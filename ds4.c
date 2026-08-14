@@ -4862,6 +4862,36 @@ static bool ds4_streaming_routed_expert_bytes(
 
 enum { DS4_STREAMING_PREFILL_HEADROOM_LAYERS = 2 };
 
+/*
+ * Layer interi di esperti tenuti liberi per il prefill. Il default upstream e'
+ * 2 e resta tale: questo e' solo un override d'ambiente per poter MISURARE il
+ * compromesso, senza cambiare il comportamento predefinito di alcun backend.
+ *
+ * Perche' serve (misurato il 14/08 su RTX 4070 SUPER da 12 GiB, DeepSeek V4
+ * Flash IQ2XXS): due layer valgono 2 x 256 x 6,75 MiB = 3,38 GiB su 11,99
+ * totali. Sommati ai 7,67 GiB di pesi non instradati residenti e alla KV, non
+ * lasciano nulla: al seed la VRAM libera misurata e' 0,01 GiB e la cache
+ * residente degli esperti non nasce mai (0 hit su 14992 richieste). Scendere a
+ * 1 layer libererebbe 1,69 GiB. Nota onesta: sarebbero ~250 esperti contro un
+ * working set per token di 258, quindi ds4 avviserebbe comunque di thrashing —
+ * il valore di questa manopola e' poter misurare il compromesso, non una
+ * promessa che convenga.
+ */
+static uint32_t ds4_streaming_prefill_headroom_layers(void) {
+    static int      letto = 0;
+    static uint32_t valore = (uint32_t)DS4_STREAMING_PREFILL_HEADROOM_LAYERS;
+    if (!letto) {
+        letto = 1;
+        const char *s = getenv("DS4_STREAMING_PREFILL_HEADROOM_LAYERS");
+        if (s && *s) {
+            char *fine = NULL;
+            const unsigned long v = strtoul(s, &fine, 10);
+            if (fine && *fine == '\0' && v <= 64ul) valore = (uint32_t)v;
+        }
+    }
+    return valore;
+}
+
 static bool ds4_streaming_cacheable_expert_count(
         const ds4_weights *weights,
         uint64_t          *experts_out,
@@ -4908,9 +4938,9 @@ static bool ds4_streaming_prefill_headroom_bytes(
         return false;
     }
     (void)cacheable_experts;
+    const uint32_t headroom_layers = ds4_streaming_prefill_headroom_layers();
     const uint32_t reserve_layers =
-        cacheable_layers < DS4_STREAMING_PREFILL_HEADROOM_LAYERS ?
-        cacheable_layers : DS4_STREAMING_PREFILL_HEADROOM_LAYERS;
+        cacheable_layers < headroom_layers ? cacheable_layers : headroom_layers;
     if (per_expert_bytes > UINT64_MAX / (uint64_t)DS4_N_EXPERT) {
         return false;
     }
@@ -21869,9 +21899,15 @@ static bool metal_graph_decode_cuda_selected_slots_expected(
 }
 
 static uint32_t metal_graph_streaming_prefill_cache_seed_k(const ds4_gpu_graph *g) {
+    /* ALIAS CUDA (14/08). glm_graph_env_present ignora del tutto il nome ROCm
+     * fuori da DS4_ROCM_BUILD (ds4.c:431-438), quindi su una build CUDA l'unico
+     * nome riconosciuto sarebbe quello col prefisso DS4_METAL_. Senza questo
+     * alias, ds4_gpu_stream_expert_cache_seed_selected resterebbe irraggiungibile
+     * su CUDA anche dopo essere stata implementata. */
     const bool enabled =
         glm_graph_env_present("DS4_ROCM_ENABLE_STREAMING_PREFILL_CACHE_SEED",
-                              "DS4_METAL_ENABLE_STREAMING_PREFILL_CACHE_SEED");
+                              "DS4_METAL_ENABLE_STREAMING_PREFILL_CACHE_SEED") ||
+        getenv("DS4_CUDA_ENABLE_STREAMING_PREFILL_CACHE_SEED") != NULL;
     if (!g ||
         !g->ssd_streaming ||
         !enabled) {
@@ -21881,6 +21917,7 @@ static uint32_t metal_graph_streaming_prefill_cache_seed_k(const ds4_gpu_graph *
     uint32_t k = 1;
     const char *env = glm_graph_env_value("DS4_ROCM_STREAMING_PREFILL_CACHE_SEED_K",
                                           "DS4_METAL_STREAMING_PREFILL_CACHE_SEED_K");
+    if (!env || !env[0]) env = getenv("DS4_CUDA_STREAMING_PREFILL_CACHE_SEED_K");
     if (env && env[0]) {
         char *end = NULL;
         unsigned long v = strtoul(env, &end, 10);
@@ -46727,9 +46764,14 @@ static bool glm_graph_indexed_prefill_grouped_moe_default(
 
 static uint32_t glm_graph_streaming_prefill_cache_seed_k(
         const ds4_glm_gpu_graph *g) {
+    /* Stesso alias CUDA del percorso DeepSeek: la variabile deve significare la
+     * stessa cosa sui due percorsi, altrimenti chi la imposta la vede funzionare
+     * su un modello e non sull'altro. Non misurato su GLM 5.2, che su una scheda
+     * da 12 GiB non parte (19,59 GiB di soli pesi non instradati residenti). */
     const bool enabled =
         glm_graph_env_present("DS4_ROCM_ENABLE_STREAMING_PREFILL_CACHE_SEED",
-                              "DS4_METAL_ENABLE_STREAMING_PREFILL_CACHE_SEED");
+                              "DS4_METAL_ENABLE_STREAMING_PREFILL_CACHE_SEED") ||
+        getenv("DS4_CUDA_ENABLE_STREAMING_PREFILL_CACHE_SEED") != NULL;
     if (!g ||
         !g->ssd_streaming ||
         !enabled) {
@@ -46739,6 +46781,7 @@ static uint32_t glm_graph_streaming_prefill_cache_seed_k(
     uint32_t k = 1;
     const char *env = glm_graph_env_value("DS4_ROCM_STREAMING_PREFILL_CACHE_SEED_K",
                                           "DS4_METAL_STREAMING_PREFILL_CACHE_SEED_K");
+    if (!env || !env[0]) env = getenv("DS4_CUDA_STREAMING_PREFILL_CACHE_SEED_K");
     if (env && env[0]) {
         char *end = NULL;
         unsigned long v = strtoul(env, &end, 10);
@@ -64676,6 +64719,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
         if (!accelerator_cache_model_tensors(e->backend, &e->model,
                                              load_offsets, load_sizes,
                                              load_span_count)) {
+            /* MISURATO 14/08, porting 12 GiB: il messaggio dice "optional" ma la cache
+             * NON lo e'. Provato a proseguire con una cache parziale
+             * (DS4_ALLOW_PARTIAL_MODEL_CACHE): il motore pianifica comunque
+             * "resident model 80.76 GiB", i kernel ricevono puntatori non validi e si
+             * muore con "cuBLAS f16 rms-fold matmul failed: status 13" seguito da
+             * "rms_norm_plain launch failed: illegal memory access". La via per i
+             * modelli piu' grandi della VRAM resta UNA SOLA: --ssd-streaming.
+             * Non riprovare questa strada senza prima rendere i kernel tolleranti
+             * ai pesi assenti. L'abort qui e' quindi corretto: e' il messaggio a
+             * essere impreciso. */
             fprintf(stderr, "ds4: %s failed to prepare optional model cache\n",
                     ds4_backend_name(e->backend));
             free(load_offsets);
