@@ -12036,7 +12036,45 @@ static_assert(tt_TokentileSmemBudget<kTTStageRows, kTTG>::total == 88576ull,
               "M32/R32 total dynamic shared memory changed unexpectedly");
 static_assert(tt_TokentileSmemBudget<kTTStageRows, kTTG>::total <= kTTSmemHardCap,
               "token-tile dynamic shared memory must stay under the 90 KiB pass gate");
+/*
+ * QUARANTENA DEL DENSE TOKEN-TILE (14/08/2026).
+ *
+ * Il commento a ds4_cuda.cu:11004-11008 dichiara questo percorso «opt-in», ma i
+ * tre punti di dispatch (18249, 18540, 18750) lo abilitavano senza alcun flag.
+ * Su prompt lunghi produce un ACCESSO ILLEGALE ALLA MEMORIA nell'attenzione del
+ * prefill layer-major sotto --ssd-streaming, e da li' ogni chiamata CUDA eredita
+ * l'errore: un server non risponde piu' a nessuna richiesta.
+ *
+ * Misurato con DS4_METAL_LAYER_STAGE_PROFILE=2 (il gate e' condiviso, vale anche
+ * per CUDA): con un prompt da ~3555 token muore dentro `part=attn layer=2
+ * tokens=2048`, subito dopo `indexer_setup`; con un prompt da 27 token completa
+ * e non entra mai qui, perche' il predicato pretende `n_tokens >= 128`. Quel 128
+ * e' il discriminante fra i due casi, verificato su entrambi i lati.
+ *
+ * Preesistente al commit d9b35fa: bisezione su tre binari (03:17, 10:49, 16:10)
+ * -> esplodono tutti; e le righe coinvolte non compaiono nel diff 84cc882..d9b35fa.
+ *
+ * La guardia sta QUI, e non nei tre predicati, perche' tutti e tre passano di
+ * qui: cosi' non se ne puo' dimenticare uno. In cambio la funzione non risponde
+ * piu' soltanto «l'architettura lo regge» ma «va usato»: il nome resta quello di
+ * prima per non toccare tre punti di chiamata, e questo commento e' il posto in
+ * cui la differenza e' scritta.
+ *
+ * Per riaccenderlo: DS4_CUDA_ATTN_TOKENTILE=1.
+ * NON usare DS4_CUDA_NO_WINDOW_ATTENTION per ottenere lo stesso effetto: quello
+ * disabilita ANCHE il fallback online bounded-memory (18761-18776) e spinge sul
+ * percorso cuBLAS con uno score buffer molto piu' grande.
+ */
 static int ds4_cuda_attn_tokentile_arch_ok(void) {
+    static int quarantena_letta = 0;
+    static int abilitato = 0;
+    if (!quarantena_letta) {
+        quarantena_letta = 1;
+        const char *s = getenv("DS4_CUDA_ATTN_TOKENTILE");
+        abilitato = (s != NULL && *s != '\0' && *s != '0');
+    }
+    if (!abilitato) return 0;
+
     int device = 0;
     cudaDeviceProp prop;
     if (cudaGetDevice(&device) != cudaSuccess ||
