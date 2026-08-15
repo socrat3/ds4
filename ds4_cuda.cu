@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>   /* pool di letture parallele (porting ROCm, 15/08) */
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
@@ -159,10 +160,64 @@ static void cuda_stream_selected_cache_invalidate(void) {
     g_stream_selected_cache.valid = 0;
 }
 
+extern "C" void ds4_gpu_decode_graphs_invalidate(void);
+
+/*
+ * Contatore delle liberazioni di VRAM (15/08, rilievo 6). Non misura quanta
+ * memoria sia libera: segna soltanto che qualcosa e' cambiato da quando una
+ * classe di slab ha rinunciato a crescere. Basta a distinguere "ritenta,
+ * adesso ha senso" da "ritenta a vuoto per la decimillesima volta".
+ */
+static uint64_t g_stream_vram_epoca = 1;
+
+static void cuda_stream_vram_liberata(void) { g_stream_vram_epoca++; }
+
+/*
+ * Invalidazione dei grafi di decode al cambio di indirizzo della tabella
+ * compatta (15/08, rilievi 7 e 8 del contraddittorio).
+ *
+ * I quattro puntatori della selected cache (gate/up/down/slot_selected)
+ * finiscono COTTI dentro i grafi CUDA catturati: g_decode_graphs registra i
+ * parametri dei kernel al momento della cattura e il replay li riusa senza
+ * rileggerli. Se uno di quei buffer viene liberato e riallocato altrove, un
+ * replay successivo scrive su memoria che non e' piu' sua: nessun crash
+ * garantito, output diverso — la firma esatta osservata quando il rilascio
+ * della tabella compatta produsse 3ad4b5ff invece di 0a9af6a1.
+ *
+ * La correzione sta QUI, nel proprietario dell'allocazione, e non nei
+ * chiamanti: ogni strada che cambia uno dei quattro indirizzi passa per
+ * ensure_bytes o per cache_release, e nessuna delle due puo' essere
+ * dimenticata da un chiamante futuro. Il ramo opt-in
+ * DS4_CUDA_RELEASE_SELECTED_TABLE se lo faceva per conto suo: copriva il
+ * primo rilascio e non la seconda crescita nella stessa vita del processo,
+ * ne' i rebind di modello e la disabilitazione SSD, che chiamano release
+ * per una strada tutta loro.
+ *
+ * Costo: si paga solo quando un indirizzo cambia DAVVERO — prima
+ * allocazione e rare crescite — non a ogni load.
+ */
+/* Corpo dopo la dichiarazione di g_gpu (serve a controllare la cattura sullo
+ * stream del device). */
+static int cuda_stream_selected_addresses_changing(const char *dove);
+
 static void cuda_stream_selected_cache_release(void) {
     const int tier = g_stream_selected_cache.logical_tier;
     if (tier >= 0 && tier < g_n_gpus) {
         (void)ds4_gpu_set_current_device(tier);
+    }
+    if (g_stream_selected_cache.gate_ptr ||
+        g_stream_selected_cache.up_ptr ||
+        g_stream_selected_cache.down_ptr ||
+        g_stream_selected_cache.slot_selected_ptr) {
+        /* Il rilascio DEVE completare (teardown, rebind, spegnimento dello
+         * streaming): se l'invalidazione non riesce si prosegue, ma lo si
+         * dice — a quel punto i graph residui vanno considerati inaffidabili
+         * e il chiamante e' fuori contratto. */
+        if (!cuda_stream_selected_addresses_changing("selected cache release")) {
+            fprintf(stderr,
+                    "ds4: CUDA streaming: rilascio della tabella compatta "
+                    "senza invalidazione dei graph\n");
+        }
     }
     if (g_stream_selected_cache.gate_ptr) {
         (void)cudaFree(g_stream_selected_cache.gate_ptr);
@@ -178,6 +233,10 @@ static void cuda_stream_selected_cache_release(void) {
     }
     memset(&g_stream_selected_cache, 0, sizeof(g_stream_selected_cache));
     g_stream_selected_cache.logical_tier = -1;
+    /* La tabella compatta e' il blocco piu' grosso che la cache residente
+     * possa vedersi liberare davanti (~1,7 GiB): e' esattamente il caso in
+     * cui una classe che aveva rinunciato deve poter ritentare. */
+    cuda_stream_vram_liberata();
 }
 
 /*
@@ -295,6 +354,22 @@ static uint64_t g_stream_resident_misses;
 static uint64_t g_stream_resident_hit_bytes;    /* serviti device-to-device */
 static uint64_t g_stream_resident_disk_bytes;   /* riletti dal GGUF sui miss */
 /*
+ * CONFINE PREFILL->DECODE (15/08).
+ *
+ * Il consuntivo stampato al rilascio e' CUMULATO su prefill e decode: il 7,8%
+ * misurato sul prompt lungo non dice quanto vale la cache per i token
+ * GENERATI, che sono l'unica cosa che l'utente sta aspettando. Questi quattro
+ * numeri fotografano i contatori all'ultimo passaggio da load batch (prefill)
+ * a load per-token (decode), cosi' il rilascio puo' stampare anche il
+ * consuntivo del SOLO decode. Senza questa separazione ogni A/B sulla
+ * politica di cache confronta numeri cumulati e non conclude nulla.
+ */
+static uint64_t g_stream_resident_snap_hits;
+static uint64_t g_stream_resident_snap_misses;
+static uint64_t g_stream_resident_snap_hit_bytes;
+static uint64_t g_stream_resident_snap_disk_bytes;
+static int      g_stream_prev_load_scan;   /* l'ultimo load era una scansione batch? */
+/*
  * ALLOCATORE A PIU' CLASSI DI DIMENSIONE (14/08).
  *
  * La prima versione aveva UNA sola classe: il primo esperto visto fissava
@@ -326,6 +401,20 @@ struct cuda_stream_expert_class {
      * uscirebbe una volta per ogni esperto richiesto (94 volte su 94, 398 su
      * 398 — il rapporto 1:1 che ci aveva depistati). */
     int fallimento_segnalato;
+    /*
+     * BACKOFF DELLA CRESCITA IMPOSSIBILE (15/08, rilievo 6).
+     *
+     * fallimento_segnalato sopprimeva il MESSAGGIO, non i TENTATIVI: a VRAM
+     * satura ogni singolo miss rientrava in slab_grow e rifaceva
+     * cudaMemGetInfo piu' una catena di cudaMalloc dimezzati fino a 0 —
+     * lavoro puro a perdere, decine di migliaia di volte per prefill. Da
+     * qui: se la crescita e' fallita e da allora NESSUNA VRAM e' stata
+     * liberata (stessa epoca), si esce subito. Un rilascio qualsiasi
+     * incrementa l'epoca e riapre il tentativo, quindi il backoff non e'
+     * mai definitivo.
+     */
+    int      crescita_impossibile;
+    uint64_t crescita_epoca;
 };
 
 static std::vector<cuda_stream_expert_class> g_stream_expert_classes;
@@ -352,6 +441,8 @@ static cuda_stream_expert_class *cuda_stream_expert_class_for(uint64_t bytes,
     nuova.slot_bytes = bytes;
     nuova.slot_count = 0;
     nuova.fallimento_segnalato = 0;
+    nuova.crescita_impossibile = 0;
+    nuova.crescita_epoca = 0;
     g_stream_expert_classes.push_back(nuova);
     return &g_stream_expert_classes.back();
 }
@@ -1112,6 +1203,45 @@ static void cuda_decode_graph_entry_kill(cuda_decode_graph_entry *e) {
         e->exec = NULL;
     }
     e->state = 3;
+}
+
+static int cuda_stream_selected_addresses_changing(const char *dove) {
+    /*
+     * FALLIBILE E CONSAPEVOLE DELLA CATTURA (15/08, secondo contraddittorio).
+     *
+     * cudaDeviceSynchronize e' fra le operazioni PROIBITE mentre una cattura
+     * di graph e' in corso: non e' "lento", e' comportamento indefinito. La
+     * prima stesura lo chiamava incondizionatamente da ensure_bytes, che sta
+     * sul percorso caldo. Qui si controlla prima, e in cattura si RIFIUTA il
+     * cambio di indirizzo: il chiamante fallisce il load e ripiega sul
+     * percorso a freddo, cosa che sa gia' fare, invece di corrompere la
+     * cattura.
+     */
+    cudaStreamCaptureStatus stato = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &stato) != cudaSuccess) {
+        (void)cudaGetLastError();
+        stato = cudaStreamCaptureStatusNone;
+    }
+    for (int i = 0; stato == cudaStreamCaptureStatusNone && i < g_n_gpus; i++) {
+        if (!g_gpu[i].stream) continue;
+        if (cudaStreamIsCapturing((cudaStream_t)g_gpu[i].stream, &stato) !=
+                cudaSuccess) {
+            (void)cudaGetLastError();
+            stato = cudaStreamCaptureStatusNone;
+        }
+    }
+    if (stato != cudaStreamCaptureStatusNone) {
+        fprintf(stderr,
+                "ds4: CUDA streaming: %s durante una cattura di graph: "
+                "riallocazione rifiutata\n",
+                dove ? dove : "cambio di indirizzo");
+        return 0;
+    }
+    if (!cuda_ok(cudaDeviceSynchronize(), "selected table address change")) {
+        return 0;
+    }
+    ds4_gpu_decode_graphs_invalidate();
+    return 1;
 }
 
 extern "C" void ds4_gpu_decode_graphs_invalidate(void) {
@@ -2312,6 +2442,562 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
     return cuda_pread_full(g_model_fd, stage, bytes, offset);
 }
 
+/*
+ * POOL DI LETTURE PARALLELE (15/08) — trapianto del read-worker pool ROCm
+ * (rocm/ds4_rocm_runtime.cuh:1939-2314) sul backend CUDA puro. Era il pezzo
+ * mancante dichiarato del porting (vedi il commento sotto in
+ * cuda_stream_resident_seed_experts).
+ *
+ * Prima del pool ogni esperto mancante costava tre pread sincrone in serie
+ * dentro cuda_model_copy_to_device_streamed, ciascuna chiusa da un
+ * cudaStreamSynchronize: profondita' di coda sull'NVMe = 1, sempre. Misurato
+ * sul GGUF vero (letture casuali da 2 MiB, page cache svuotata):
+ * coda 1 = 1,19 GiB/s | coda 4 = 3,71 | coda 8 = 4,22 | coda 16 = 4,39.
+ * E 1,19 coincide con la banda implicita calcolata dai token/s in
+ * generazione: il motore era dimostrabilmente limitato dalla coda 1.
+ *
+ * Ogni worker ha il proprio staging pinned (dimensionato sul job piu' grande
+ * piu' lo slack di allineamento O_DIRECT) e il proprio stream di upload; un
+ * job e' una terna offset/bytes/dst dentro la selected-cache. Gli hit
+ * residenti e le AMMISSIONI restano sul thread chiamante: i worker toccano
+ * solo GGUF e selected-cache, quindi le strutture residenti
+ * (g_stream_resident_*) non prendono lock nuovi. L'upload sincronizza il
+ * proprio stream job per job, quindi al ritorno di jobs_wait tutti i byte
+ * sono in VRAM: il contratto di begin_load resta "sincrono al ritorno".
+ *
+ * DS4_CUDA_STREAM_READ_WORKERS: default 8 (sul disco di questa macchina la
+ * coda 8 rende 3,5x la coda 1; 16 aggiunge solo il 4%), max 16, 0 = pool
+ * spento (percorso sequenziale storico, tenuto per l'A/B e come via di
+ * fuga). Divergenza deliberata da ROCm, dove 0 significa 1 worker: qui
+ * serve un interruttore che ripristini il comportamento vecchio.
+ */
+enum {
+    DS4_CUDA_STREAM_READ_WORKERS_MAX = 16,
+    DS4_CUDA_STREAM_READ_MAX_JOBS = 1152   /* 384 esperti x 3, come ROCm */
+};
+
+typedef struct cuda_stream_read_job {
+    char    *dst;
+    uint64_t offset;
+    uint64_t bytes;
+    void    *host_buf;
+    int      ok;
+    int      errnum;
+    int      direct;
+} cuda_stream_read_job;
+
+static void *g_stream_read_stage_raw[DS4_CUDA_STREAM_READ_WORKERS_MAX];
+static uint64_t g_stream_read_stage_bytes[DS4_CUDA_STREAM_READ_WORKERS_MAX];
+static cudaStream_t g_stream_read_upload_streams[DS4_CUDA_STREAM_READ_WORKERS_MAX];
+static pthread_t g_stream_read_threads[DS4_CUDA_STREAM_READ_WORKERS_MAX];
+static uint32_t g_stream_read_thread_ids[DS4_CUDA_STREAM_READ_WORKERS_MAX];
+static pthread_mutex_t g_stream_read_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_stream_read_work_cond = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t g_stream_read_done_cond = PTHREAD_COND_INITIALIZER;
+static int g_stream_read_pool_started;
+static uint32_t g_stream_read_pool_workers;
+static int g_stream_read_pool_stop;
+/*
+ * Chiusura dell'ammissione (15/08, rilievo 3). Alzato PRIMA di fermare i
+ * worker: da quel momento jobs_start rifiuta ogni nuovo lotto e il
+ * chiamante ripiega sul percorso sequenziale, che non dipende dal pool.
+ * Senza questo, fra "stop" e "join" restava una finestra in cui un thread
+ * poteva accodare lavoro verso buffer in via di distruzione.
+ */
+static int g_stream_read_pool_draining;
+static int g_stream_read_pool_device;
+static cuda_stream_read_job *g_stream_read_active_jobs;
+static uint32_t g_stream_read_active_count;
+static uint32_t g_stream_read_active_next;
+static uint32_t g_stream_read_active_done;
+static int g_stream_read_active_ok;
+static pthread_t g_stream_read_active_owner;
+static int g_stream_read_active_owner_set;
+
+static uint32_t cuda_stream_read_worker_count(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        uint32_t n = 8u;
+        const char *env = getenv("DS4_CUDA_STREAM_READ_WORKERS");
+        if (env && env[0]) {
+            char *end = NULL;
+            errno = 0;
+            unsigned long v = strtoul(env, &end, 10);
+            if (end != env && errno == 0 &&
+                v <= (unsigned long)DS4_CUDA_STREAM_READ_WORKERS_MAX) {
+                n = (uint32_t)v;   /* 0 = pool spento */
+            }
+        }
+        cached = (int)n;
+    }
+    return (uint32_t)cached;
+}
+
+static void cuda_stream_read_job_run(cuda_stream_read_job *job,
+                                     void *stage,
+                                     uint64_t stage_bytes) {
+    if (!job) return;
+    job->ok = 0;
+    job->errnum = 0;
+    job->direct = 0;
+    if (!stage || job->bytes == 0 || g_model_fd < 0) {
+        job->errnum = EINVAL;
+        return;
+    }
+    job->host_buf = stage;
+#if defined(__linux__) && defined(O_DIRECT)
+    /* Come ROCm: su un fallimento della lettura diretta si ripiega sul fd
+     * bufferizzato SOLO per questo job. Il fd O_DIRECT condiviso NON si
+     * chiude da un worker (differenza da cuda_model_stage_read, che su
+     * EINVAL lo disattiva per sempre: qui altri worker lo stanno usando e
+     * chiuderlo sarebbe una corsa). DS4_CUDA_NO_DIRECT_IO continua a
+     * governare tutto a monte: se e' impostata il fd diretto non esiste. */
+    if (g_model_direct_fd >= 0 && g_model_direct_align > 1 &&
+        g_model_file_size != 0) {
+        const uint64_t aligned_off =
+            cuda_round_down(job->offset, g_model_direct_align);
+        const uint64_t delta = job->offset - aligned_off;
+        const uint64_t read_size =
+            cuda_round_up(delta + job->bytes, g_model_direct_align);
+        if (read_size <= stage_bytes &&
+            aligned_off <= g_model_file_size &&
+            read_size <= g_model_file_size - aligned_off &&
+            cuda_pread_full(g_model_direct_fd, stage, read_size, aligned_off)) {
+            job->host_buf = (char *)stage + delta;
+            job->direct = 1;
+            job->ok = 1;
+            return;
+        }
+    }
+#else
+    (void)stage_bytes;
+#endif
+    if (cuda_pread_full(g_model_fd, job->host_buf, job->bytes, job->offset)) {
+        job->ok = 1;
+    } else {
+        job->errnum = errno ? errno : EIO;
+    }
+}
+
+static int cuda_stream_read_job_upload(cuda_stream_read_job *job,
+                                       cudaStream_t stream) {
+    if (!job || !job->ok || !job->dst || !job->host_buf || !stream) {
+        if (job) { job->ok = 0; job->errnum = EINVAL; }
+        return 0;
+    }
+    cudaError_t err = cudaMemcpyAsync(job->dst, job->host_buf,
+                                      (size_t)job->bytes,
+                                      cudaMemcpyHostToDevice, stream);
+    if (err == cudaSuccess) err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA streaming read-worker upload failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        job->ok = 0;
+        job->errnum = EIO;
+        return 0;
+    }
+    if (!job->direct) cuda_model_drop_file_pages(job->offset, job->bytes);
+    return 1;
+}
+
+static void *cuda_stream_read_worker(void *arg) {
+    const uint32_t worker_id = arg ? *(const uint32_t *)arg : 0u;
+    (void)cudaSetDevice(g_stream_read_pool_device);
+    for (;;) {
+        pthread_mutex_lock(&g_stream_read_mutex);
+        while (!g_stream_read_pool_stop &&
+               (!g_stream_read_active_jobs ||
+                g_stream_read_active_next >= g_stream_read_active_count)) {
+            pthread_cond_wait(&g_stream_read_work_cond, &g_stream_read_mutex);
+        }
+        if (g_stream_read_pool_stop) {
+            /*
+             * DRENAGGIO ALL'USCITA (15/08, rilievo 3).
+             *
+             * Prima si usciva subito, lasciando in coda i job non ancora
+             * presi: active_done non raggiungeva mai active_count e il
+             * proprietario restava appeso per sempre in jobs_wait, dopo che
+             * lo shutdown aveva gia' fatto join. Ora i job residui vengono
+             * CONTABILIZZATI come falliti senza eseguire I/O: il
+             * proprietario si sveglia sempre, con ok=0, e ripiega sul
+             * percorso sequenziale invece di bloccare il processo.
+             */
+            if (g_stream_read_active_jobs) {
+                while (g_stream_read_active_next <
+                       g_stream_read_active_count) {
+                    cuda_stream_read_job *residuo =
+                        &g_stream_read_active_jobs[g_stream_read_active_next++];
+                    residuo->ok = 0;
+                    if (residuo->errnum == 0) residuo->errnum = ECANCELED;
+                    g_stream_read_active_ok = 0;
+                    g_stream_read_active_done++;
+                }
+                if (g_stream_read_active_done >= g_stream_read_active_count) {
+                    pthread_cond_broadcast(&g_stream_read_done_cond);
+                }
+            }
+            pthread_mutex_unlock(&g_stream_read_mutex);
+            break;
+        }
+        const uint32_t idx = g_stream_read_active_next++;
+        cuda_stream_read_job *job = &g_stream_read_active_jobs[idx];
+        void *stage = NULL;
+        uint64_t stage_bytes = 0;
+        if (worker_id < (uint32_t)DS4_CUDA_STREAM_READ_WORKERS_MAX) {
+            stage = g_stream_read_stage_raw[worker_id];
+            stage_bytes = g_stream_read_stage_bytes[worker_id];
+        }
+        pthread_mutex_unlock(&g_stream_read_mutex);
+
+        cuda_stream_read_job_run(job, stage, stage_bytes);
+        if (job->ok) {
+            (void)cuda_stream_read_job_upload(
+                    job,
+                    worker_id < (uint32_t)DS4_CUDA_STREAM_READ_WORKERS_MAX ?
+                        g_stream_read_upload_streams[worker_id] : NULL);
+        }
+
+        pthread_mutex_lock(&g_stream_read_mutex);
+        if (!job->ok) g_stream_read_active_ok = 0;
+        g_stream_read_active_done++;
+        if (g_stream_read_active_done >= g_stream_read_active_count) {
+            /* broadcast, non signal (15/08, rilievo 3): su questa condvar
+             * possono dormire DUE thread distinti — il proprietario del
+             * lotto in jobs_wait e lo shutdown che sta drenando. Con signal
+             * si sveglia uno solo dei due, e l'altro non viene piu' svegliato
+             * da nessuno. */
+            pthread_cond_broadcast(&g_stream_read_done_cond);
+        }
+        pthread_mutex_unlock(&g_stream_read_mutex);
+    }
+    return NULL;
+}
+
+static void cuda_stream_read_upload_streams_destroy(void) {
+    for (uint32_t i = 0; i < (uint32_t)DS4_CUDA_STREAM_READ_WORKERS_MAX; i++) {
+        if (g_stream_read_upload_streams[i]) {
+            (void)cudaStreamDestroy(g_stream_read_upload_streams[i]);
+            g_stream_read_upload_streams[i] = NULL;
+        }
+    }
+}
+
+static int cuda_stream_read_upload_streams_ensure(uint32_t workers) {
+    for (uint32_t i = 0; i < workers; i++) {
+        if (g_stream_read_upload_streams[i]) continue;
+        cudaError_t err = cudaStreamCreateWithFlags(
+                &g_stream_read_upload_streams[i], cudaStreamNonBlocking);
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA streaming read upload stream creation failed: %s\n",
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            cuda_stream_read_upload_streams_destroy();
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int cuda_stream_read_pool_ensure(void) {
+    /* Niente fast path fuori dal lock (15/08, rilievo 4): leggere
+     * g_stream_read_pool_started senza mutex e' una data race formale
+     * appena start e shutdown possono sovrapporsi. Il lock si paga una
+     * volta per lotto, contro letture da disco di svariati MiB: invisibile. */
+    pthread_mutex_lock(&g_stream_read_mutex);
+    if (g_stream_read_pool_started) {
+        pthread_mutex_unlock(&g_stream_read_mutex);
+        return 1;
+    }
+    if (g_stream_read_pool_draining) {
+        /* Shutdown in corso: far rinascere il pool qui significherebbe
+         * creare thread che lo shutdown non aspettera' mai (15/08,
+         * rilievo 3). */
+        pthread_mutex_unlock(&g_stream_read_mutex);
+        return 0;
+    }
+    g_stream_read_pool_stop = 0;
+    g_stream_read_active_jobs = NULL;
+    g_stream_read_active_count = 0;
+    g_stream_read_active_next = 0;
+    g_stream_read_active_done = 0;
+    g_stream_read_active_ok = 1;
+    g_stream_read_active_owner_set = 0;
+    g_stream_read_pool_workers = cuda_stream_read_worker_count();
+    if (g_stream_read_pool_workers == 0) {
+        pthread_mutex_unlock(&g_stream_read_mutex);
+        return 0;
+    }
+    /* I worker devono lavorare sullo stesso device del chiamante (lo
+     * streaming SSD e' gia' vincolato a singola GPU, ma il device fisico
+     * puo' non essere lo 0: si fotografa quello corrente). */
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) {
+        (void)cudaGetLastError();
+        dev = 0;
+    }
+    g_stream_read_pool_device = dev;
+    if (!cuda_stream_read_upload_streams_ensure(g_stream_read_pool_workers)) {
+        pthread_mutex_unlock(&g_stream_read_mutex);
+        return 0;
+    }
+    for (uint32_t i = 0; i < g_stream_read_pool_workers; i++) {
+        g_stream_read_thread_ids[i] = i;
+        const int rc = pthread_create(&g_stream_read_threads[i], NULL,
+                                      cuda_stream_read_worker,
+                                      &g_stream_read_thread_ids[i]);
+        if (rc != 0) {
+            /*
+             * AVVIO FALLITO A META' (15/08, secondo contraddittorio).
+             *
+             * Prima si alzava `stop`, si rilasciava il mutex e si faceva join
+             * dei worker gia' creati. In quella finestra un secondo
+             * `pool_ensure` poteva entrare, rimettere `stop = 0` e riusare lo
+             * stesso array di thread: due join sullo stesso pthread_t, che
+             * POSIX dichiara indefinito, e worker rimessi in attesa da
+             * nessuno. Ora si alza `draining`, che tiene fuori sia
+             * `pool_ensure` sia `jobs_start` per tutta la durata della
+             * bonifica, e si abbassa solo alla fine.
+             */
+            g_stream_read_pool_draining = 1;
+            g_stream_read_pool_stop = 1;
+            pthread_cond_broadcast(&g_stream_read_work_cond);
+            pthread_mutex_unlock(&g_stream_read_mutex);
+            for (uint32_t j = 0; j < i; j++) {
+                (void)pthread_join(g_stream_read_threads[j], NULL);
+            }
+            fprintf(stderr,
+                    "ds4: CUDA streaming read worker creation failed: %s\n",
+                    strerror(rc));
+            cuda_stream_read_upload_streams_destroy();
+            pthread_mutex_lock(&g_stream_read_mutex);
+            g_stream_read_pool_stop = 0;
+            g_stream_read_pool_workers = 0;
+            g_stream_read_pool_started = 0;
+            g_stream_read_pool_draining = 0;
+            pthread_mutex_unlock(&g_stream_read_mutex);
+            return 0;
+        }
+    }
+    g_stream_read_pool_started = 1;
+    pthread_mutex_unlock(&g_stream_read_mutex);
+    return 1;
+}
+
+/*
+ * Spegnimento del pool in tre tempi (15/08, rilievo 3 del contraddittorio).
+ *
+ * La versione precedente alzava "stop" e faceva subito join. Sequenza
+ * concreta che rompeva: il thread A e' dentro un lotto da 768 upload; il
+ * thread B chiama cleanup, che liberava la selected cache — cioe' la
+ * DESTINAZIONE di quegli upload — e solo dopo fermava il pool. Un worker
+ * completava una cudaMemcpyAsync verso memoria gia' liberata, poi vedeva
+ * stop e abbandonava i job rimanenti; A non raggiungeva mai active_count.
+ * Use-after-free e attesa infinita, entrambi.
+ *
+ * Ora: (1) si chiude l'ammissione, cosi' nessun lotto NUOVO entra; (2) si
+ * aspetta che il lotto in volo sia interamente contabilizzato, cosi' nessun
+ * worker ha piu' un job in mano; (3) solo allora stop e join. Il
+ * proprietario del lotto ritira i suoi job da se': lo shutdown non azzera
+ * lo stato attivo mentre qualcuno lo possiede ancora.
+ *
+ * Resta a carico del chiamante l'ordine esterno — pool PRIMA della selected
+ * cache — corretto in ds4_gpu_cleanup nella stessa passata.
+ */
+static void cuda_stream_read_pool_shutdown(void) {
+    /* Un solo acquisto del lock per decidere E agire: leggere lo stato,
+     * rilasciare e riprendere lascerebbe una finestra in cui un altro
+     * spegnimento si infila fra la decisione e il drenaggio. */
+    pthread_mutex_lock(&g_stream_read_mutex);
+    const int pool_vivo = g_stream_read_pool_started;
+    if (!pool_vivo) {
+        /* Niente pool: si rilascia SUBITO e si passa alla sola bonifica di
+         * staging e stream. Dimenticare questo unlock e' costato un
+         * deadlock intercettato dal contraddittorio: ogni chiamata
+         * successiva al mutex si sarebbe bloccata per sempre. */
+        pthread_mutex_unlock(&g_stream_read_mutex);
+    } else {
+        g_stream_read_pool_draining = 1;
+        while (g_stream_read_active_jobs != NULL &&
+               g_stream_read_active_done < g_stream_read_active_count) {
+            pthread_cond_wait(&g_stream_read_done_cond, &g_stream_read_mutex);
+        }
+        const int lotto_ancora_del_proprietario =
+            (g_stream_read_active_jobs != NULL &&
+             g_stream_read_active_owner_set);
+        g_stream_read_pool_stop = 1;
+        pthread_cond_broadcast(&g_stream_read_work_cond);
+        pthread_mutex_unlock(&g_stream_read_mutex);
+        for (uint32_t i = 0; i < g_stream_read_pool_workers; i++) {
+            (void)pthread_join(g_stream_read_threads[i], NULL);
+        }
+        pthread_mutex_lock(&g_stream_read_mutex);
+        g_stream_read_pool_started = 0;
+        g_stream_read_pool_workers = 0;
+        g_stream_read_pool_stop = 0;
+        g_stream_read_pool_draining = 0;
+        /* Se il lotto e' completo ma il proprietario non l'ha ancora
+         * ritirato, glielo si lascia: azzerarlo qui lo farebbe fallire con
+         * "inactive job set" su byte che sono invece arrivati tutti. */
+        if (!lotto_ancora_del_proprietario) {
+            g_stream_read_active_jobs = NULL;
+            g_stream_read_active_count = 0;
+            g_stream_read_active_next = 0;
+            g_stream_read_active_done = 0;
+            g_stream_read_active_ok = 1;
+            g_stream_read_active_owner_set = 0;
+        }
+        pthread_mutex_unlock(&g_stream_read_mutex);
+    }
+    for (uint32_t i = 0; i < (uint32_t)DS4_CUDA_STREAM_READ_WORKERS_MAX; i++) {
+        if (g_stream_read_stage_raw[i]) {
+            (void)cudaFreeHost(g_stream_read_stage_raw[i]);
+            g_stream_read_stage_raw[i] = NULL;
+            g_stream_read_stage_bytes[i] = 0;
+        }
+    }
+    cuda_stream_read_upload_streams_destroy();
+}
+
+static int cuda_stream_read_jobs_prepare(cuda_stream_read_job *jobs,
+                                         uint32_t count) {
+    if (!jobs || count == 0) return 1;
+    if (count > (uint32_t)DS4_CUDA_STREAM_READ_MAX_JOBS) return 0;
+
+    uint64_t max_bytes = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        jobs[i].ok = 0;
+        jobs[i].errnum = 0;
+        jobs[i].direct = 0;
+        jobs[i].host_buf = NULL;
+        if (jobs[i].bytes > max_bytes) max_bytes = jobs[i].bytes;
+    }
+    /* Slack perche' le letture dirette possano allineare offset e taglia. */
+    if (g_model_direct_align > 1u &&
+        max_bytes <= UINT64_MAX - 2u * g_model_direct_align) {
+        max_bytes += 2u * g_model_direct_align;
+    }
+
+    const uint32_t workers = g_stream_read_pool_started ?
+        g_stream_read_pool_workers : cuda_stream_read_worker_count();
+    for (uint32_t i = 0; i < workers; i++) {
+        if (g_stream_read_stage_bytes[i] < max_bytes) {
+            if (g_stream_read_stage_raw[i]) {
+                (void)cudaFreeHost(g_stream_read_stage_raw[i]);
+                g_stream_read_stage_raw[i] = NULL;
+                g_stream_read_stage_bytes[i] = 0;
+            }
+            cudaError_t err = cudaMallocHost(&g_stream_read_stage_raw[i],
+                                             (size_t)max_bytes);
+            if (err != cudaSuccess) {
+                fprintf(stderr,
+                        "ds4: CUDA streaming read pinned allocation failed "
+                        "(%.2f MiB): %s\n",
+                        (double)max_bytes / 1048576.0,
+                        cudaGetErrorString(err));
+                (void)cudaGetLastError();
+                return 0;
+            }
+            g_stream_read_stage_bytes[i] = max_bytes;
+        }
+    }
+    return 1;
+}
+
+static int cuda_stream_read_jobs_start(cuda_stream_read_job *jobs,
+                                       uint32_t count) {
+    if (!jobs || count == 0) return 1;
+    if (!cuda_stream_read_pool_ensure()) return 0;
+    const pthread_t self = pthread_self();
+    pthread_mutex_lock(&g_stream_read_mutex);
+    while (g_stream_read_active_jobs != NULL) {
+        if (g_stream_read_active_owner_set &&
+            pthread_equal(g_stream_read_active_owner, self)) {
+            pthread_mutex_unlock(&g_stream_read_mutex);
+            fprintf(stderr,
+                    "ds4: CUDA streaming read pool already has active work "
+                    "for this thread\n");
+            return 0;
+        }
+        /* Ammissione chiusa mentre si aspettava il proprio turno: si esce
+         * subito invece di dormire su una condvar che nessuno risveglia
+         * piu' dopo il join (15/08, rilievo 3). */
+        if (g_stream_read_pool_draining || g_stream_read_pool_stop) {
+            pthread_mutex_unlock(&g_stream_read_mutex);
+            return 0;
+        }
+        pthread_cond_wait(&g_stream_read_done_cond, &g_stream_read_mutex);
+    }
+    if (g_stream_read_pool_draining || g_stream_read_pool_stop ||
+        !g_stream_read_pool_started) {
+        /* Spegnimento in corso: il chiamante ripiega sul sequenziale, che
+         * non dipende dai worker. */
+        pthread_mutex_unlock(&g_stream_read_mutex);
+        return 0;
+    }
+    if (!cuda_stream_read_jobs_prepare(jobs, count)) {
+        pthread_mutex_unlock(&g_stream_read_mutex);
+        return 0;
+    }
+    g_stream_read_active_jobs = jobs;
+    g_stream_read_active_count = count;
+    g_stream_read_active_next = 0;
+    g_stream_read_active_done = 0;
+    g_stream_read_active_ok = 1;
+    g_stream_read_active_owner = self;
+    g_stream_read_active_owner_set = 1;
+    pthread_cond_broadcast(&g_stream_read_work_cond);
+    pthread_mutex_unlock(&g_stream_read_mutex);
+    return 1;
+}
+
+static int cuda_stream_read_jobs_wait(cuda_stream_read_job *jobs,
+                                      uint32_t count) {
+    if (!jobs || count == 0) return 1;
+    pthread_mutex_lock(&g_stream_read_mutex);
+    if (g_stream_read_active_jobs != jobs) {
+        pthread_mutex_unlock(&g_stream_read_mutex);
+        fprintf(stderr,
+                "ds4: CUDA streaming read wait received inactive job set\n");
+        return 0;
+    }
+    while (g_stream_read_active_done < g_stream_read_active_count) {
+        pthread_cond_wait(&g_stream_read_done_cond, &g_stream_read_mutex);
+    }
+    const int pool_ok = g_stream_read_active_ok;
+    g_stream_read_active_jobs = NULL;
+    g_stream_read_active_count = 0;
+    g_stream_read_active_next = 0;
+    g_stream_read_active_done = 0;
+    g_stream_read_active_ok = 1;
+    g_stream_read_active_owner_set = 0;
+    pthread_cond_broadcast(&g_stream_read_done_cond);
+    pthread_mutex_unlock(&g_stream_read_mutex);
+
+    int ok = pool_ok;
+    for (uint32_t i = 0; i < count; i++) {
+        if (!jobs[i].ok) {
+            fprintf(stderr,
+                    "ds4: CUDA streaming read failed at offset %.2f GiB "
+                    "size %.2f MiB: %s\n",
+                    (double)jobs[i].offset / 1073741824.0,
+                    (double)jobs[i].bytes / 1048576.0,
+                    strerror(jobs[i].errnum ? jobs[i].errnum : EIO));
+            ok = 0;
+        }
+    }
+    return ok;
+}
+
+static int cuda_stream_read_jobs_parallel(cuda_stream_read_job *jobs,
+                                          uint32_t count) {
+    if (!jobs || count == 0) return 1;
+    return cuda_stream_read_jobs_start(jobs, count) &&
+           cuda_stream_read_jobs_wait(jobs, count);
+}
+
 static void cuda_stream_selected_stage_release(void) {
     for (size_t i = 0; i < 4; i++) {
         if (g_stream_selected_stage_event[i]) {
@@ -2681,6 +3367,13 @@ static int cuda_stream_expert_slab_grow(uint64_t slot_bytes) {
     }
     cuda_stream_expert_class *cl = cuda_stream_expert_class_for(slot_bytes, true);
     if (!cl) return 0;   /* troppe classi: il chiamante ricadra' su alloc dedicata */
+    /* Backoff: questa classe ha gia' rinunciato e da allora nessuno ha
+     * liberato VRAM. Rifare cudaMemGetInfo e la catena di cudaMalloc
+     * dimezzati darebbe lo stesso esito, al prezzo di un round-trip col
+     * driver per ogni miss (15/08, rilievo 6). */
+    if (cl->crescita_impossibile && cl->crescita_epoca == g_stream_vram_epoca) {
+        return 0;
+    }
     uint32_t slab_slots = slot_bytes >= slab_target_bytes ?
         1u : (uint32_t)(slab_target_bytes / slot_bytes);
     const uint32_t want = g_stream_expert_cache_budget - usati;
@@ -2740,8 +3433,13 @@ static int cuda_stream_expert_slab_grow(uint64_t slot_bytes) {
             cl->free_slots.push_back((char *)base + (uint64_t)i * slot_bytes);
         }
         cl->slot_count += slab_slots;
+        cl->crescita_impossibile = 0;
         return 1;
     }
+    /* Nessun taglio e' entrato: si annota l'epoca, e finche' non cambia
+     * questa classe non ritenta (15/08, rilievo 6). */
+    cl->crescita_impossibile = 1;
+    cl->crescita_epoca = g_stream_vram_epoca;
     if (!cl->fallimento_segnalato) {
         cl->fallimento_segnalato = 1;
         fprintf(stderr,
@@ -2812,10 +3510,34 @@ static int cuda_stream_resident_alloc(
          * esiste una classe — o per cui non se ne puo' creare una, oltre
          * DS4_STREAM_MAX_CLASSES — proseguono invece sulla via dedicata qui
          * sotto: e' il caso dei layer mixed-precision fuori misura. */
-        fprintf(stderr,
-                "ds4: CUDA streaming expert cache cannot reserve a %.2f MiB "
-                "slot for layer=%u expert=%d\n",
-                (double)bytes / 1048576.0, layer, expert);
+        /*
+         * UNA VOLTA PER EPOCA (15/08). Questo messaggio usciva a ogni
+         * ammissione fallita: 38.184 fprintf in una sola richiesta da 400
+         * token, misurati. Non e' solo rumore che nasconde il resto del log
+         * — sono 38.184 scritture sincrone su file, pagate dentro il ciclo
+         * caldo del decode. Il conteggio dice quante volte e' successo; il
+         * dettaglio della prima basta a diagnosticare, perche' la causa e'
+         * sempre la stessa finche' la VRAM non cambia (stessa epoca del
+         * backoff di slab_grow).
+         */
+        static uint64_t muto_epoca;
+        static uint64_t muti;
+        if (muto_epoca != g_stream_vram_epoca) {
+            if (muti != 0) {
+                fprintf(stderr,
+                        "ds4: CUDA streaming expert cache: altre %llu "
+                        "ammissioni non riservate nell'epoca precedente\n",
+                        (unsigned long long)muti);
+            }
+            muto_epoca = g_stream_vram_epoca;
+            muti = 0;
+            fprintf(stderr,
+                    "ds4: CUDA streaming expert cache cannot reserve a %.2f MiB "
+                    "slot for layer=%u expert=%d\n",
+                    (double)bytes / 1048576.0, layer, expert);
+        } else {
+            muti++;
+        }
         return -1;
     }
     if (!pooled) {
@@ -2895,10 +3617,39 @@ static void cuda_stream_resident_cache_release(void) {
                 (double)g_stream_resident_hit_bytes / 1073741824.0,
                 (double)g_stream_resident_disk_bytes / 1073741824.0);
     }
+    /* Consuntivo dopo il confine batch->token singolo, se e' stato
+     * attraversato: il cumulato sopra somma la scansione dei blocchi (che
+     * chiede ~ogni esperto una volta) ai token generati, e maschera cosi'
+     * il tasso di hit che l'utente paga davvero durante la generazione.
+     * "Token singolo" e non "decode": vedi la nota sul criterio in
+     * begin_load — un prefill di un token non e' distinguibile qui. */
+    if ((g_stream_resident_snap_hits | g_stream_resident_snap_misses) != 0) {
+        const uint64_t dec_hits =
+            g_stream_resident_hits - g_stream_resident_snap_hits;
+        const uint64_t dec_misses =
+            g_stream_resident_misses - g_stream_resident_snap_misses;
+        const uint64_t dec_tot = dec_hits + dec_misses;
+        fprintf(stderr,
+                "ds4: CUDA resident expert cache: soli load a token singolo: "
+                "%llu hit / %llu richieste (%.1f%%), %.2f GiB dalla VRAM, "
+                "%.2f GiB riletti dal modello\n",
+                (unsigned long long)dec_hits,
+                (unsigned long long)dec_tot,
+                dec_tot ? 100.0 * (double)dec_hits / (double)dec_tot : 0.0,
+                (double)(g_stream_resident_hit_bytes -
+                         g_stream_resident_snap_hit_bytes) / 1073741824.0,
+                (double)(g_stream_resident_disk_bytes -
+                         g_stream_resident_snap_disk_bytes) / 1073741824.0);
+    }
     g_stream_resident_hits = 0;
     g_stream_resident_misses = 0;
     g_stream_resident_hit_bytes = 0;
     g_stream_resident_disk_bytes = 0;
+    g_stream_resident_snap_hits = 0;
+    g_stream_resident_snap_misses = 0;
+    g_stream_resident_snap_hit_bytes = 0;
+    g_stream_resident_snap_disk_bytes = 0;
+    g_stream_prev_load_scan = 0;
     for (cuda_stream_resident_expert &e : g_stream_resident_experts) {
         if (e.base && !e.pooled) (void)cudaFree(e.base);
     }
@@ -2915,6 +3666,10 @@ static void cuda_stream_resident_cache_release(void) {
         cl.slot_count = 0;
     }
     g_stream_expert_classes.clear();
+    /* VRAM restituita al driver: le classi che avevano rinunciato a crescere
+     * possono ritentare (15/08, rilievo 6). Qui le classi spariscono del
+     * tutto, ma l'epoca serve agli altri rilasci che non le distruggono. */
+    cuda_stream_vram_liberata();
 }
 
 /*
@@ -3595,6 +4350,19 @@ extern "C" void ds4_gpu_cleanup(void) {
             }
         }
     }
+    /*
+     * ORDINE OBBLIGATO (15/08, rilievo 3 del contraddittorio).
+     *
+     * Il pool di lettura scrive dentro la selected cache e legge dallo
+     * staging pinned: va spento e drenato PRIMA di liberarli, non dopo.
+     * Nell'ordine precedente (release, stage_release, shutdown) un worker
+     * ancora vivo poteva completare una copia verso buffer gia' liberati —
+     * use-after-free silenzioso, tanto piu' insidioso perche' il
+     * cudaDeviceSynchronize in cima a questa funzione da' l'impressione di
+     * aver messo tutti d'accordo, mentre un worker puo' aprire una nuova
+     * H2D subito dopo.
+     */
+    cuda_stream_read_pool_shutdown();
     cuda_stream_selected_cache_release();
     cuda_stream_selected_stage_release();
     cuda_stream_resident_cache_release();
@@ -4471,6 +5239,11 @@ extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
+    /* Stesso protocollo del teardown (15/08, rilievo 4): il pool va drenato
+     * PRIMA di liberare la selected cache, che e' la destinazione dei suoi
+     * upload, e prima di cambiare il modello sotto ai suoi piedi. Il pool e'
+     * a creazione pigra: il prossimo lotto lo fa rinascere da solo. */
+    cuda_stream_read_pool_shutdown();
     cuda_stream_selected_cache_release();
     cuda_stream_resident_cache_release();
     cuda_model_range_release_all();
@@ -4645,6 +5418,11 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
 
+    /* Stesso drenaggio degli altri rebind: questa API era rimasta scoperta,
+     * ed e' quella su cui passa ds4_gpu_set_model_map_range (15/08, secondo
+     * contraddittorio). Senza, un worker in volo scrive su memoria liberata
+     * e continua a leggere il modello vecchio. */
+    cuda_stream_read_pool_shutdown();
     cuda_stream_selected_cache_release();
     cuda_stream_resident_cache_release();
     cuda_model_range_release_all();
@@ -5159,6 +5937,11 @@ extern "C" int ds4_gpu_lookup_cache_strict(uint64_t source_offset,
 }
 
 extern "C" int ds4_gpu_set_model_fd(int fd) {
+    /* I worker leggono da g_model_fd / g_model_direct_fd: sostituirli
+     * mentre il pool e' vivo significa chiudere un fd sotto una pread in
+     * corso, o peggio riusare quel numero per un altro file (15/08,
+     * rilievo 4). Si drena prima. */
+    cuda_stream_read_pool_shutdown();
     g_model_fd = fd;
     g_model_fd_host_base = g_model_host_base;
     g_model_file_size = 0;
@@ -27428,6 +28211,9 @@ static int cuda_stream_selected_ensure_bytes(
         char **ptr, uint64_t *capacity, uint64_t bytes, const char *label) {
     if (*ptr && *capacity >= bytes) return 1;
     if (*ptr) {
+        /* Se non si puo' invalidare (cattura in corso), NON si libera: un
+         * replay futuro userebbe l'indirizzo vecchio. Meglio fallire il load. */
+        if (!cuda_stream_selected_addresses_changing(label)) return 0;
         (void)cudaFree(*ptr);
         *ptr = NULL;
         *capacity = 0;
@@ -27452,6 +28238,27 @@ static int cuda_stream_selected_ensure_i32(uint64_t count) {
             &g_stream_selected_cache.slot_selected_capacity,
             bytes,
             "selected-id remap");
+}
+
+/* Le quattro allocazioni della tabella compatta, riunite: servono due volte
+ * in begin_load (tentativo normale e ritentativo dopo aver ceduto la cache
+ * residente) e duplicarle inline renderebbe illeggibile il chiamante. */
+static int cuda_stream_selected_tables_ensure(uint64_t gate_bytes,
+                                              uint64_t down_bytes,
+                                              uint32_t slot_count) {
+    return cuda_stream_selected_ensure_bytes(
+                   &g_stream_selected_cache.gate_ptr,
+                   &g_stream_selected_cache.gate_capacity,
+                   gate_bytes, "gate experts") &&
+           cuda_stream_selected_ensure_bytes(
+                   &g_stream_selected_cache.up_ptr,
+                   &g_stream_selected_cache.up_capacity,
+                   gate_bytes, "up experts") &&
+           cuda_stream_selected_ensure_bytes(
+                   &g_stream_selected_cache.down_ptr,
+                   &g_stream_selected_cache.down_capacity,
+                   down_bytes, "down experts") &&
+           cuda_stream_selected_ensure_i32(slot_count);
 }
 
 static int cuda_stream_selected_ranges_valid(
@@ -27479,10 +28286,18 @@ static int cuda_stream_selected_ranges_valid(
            down_bytes <= table->model_size - table->down_offset;
 }
 
+/*
+ * n_tokens: quanti token compone questo load. E' la FASE, dichiarata dal
+ * chiamante invece che indovinata (15/08, rilievi 1 e 2). 1 = un passo di
+ * generazione; >1 = un blocco di prefill. Chi non lo sa passi 0: viene
+ * trattato come sconosciuto e il vecchio criterio sulla cardinalita' resta
+ * come sola rete di sicurezza.
+ */
 static int cuda_stream_selected_cache_begin_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
-        uint32_t slot_count) {
+        uint32_t slot_count,
+        uint32_t n_tokens) {
     cuda_stream_selected_cache_invalidate();
     if (!g_ssd_streaming_mode) return 1;
     if (!cuda_stream_selected_ranges_valid(table) || !selected_ids ||
@@ -27530,6 +28345,147 @@ static int cuda_stream_selected_cache_begin_load(
     }
     const uint64_t gate_bytes = compact_count * table->gate_expert_bytes;
     const uint64_t down_bytes = compact_count * table->down_expert_bytes;
+    /*
+     * CANCELLO ANTI-SCANSIONE (15/08), soglia derivata dalla FASE.
+     *
+     * Perche' serve: l'ammissione incondizionata dei miss fa si' che ogni
+     * layer di ogni blocco di prefill ricopra l'intera cache residente
+     * (~11.000 sfratti a blocco su ~250 slot, LRU puro): alla fine del
+     * prefill la cache contiene la coda dell'ultimo layer e il decode
+     * riparte da zero — misurato 49% di hit a prompt corto contro 7,8%
+     * cumulato dopo un prompt da 3555 token. E' la patologia LRU-contro-
+     * scansione da manuale: una scansione piu' grande della cache la svuota
+     * senza trarne alcun beneficio. Gli HIT durante il prefill restano
+     * attivi (resident_find non e' toccato): la cache continua a servire,
+     * smette solo di farsi riscrivere dalla scansione.
+     *
+     * COME SI RICONOSCE LA SCANSIONE — correzione del 15/08 (rilievi 1 e 2
+     * del contraddittorio). La prima versione usava `compact_count > 32`.
+     * Numero cablato, e soprattutto grandezza sbagliata: compact_count e' la
+     * CARDINALITA' del working set, non la fase. Due batch con la stessa
+     * cardinalita' possono avere semantica opposta — cinque token di prefill
+     * con top-k 6 stanno sotto 32 pur essendo prefill; un decode raggruppato
+     * con 33 distinti sta sopra e non imparerebbe piu' nulla per sempre. E
+     * un prefill di UN token dopo rewind KV veniva contato come decode,
+     * falsando proprio la telemetria usata per giustificare la politica.
+     *
+     * Ora si decide su n_tokens, che il chiamante conosce senza indovinarlo:
+     * prepare_selected_batch lo riceve gia' separato da n_selected e lo
+     * buttava via. Un load di piu' token e' un blocco: nessuna ammissione. Un
+     * load di un solo token si ammette, perche' quei sei esperti hanno alta
+     * probabilita' di riuso immediato.
+     *
+     * ONESTA' SU COSA QUESTO E' (secondo contraddittorio, rilievo accolto):
+     * n_tokens NON e' la fase, e' un ottimo indizio della fase. Un prefill di
+     * un solo token dopo rewind KV resta indistinguibile da un passo di
+     * decode. Per la POLITICA di ammissione la differenza non conta — un
+     * token e' un token, e ammetterlo e' giusto in entrambi i casi — ma per
+     * la TELEMETRIA si', quindi il confine sotto e' etichettato per quello
+     * che sa davvero ("da batch a token singolo") e non per quello che
+     * vorrebbe sapere. Una fase vera richiede un flag dichiarato dai call
+     * site in ds4.c: e' un lavoro separato, non un ritocco di questa riga.
+     *
+     * Il vecchio criterio resta come RETE DI SICUREZZA per i chiamanti che
+     * passano 0 (indizio assente), con la soglia ora configurabile invece
+     * che cablata: DS4_CUDA_STREAM_SCAN_DISTINCT, default 32.
+     *
+     * DS4_CUDA_STREAM_SCAN_ADMIT=1 ripristina l'ammissione incondizionata
+     * (per l'A/B e come via di fuga).
+     */
+    static uint64_t scan_distinct_soglia = 0;
+    if (scan_distinct_soglia == 0) {
+        scan_distinct_soglia = 32u;
+        const char *env = getenv("DS4_CUDA_STREAM_SCAN_DISTINCT");
+        if (env && env[0]) {
+            char *fine = NULL;
+            errno = 0;
+            const unsigned long v = strtoul(env, &fine, 10);
+            if (fine != env && errno == 0 && v > 0ul) {
+                scan_distinct_soglia = (uint64_t)v;
+            }
+        }
+    }
+    const int fase_nota = (n_tokens != 0u);
+    const int load_scan = fase_nota ? (n_tokens > 1u)
+                                    : (compact_count > scan_distinct_soglia);
+    static int scan_admit_override = -1;
+    if (scan_admit_override < 0) {
+        const char *env = getenv("DS4_CUDA_STREAM_SCAN_ADMIT");
+        scan_admit_override =
+            (env != NULL && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    const int ammetti = scan_admit_override || !load_scan;
+    if (g_stream_prev_load_scan && !load_scan) {
+        /* Confine da batch a token singolo: fotografa i contatori. Da qui in
+         * poi il consuntivo al rilascio misura i load a un token — che sono
+         * i token generati, salvo un eventuale prefill di un solo token dopo
+         * rewind KV, che questo criterio non sa distinguere e che quindi non
+         * viene dichiarato "decode". */
+        const uint64_t tot = g_stream_resident_hits + g_stream_resident_misses;
+        fprintf(stderr,
+                "ds4: CUDA resident expert cache: confine batch->token "
+                "singolo: %llu hit / %llu richieste (%.1f%%), %.2f GiB dalla "
+                "VRAM, %.2f GiB riletti dal modello\n",
+                (unsigned long long)g_stream_resident_hits,
+                (unsigned long long)tot,
+                tot ? 100.0 * (double)g_stream_resident_hits / (double)tot : 0.0,
+                (double)g_stream_resident_hit_bytes / 1073741824.0,
+                (double)g_stream_resident_disk_bytes / 1073741824.0);
+        g_stream_resident_snap_hits = g_stream_resident_hits;
+        g_stream_resident_snap_misses = g_stream_resident_misses;
+        g_stream_resident_snap_hit_bytes = g_stream_resident_hit_bytes;
+        g_stream_resident_snap_disk_bytes = g_stream_resident_disk_bytes;
+        /*
+         * RILASCIO DELLA TABELLA COMPATTA — SPERIMENTALE, SPENTO DI SERIE.
+         *
+         * L'idea (15/08): il prefill dimensiona la tabella a ~n_total_expert
+         * esperti (256 x 6,75 MiB = 1,73 GiB) e cuda_stream_selected_
+         * ensure_bytes cresce ma non rientra mai; al decode servono <= top-k
+         * slot (~40 MiB), quindi rilasciarla qui restituirebbe ~1,7 GiB alla
+         * cache residente.
+         *
+         * BOCCIATA alla misura A-B-A del 15/08 (drop_caches fra i giri):
+         * con il rilascio attivo l'impronta dell'output cambia
+         * (3ad4b5ff... contro db75ddcf...) e il decode fa 10.578 richieste
+         * di esperti invece di 11.868 — computazione diversa, non velocita'.
+         *
+         * TRAPPOLA DOCUMENTATA (15/08, vale anche se questo rilascio verra'
+         * scartato del tutto): le isole di decode catturate come CUDA graph
+         * (g_decode_graphs, vedi ds4_cuda.cu:1040-1120) incorporano gli
+         * argomenti dei kernel AL MOMENTO della cattura — inclusi gate_ptr/
+         * up_ptr/down_ptr/slot_selected_ptr della tabella compatta, risolti
+         * all'encode (percorso use_stream_selected_cache) — e al replay
+         * l'encode e' saltato per intero: il puntatore fresco non viene mai
+         * riletto. La chiave del graph (ds4_decode_graph_key) contiene solo
+         * i buffer hidden-state, NON questi puntatori. La convenzione
+         * in-tree esiste gia': cuda_tmp_alloc, quando rialloca lo scratch,
+         * sincronizza e chiama ds4_gpu_decode_graphs_invalidate() PRIMA del
+         * cudaFree (ds4_cuda.cu:760-772).
+         *
+         * Dal 15/08 quella sequenza e' dentro cuda_stream_selected_cache_
+         * release e cuda_stream_selected_ensure_bytes (rilievi 7 e 8): il
+         * contratto sta nel proprietario dell'allocazione, cosi' vale anche
+         * per la SECONDA crescita della tabella nella stessa vita del
+         * processo e per i rebind di modello, che prima non erano coperti.
+         * Qui non serve piu' fare nulla di speciale.
+         *
+         * Il rilascio in se' resta comunque dietro opt-in
+         * DS4_CUDA_RELEASE_SELECTED_TABLE=1: la bocciatura sopra e' di
+         * merito (cambia la computazione), non di lifetime, e non e' stata
+         * riesaminata dopo questa correzione.
+         */
+        static int release_selected_table = -1;
+        if (release_selected_table < 0) {
+            const char *rel_env = getenv("DS4_CUDA_RELEASE_SELECTED_TABLE");
+            release_selected_table =
+                (rel_env != NULL && rel_env[0] != '\0' &&
+                 strcmp(rel_env, "0") != 0) ? 1 : 0;
+        }
+        if (release_selected_table) {
+            cuda_stream_selected_cache_release();
+        }
+    }
+    g_stream_prev_load_scan = load_scan;
     const int logical_tier = 0;
     if (g_stream_selected_cache.logical_tier != logical_tier &&
         (g_stream_selected_cache.gate_ptr ||
@@ -27538,24 +28494,50 @@ static int cuda_stream_selected_cache_begin_load(
          g_stream_selected_cache.slot_selected_ptr)) {
         cuda_stream_selected_cache_release();
     }
-    if (ds4_gpu_set_current_device(logical_tier) != 0 ||
-        !cuda_stream_selected_ensure_bytes(
-                &g_stream_selected_cache.gate_ptr,
-                &g_stream_selected_cache.gate_capacity,
-                gate_bytes, "gate experts") ||
-        !cuda_stream_selected_ensure_bytes(
-                &g_stream_selected_cache.up_ptr,
-                &g_stream_selected_cache.up_capacity,
-                gate_bytes, "up experts") ||
-        !cuda_stream_selected_ensure_bytes(
-                &g_stream_selected_cache.down_ptr,
-                &g_stream_selected_cache.down_capacity,
-                down_bytes, "down experts") ||
-        !cuda_stream_selected_ensure_i32(slot_count)) {
+    if (ds4_gpu_set_current_device(logical_tier) != 0) {
+        cuda_stream_selected_cache_invalidate();
+        return 0;
+    }
+    int tabelle_ok =
+        cuda_stream_selected_tables_ensure(gate_bytes, down_bytes, slot_count);
+    if (!tabelle_ok && !g_stream_resident_experts.empty()) {
+        /* Degrado, non aborto (15/08): dopo il rilascio post-prefill la VRAM
+         * della tabella larga puo' essere stata assorbita dagli slab della
+         * cache residente; un NUOVO prefill che la rivuole deve poterla
+         * riavere. La cache residente e' solo un acceleratore: cederla tutta
+         * e riprovare una volta e' sempre meglio di fallire il load. */
+        cuda_stream_resident_cache_release();
+        tabelle_ok = cuda_stream_selected_tables_ensure(gate_bytes, down_bytes,
+                                                        slot_count);
+    }
+    if (!tabelle_ok) {
         cuda_stream_selected_cache_invalidate();
         return 0;
     }
 
+    /*
+     * TRE PASSATE (15/08, per il pool di letture parallele).
+     *
+     * Prima erano una sola: hit, lettura sincrona e ammissione intrecciati
+     * per esperto. Con il pool le letture dei miss devono partire INSIEME,
+     * quindi: (1) hit subito e miss raccolti come job; (2) i job in
+     * parallelo, un'attesa sola; (3) le ammissioni. Le ammissioni in coda
+     * valgono anche per il percorso sequenziale (pool spento): cosi' uno
+     * sfratto da ammissione non puo' piu' cadere su un esperto che questa
+     * stessa passata avrebbe trovato residente qualche indice dopo, e l'A/B
+     * pool acceso/spento confronta due percorsi identici salvo la
+     * profondita' di coda.
+     */
+    const uint32_t pool_workers = cuda_stream_read_worker_count();
+    std::vector<cuda_stream_read_job> read_jobs;
+    std::vector<uint32_t> miss_ids;
+    try {
+        if (pool_workers != 0) read_jobs.reserve(compact_ids.size() * 3u);
+        miss_ids.reserve(compact_ids.size());
+    } catch (...) {
+        cuda_stream_selected_cache_invalidate();
+        return 0;
+    }
     for (uint32_t i = 0; i < compact_ids.size(); i++) {
         const uint64_t expert = (uint32_t)compact_ids[i];
         const uint64_t gate_src =
@@ -27607,7 +28589,23 @@ static int cuda_stream_selected_cache_begin_load(
         }
         g_stream_resident_misses++;
         g_stream_resident_disk_bytes += expert_bytes;
-        if (!cuda_model_copy_to_device_streamed(
+        miss_ids.push_back(i);
+        if (pool_workers != 0) {
+            cuda_stream_read_job job;
+            memset(&job, 0, sizeof(job));
+            job.dst = g_stream_selected_cache.gate_ptr + gate_dst;
+            job.offset = gate_src;
+            job.bytes = table->gate_expert_bytes;
+            read_jobs.push_back(job);
+            job.dst = g_stream_selected_cache.up_ptr + gate_dst;
+            job.offset = up_src;
+            job.bytes = table->gate_expert_bytes;
+            read_jobs.push_back(job);
+            job.dst = g_stream_selected_cache.down_ptr + down_dst;
+            job.offset = down_src;
+            job.bytes = table->down_expert_bytes;
+            read_jobs.push_back(job);
+        } else if (!cuda_model_copy_to_device_streamed(
                     g_stream_selected_cache.gate_ptr + gate_dst,
                     table->model_map, table->model_size,
                     gate_src, table->gate_expert_bytes,
@@ -27625,22 +28623,41 @@ static int cuda_stream_selected_cache_begin_load(
             cuda_stream_selected_cache_invalidate();
             return 0;
         }
+    }
+    /* Passata 2: le letture dei miss in parallelo, un'attesa sola. A lotti
+     * solo nel caso teorico in cui un layer chieda piu' job del massimo del
+     * pool (256 esperti x 3 = 768 < 1152 su questa famiglia di modelli). */
+    for (size_t base = 0; base < read_jobs.size();
+         base += (size_t)DS4_CUDA_STREAM_READ_MAX_JOBS) {
+        const size_t resto = read_jobs.size() - base;
+        const uint32_t lotto = resto > (size_t)DS4_CUDA_STREAM_READ_MAX_JOBS ?
+            (uint32_t)DS4_CUDA_STREAM_READ_MAX_JOBS : (uint32_t)resto;
+        if (!cuda_stream_read_jobs_parallel(&read_jobs[base], lotto)) {
+            cuda_stream_selected_cache_invalidate();
+            return 0;
+        }
+    }
 
-        /*
-         * AMMISSIONE SUI MISS (14/08).
-         *
-         * Senza questo blocco la cache puo' contenere SOLTANTO cio' che il seed
-         * iniziale vi ha messo: `cuda_stream_resident_alloc` aveva un unico
-         * chiamante, il seed. Restava quindi congelata sulla previsione della
-         * hotlist e non imparava nulla dagli esperti realmente richiesti — il
-         * tetto di hit sarebbe la sola sovrapposizione con quella previsione.
-         * Rilievo del contraddittorio con gpt-5.6-sol del 14/08.
-         *
-         * La sorgente e' la selected-cache, non il disco: i byte sono gia' in
-         * VRAM perche' li abbiamo appena letti, quindi ammettere costa una copia
-         * device-to-device e non una seconda lettura dal GGUF.
-         */
-        if (g_stream_expert_cache_budget != 0 && ridx < 0) {
+    /*
+     * Passata 3 — AMMISSIONE SUI MISS (14/08, spostata in coda il 15/08).
+     *
+     * Senza questo blocco la cache puo' contenere SOLTANTO cio' che il seed
+     * iniziale vi ha messo: `cuda_stream_resident_alloc` aveva un unico
+     * chiamante, il seed. Restava quindi congelata sulla previsione della
+     * hotlist e non imparava nulla dagli esperti realmente richiesti — il
+     * tetto di hit sarebbe la sola sovrapposizione con quella previsione.
+     * Rilievo del contraddittorio con gpt-5.6-sol del 14/08.
+     *
+     * La sorgente e' la selected-cache, non il disco: i byte sono gia' in
+     * VRAM perche' li abbiamo appena letti, quindi ammettere costa una copia
+     * device-to-device e non una seconda lettura dal GGUF.
+     */
+    if (ammetti && g_stream_expert_cache_budget != 0) {
+        for (size_t m = 0; m < miss_ids.size(); m++) {
+            const uint32_t i = miss_ids[m];
+            const uint64_t expert = (uint32_t)compact_ids[i];
+            const uint64_t gate_dst = (uint64_t)i * table->gate_expert_bytes;
+            const uint64_t down_dst = (uint64_t)i * table->down_expert_bytes;
             const int nuovo = cuda_stream_resident_alloc(
                     table->model_map, table->layer, (int32_t)expert,
                     table->gate_offset, table->up_offset, table->down_offset,
@@ -27670,6 +28687,9 @@ static int cuda_stream_selected_cache_begin_load(
                                 cudaMemcpyDeviceToDevice,
                                 g_stream_selected_upload_stream),
                             "resident down expert admit");
+                /* Il drenaggio va fatto ANCHE su copia fallita: qualche copia
+                 * puo' essere gia' partita, e sfrattare lo slot con trasferimenti
+                 * in volo lo restituirebbe alla free-list mentre viene scritto. */
                 const int drenato =
                     cuda_ok(cudaStreamSynchronize(g_stream_selected_upload_stream),
                             "resident expert admit sync");
@@ -33082,7 +34102,10 @@ extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
                  "GLM streaming selected-id read")) {
         return 0;
     }
-    return cuda_stream_selected_cache_begin_load(table, ids.data(), n_selected);
+    /* Una riga di top-k = un token: e' il contratto di questa API (i
+     * chiamanti in ds4.c passano sempre n_expert_used). */
+    return cuda_stream_selected_cache_begin_load(table, ids.data(), n_selected,
+                                                 1u);
 }
 
 __global__ static void glm_value_project_q8_0_batch_heads_kernel(
@@ -33711,8 +34734,10 @@ extern "C" int ds4_gpu_stream_expert_cache_begin_selected_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
         uint32_t                           n_selected) {
+    /* API a riga singola: n_selected e' il top-k di UN token (ds4.c passa
+     * sempre DS4_N_EXPERT_USED). Da qui la fase e' nota ed e' decode. */
     return cuda_stream_selected_cache_begin_load(table, selected_ids,
-                                                 n_selected);
+                                                 n_selected, 1u);
 }
 
 extern "C" uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
@@ -33838,7 +34863,12 @@ extern "C" void ds4_gpu_set_glm_model(bool enabled) {
 extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     g_ssd_streaming_mode = enabled ? 1 : 0;
     cuda_stream_selected_cache_invalidate();
-    if (!g_ssd_streaming_mode) cuda_stream_selected_cache_release();
+    if (!g_ssd_streaming_mode) {
+        /* Spegnere lo streaming libera la destinazione degli upload: prima
+         * si drena il pool (15/08, rilievo 4). */
+        cuda_stream_read_pool_shutdown();
+        cuda_stream_selected_cache_release();
+    }
 }
 
 extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
@@ -33944,8 +34974,10 @@ extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         (uint64_t)n_tokens * n_selected > UINT32_MAX) {
         return 0;
     }
+    /* n_tokens arriva fin qui e prima veniva collassato dentro il prodotto:
+     * e' la fase, e adesso prosegue separata (15/08, rilievo 1). */
     return cuda_stream_selected_cache_begin_load(
-            table, selected_ids, n_tokens * n_selected);
+            table, selected_ids, n_tokens * n_selected, n_tokens);
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
