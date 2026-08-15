@@ -15545,6 +15545,9 @@ __global__ static void __launch_bounds__(512) indexer_topk_stream512_kernel(
     __shared__ typename StreamSort::TempStorage sort_tmp;
     __shared__ uint32_t s_cnt;
     __shared__ uint64_t s_thr;
+    /* verdetto del compact CONGELATO sotto barriera — vedi la nota alla
+     * lettura, piu' sotto. Costa una parola di shared memory. */
+    __shared__ uint32_t s_vcnt;
 
     const uint32_t t = blockIdx.x;
     const uint32_t tid = threadIdx.x;
@@ -15581,8 +15584,41 @@ __global__ static void __launch_bounds__(512) indexer_topk_stream512_kernel(
         }
         __syncthreads();
 
-        if (s_cnt > STREAM_CAP - tile) {
-            const uint32_t cnt = s_cnt;
+        /* CAUSA RADICE DELL'ILLEGAL ACCESS SUI PROMPT LUNGHI (16/08).
+         *
+         * Il verdetto del compact va letto da un valore CONGELATO sotto
+         * barriere. Leggendo `s_cnt` direttamente qui si corre con
+         * l'atomicAdd dell'append dell'iterazione SUCCESSIVA sul percorso
+         * "salta", perche' fra i due non c'e' nessuna barriera: una warp
+         * veloce che legge "salta" torna al giro dopo e incrementa s_cnt
+         * prima che una sorella lenta l'abbia letto; la sorella supera
+         * allora la soglia ed entra nel compact DA SOLA. Le warp restano
+         * divise fra due iterazioni, gli arrivi alla singola barriera
+         * hardware si confondono, lo stato di rank di cub si corrompe, e un
+         * rank spazzatura scrive fuori dalla finestra di shared memory —
+         * illegal access.
+         *
+         * COME SI MANIFESTAVA DA NOI: `CUDA model range upload sync failed
+         * for attn_out_a`. Il nome del tensore non e' il colpevole: gli
+         * errori CUDA sono asincroni e affiorano al primo punto di
+         * sincronizzazione successivo. Il kernel e' il selettore top-512
+         * dell'indexer, che gira nel prefill — per questo esplodeva solo
+         * sui prompt lunghi, e in modo che sembrava intermittente.
+         *
+         * La barriera qui sotto chiude la finestra per costruzione: nessun
+         * append dell'iterazione k+1 puo' partire prima che ogni warp abbia
+         * passato lo scatto, quindi `s_vcnt` e' esattamente il numero di
+         * append completati e il verdetto e' uniforme fra tutte le warp.
+         *
+         * Diagnosi e rimedio di Entrpi (fork ds4, commit 6d3cfa4 del
+         * 05/08/2026, «stream512 compact-verdict race»). Da noi il codice
+         * era identico riga per riga, e il rimedio mancava.
+         */
+        if (tid == 0) s_vcnt = s_cnt;
+        __syncthreads();
+
+        if (s_vcnt > STREAM_CAP - tile) {
+            const uint32_t cnt = s_vcnt;
             uint64_t keys[STREAM_ITEMS];
 #pragma unroll
             for (uint32_t k = 0; k < STREAM_ITEMS; k++) {
