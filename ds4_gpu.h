@@ -3302,6 +3302,26 @@ int ds4_gpu_qwen35_gdn_prefill(
         uint32_t              n_tokens,
         float                 norm_eps);
 
+/* Qwen3.5 full attention, one layer in four.  Query heads are grouped over
+ * fewer key/value heads (24 over 4 in the 27B), so the cache holds n_head_kv
+ * heads and query head h reads cache head h / (n_head / n_head_kv).  Storing
+ * one cache head per query head instead would hold six identical copies. */
+int ds4_gpu_qwen35_attention_gqa_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *key_cache,
+        const ds4_gpu_tensor *value_cache,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              cache_len,
+        uint32_t              cache_cap,
+        uint32_t              n_head,
+        uint32_t              n_head_kv,
+        uint32_t              qk_dim,
+        uint32_t              value_dim,
+        bool                  cache_f16);
+
+
 
 /* Decode-island CUDA graph capture (CUDA backend; Metal/ROCm/CPU stub it
  * out and stay eager).  Design ported from the Entrpi/ds4 batched-serving

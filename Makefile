@@ -9,6 +9,7 @@ endif
 SAMPLING_TEST := tests/test_sampling
 GLM53_KDA_TEST := tests/test_glm53_kda
 QWEN35_GDN_TEST := tests/test_qwen35_gdn
+QWEN35_ATTN_TEST := tests/test_qwen35_attn
 GLM53_KDA_ROCM_TEST := tests/test_glm53_kda_rocm
 
 DEBUG_FLAGS ?= -g
@@ -814,4 +815,19 @@ $(QWEN35_GDN_TEST): tests/test_qwen35_gdn.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
 .PHONY: test-qwen35-gdn
 test-qwen35-gdn: $(QWEN35_GDN_TEST)
 	./$(QWEN35_GDN_TEST)
+
+
+tests/test_qwen35_attn.o: tests/test_qwen35_attn.c ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_qwen35_attn.c
+
+$(QWEN35_ATTN_TEST): tests/test_qwen35_attn.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+.PHONY: test-qwen35-attn
+test-qwen35-attn: $(QWEN35_ATTN_TEST)
+	./$(QWEN35_ATTN_TEST)
+
+# Tutto il supporto qwen35 verificabile in un colpo.
+.PHONY: test-qwen35
+test-qwen35: test-qwen35-gdn test-qwen35-attn
 

@@ -30299,6 +30299,142 @@ extern "C" int ds4_gpu_qwen35_gdn_prefill(
         n_k_heads, n_v_heads, head_dim, conv_len, n_tokens, norm_eps, "prefill");
 }
 
+/* ---------------------------------------------------------------------------
+ * Qwen3.5 full attention, one of every four layers.
+ *
+ * The GLM dense attention above stores one cache head per query head.  Qwen
+ * groups them: 24 query heads over 4 key/value heads, so replaying that layout
+ * would hold six identical copies of every key and value.  At 4096 tokens over
+ * 16 attention layers that is the difference between about 270 MB and 1.6 GB on
+ * a card that already carries 10.2 GB of weights, which is the whole margin.
+ *
+ * So the only change from that kernel is the index: query head h reads cache
+ * head h / (n_head / n_head_kv).  Everything else, including the streaming
+ * softmax that keeps the running maximum, is the same arithmetic.
+ * ------------------------------------------------------------------------- */
+template <typename CT>
+__global__ static void qwen35_attention_gqa_kernel(
+        float       *heads,
+        const float *q,
+        const CT    *key_cache,
+        const CT    *value_cache,
+        uint32_t     pos0,
+        uint32_t     n_tokens,
+        uint32_t     cache_len,
+        uint32_t     n_head,
+        uint32_t     n_head_kv,
+        uint32_t     qk_dim,
+        uint32_t     value_dim) {
+    const uint32_t token = blockIdx.x;
+    const uint32_t head = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    if (token >= n_tokens || head >= n_head) return;
+
+    extern __shared__ float reduce[];
+    const uint32_t group = n_head / n_head_kv;
+    const uint32_t kv_head = head / group;
+    const float *qh = q + ((uint64_t)token * n_head + head) * qk_dim;
+    const uint32_t visible = min(cache_len, pos0 + token + 1u);
+    const float scale = rsqrtf((float)qk_dim);
+    float max_score = -FLT_MAX;
+    float sum_weight = 0.0f;
+    float output = 0.0f;
+
+    for (uint32_t row = 0; row < visible; row++) {
+        const CT *krow = key_cache +
+            ((uint64_t)row * n_head_kv + kv_head) * qk_dim;
+        float dot = 0.0f;
+        for (uint32_t d = tid; d < qk_dim; d += blockDim.x) {
+            dot = fmaf(qh[d], (float)krow[d], dot);
+        }
+        reduce[tid] = dot;
+        __syncthreads();
+        for (uint32_t step = blockDim.x >> 1u; step > 0u; step >>= 1u) {
+            if (tid < step) reduce[tid] += reduce[tid + step];
+            __syncthreads();
+        }
+        const float score = reduce[0] * scale;
+        const float next_max = fmaxf(max_score, score);
+        const float old_scale = max_score == -FLT_MAX
+            ? 0.0f : expf(max_score - next_max);
+        const float row_weight = expf(score - next_max);
+        if (tid < value_dim) {
+            const CT *vrow = value_cache +
+                ((uint64_t)row * n_head_kv + kv_head) * value_dim;
+            output = output * old_scale + row_weight * (float)vrow[tid];
+        }
+        sum_weight = sum_weight * old_scale + row_weight;
+        max_score = next_max;
+        __syncthreads();
+    }
+    if (tid < value_dim) {
+        heads[((uint64_t)token * n_head + head) * value_dim + tid] =
+            output / fmaxf(sum_weight, 1.0e-20f);
+    }
+}
+
+extern "C" int ds4_gpu_qwen35_attention_gqa_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *key_cache,
+        const ds4_gpu_tensor *value_cache,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              cache_len,
+        uint32_t              cache_cap,
+        uint32_t              n_head,
+        uint32_t              n_head_kv,
+        uint32_t              qk_dim,
+        uint32_t              value_dim,
+        bool                  cache_f16) {
+    uint64_t q_elements = 0, out_elements = 0, cache_elements = 0;
+    uint64_t v_cache_elements = 0;
+    if (!heads || !q || !key_cache || !value_cache ||
+        n_head == 0u || n_head_kv == 0u || n_tokens == 0u ||
+        qk_dim == 0u || value_dim == 0u ||
+        n_head % n_head_kv != 0u ||
+        cache_len > cache_cap ||
+        value_dim > 1024u ||
+        !glm53_cuda_mul_u64((uint64_t)n_tokens * n_head, qk_dim, &q_elements) ||
+        !glm53_cuda_mul_u64((uint64_t)n_tokens * n_head, value_dim, &out_elements) ||
+        !glm53_cuda_mul_u64((uint64_t)cache_cap * n_head_kv, qk_dim, &cache_elements) ||
+        !glm53_cuda_mul_u64((uint64_t)cache_cap * n_head_kv, value_dim, &v_cache_elements) ||
+        !glm53_cuda_tensor_has(q, q_elements, sizeof(float)) ||
+        !glm53_cuda_tensor_has(heads, out_elements, sizeof(float)) ||
+        !glm53_cuda_tensor_has(key_cache, cache_elements,
+                               cache_f16 ? sizeof(__half) : sizeof(float)) ||
+        !glm53_cuda_tensor_has(value_cache, v_cache_elements,
+                               cache_f16 ? sizeof(__half) : sizeof(float))) {
+        fprintf(stderr, "ds4: qwen35 GQA attention received invalid buffers\n");
+        return 0;
+    }
+
+    /* The reduction below halves the thread count each step, so it needs a
+     * power of two, and it must cover both the dot product and the value row. */
+    uint32_t threads = 32u;
+    while (threads < qk_dim || threads < value_dim) threads <<= 1u;
+    if (threads > 1024u) {
+        fprintf(stderr, "ds4: qwen35 GQA attention: head too wide (%u/%u)\n",
+                qk_dim, value_dim);
+        return 0;
+    }
+    const dim3 grid(n_tokens, n_head, 1u);
+    const size_t shared = (size_t)threads * sizeof(float);
+    cudaStream_t stream = cuda_decode_stream();
+    if (cache_f16) {
+        qwen35_attention_gqa_kernel<__half><<<grid, threads, shared, stream>>>(
+            (float *)heads->ptr, (const float *)q->ptr,
+            (const __half *)key_cache->ptr, (const __half *)value_cache->ptr,
+            pos0, n_tokens, cache_len, n_head, n_head_kv, qk_dim, value_dim);
+    } else {
+        qwen35_attention_gqa_kernel<float><<<grid, threads, shared, stream>>>(
+            (float *)heads->ptr, (const float *)q->ptr,
+            (const float *)key_cache->ptr, (const float *)value_cache->ptr,
+            pos0, n_tokens, cache_len, n_head, n_head_kv, qk_dim, value_dim);
+    }
+    return cuda_ok(cudaGetLastError(), "qwen35 GQA attention launch");
+}
+
 extern "C" int ds4_gpu_flush_encoder(void) {
     /* Metal encoder flush: CUDA kernels are already queued in stream
      * order, nothing to split. */
