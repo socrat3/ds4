@@ -63684,7 +63684,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->glm_mtp_timing = opt->glm_mtp_timing;
     e->dspark = opt->dspark;
     e->dspark_strict = opt->dspark_strict;
-    e->dspark_exact_sampling = opt->dspark_exact_sampling;
+    /* Exact stochastic sampling is the DEFAULT here, which inverts upstream.
+     * Upstream keeps opportunistic temperature sampling on unless asked
+     * otherwise; we accept the speed loss to keep the sampled distribution
+     * identical to the one the model would produce without speculation, since
+     * every quality measurement in this tree assumes that.  Opportunistic
+     * sampling is still one environment variable away:
+     *     DS4_DSPARK_OPPORTUNISTIC=1
+     * Kept as a single line on purpose, so the divergence survives a merge. */
+    e->dspark_exact_sampling = opt->dspark_exact_sampling ||
+                               (getenv("DS4_DSPARK_OPPORTUNISTIC") == NULL);
     e->cuda_tensor_parallel = opt->cuda_tensor_parallel;
     e->glm_tp_token_prefill = opt->tp.glm_token_prefill;
     e->ssd_streaming = opt->ssd_streaming;
