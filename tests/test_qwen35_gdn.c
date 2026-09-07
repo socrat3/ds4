@@ -72,8 +72,8 @@ static void require_close(const char *what, uint32_t idx,
 
 enum {
     D = 128,             /* head dimension: the kernel is written for 128 */
-    K_HEADS = 4,
-    V_HEADS = 12,        /* 3 value heads per key head, as 48 over 16 */
+    K_HEADS = 16,
+    V_HEADS = 48,        /* the real geometry of Qwen3.8-27B: 3 value heads per key head */
     CONV_K = 4,
     CONV_HISTORY = CONV_K - 1,
     QK_DIM = K_HEADS * D,
@@ -81,11 +81,17 @@ enum {
     QKV_DIM = 2 * QK_DIM + V_DIM,
     TOKENS = 9,
 
-    CONV_OFFSET = 0,                        /* [QKV_DIM][CONV_K] */
-    SSM_A_OFFSET = 65536,                   /* [V_HEADS] */
-    DT_BIAS_OFFSET = 65536 + 4096,          /* [V_HEADS] */
-    NORM_OFFSET = 65536 + 8192,             /* [D] */
-    MODEL_BYTES = 131072,
+    /* Offsets DERIVED from the geometry, never written by hand: with 48 value
+     * heads the convolution weights alone are 160 KB, and the hand-written
+     * offsets this file started with put ssm_a in the middle of them.  That
+     * cost a segfault, and a constant that has to be recomputed by hand every
+     * time the shape changes will cost it again. */
+    CONV_OFFSET = 0,
+    CONV_BYTES = QKV_DIM * CONV_K * 4,
+    SSM_A_OFFSET = CONV_BYTES,              /* [V_HEADS] */
+    DT_BIAS_OFFSET = SSM_A_OFFSET + V_HEADS * 4,
+    NORM_OFFSET = DT_BIAS_OFFSET + V_HEADS * 4,
+    MODEL_BYTES = NORM_OFFSET + D * 4 + 4096,
 };
 
 static double host_silu(double x) {
@@ -122,7 +128,7 @@ static void host_step(host_gdn *g,
                       const float *output_gate,
                       double norm_eps,
                       double *out) {
-    double mixed[QKV_DIM];
+    static double mixed[QKV_DIM];   /* 80 KB with the real shape: not on the stack */
     for (uint32_t c = 0; c < QKV_DIM; c++) {
         double acc = 0.0;
         for (uint32_t w = 0; w < CONV_HISTORY; w++) {
@@ -227,7 +233,8 @@ int main(void) {
         norm_w[d] = 0.8f + 0.003f * (float)d;
     }
 
-    host_gdn ref;
+    /* 48 heads of 128x128 in double is 6.3 MB: static, not on the stack. */
+    static host_gdn ref;
     memset(&ref, 0, sizeof(ref));
     for (uint32_t c = 0; c < QKV_DIM; c++) {
         for (uint32_t w = 0; w < CONV_K; w++) ref.conv[c][w] = conv_w[c * CONV_K + w];
