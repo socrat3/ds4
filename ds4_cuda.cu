@@ -30109,8 +30109,14 @@ __global__ static void qwen35_gdn_recur_kernel(
 
         const uint64_t out_idx =
             (uint64_t)t * v_dim + (uint64_t)h * QWEN35_CUDA_GDN_DIM + tid;
+        /* SiLU, not sigmoid.  llama.cpp qwen35.cpp::build_norm_gated does
+         * ggml_silu on the gate; the KDA kernel this was modelled on uses
+         * sigmoid, and copying it put the wrong activation here.  The test
+         * had inherited the same mistake from the same place, so the two
+         * agreed and the error was invisible until a reviewer read the
+         * source instead of this code. */
         out[out_idx] = so[tid] * o_scale * output_norm[tid] *
-                       qwen35_cuda_sigmoid(output_gate[out_idx]);
+                       qwen35_cuda_silu(output_gate[out_idx]);
         __syncthreads();
     }
 }

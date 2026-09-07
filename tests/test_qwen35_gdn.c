@@ -22,7 +22,9 @@
  *   5. beta = sigmoid(raw_beta[h])
  *   6. the delta rule:
  *          S *= decay;  u = S.k;  d = (v - u) * beta;  S += k (x) d;  o = S.q
- *   7. per-head RMSNorm with a sigmoid output gate
+ *   7. per-head RMSNorm with a SiLU output gate (qwen35.cpp::build_norm_gated
+ *      does ggml_silu on the gate, NOT sigmoid: GLM's KDA uses sigmoid there
+ *      and copying it is how this file first got it wrong)
  *
  * Value head h reads the query and key of head h % n_k_heads: ggml repeats the
  * whole block cyclically (ggml_repeat_4d), so the mapping is interleaved and
@@ -191,13 +193,13 @@ static void host_step(host_gdn *g,
             head_out[j] = sum;
         }
 
-        /* per-head RMSNorm with a sigmoid output gate */
+        /* per-head RMSNorm with a SiLU output gate */
         double sumsq = 0.0;
         for (uint32_t j = 0; j < D; j++) sumsq += head_out[j] * head_out[j];
         const double inv = 1.0 / sqrt(sumsq / (double)D + norm_eps);
         for (uint32_t j = 0; j < D; j++) {
             out[h * D + j] = head_out[j] * inv * g->norm[j] *
-                             host_sigmoid((double)output_gate[h * D + j]);
+                             host_silu((double)output_gate[h * D + j]);
         }
     }
 }
@@ -259,7 +261,10 @@ int main(void) {
             beta[t][h]  =  0.4f - 0.07f * (float)h + 0.03f * (float)t;
         }
         for (uint32_t i = 0; i < V_DIM; i++) {
-            ogate[t][i] = 0.2f - 0.0017f * (float)(i % 23u) + 0.01f * (float)t;
+            /* Deliberately straddling zero: SiLU is negative below zero and
+             * sigmoid never is, so a gate that stayed positive could hide the
+             * difference between them in magnitude alone. */
+            ogate[t][i] = 0.9f - 0.08f * (float)(i % 23u) + 0.01f * (float)t;
         }
     }
 
