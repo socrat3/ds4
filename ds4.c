@@ -66101,43 +66101,15 @@ static bool qwen35_graph_forward_tokens(
 
     const uint64_t rows = (uint64_t)n * DS4_N_EMBD;
     for (uint32_t il = 0; il < g->n_exec; il++) {
-        bool ok;
-        /* Recurrent layers do not depend on the position, so a decode step can
-         * be captured once and replayed.  Attention layers rotate by position
-         * and bake it into the capture, so they stay eager: that is what the
-         * island field of the key is for upstream, and here the whole layer is
-         * either capturable or it is not.  Prefill never captures: it has more
-         * than one token and different shapes. */
-        if (n == 1u && ds4_qwen35_layer_is_gdn(il) &&
-            ds4_gpu_decode_graphs_supported()) {
-            ds4_decode_graph_key key;
-            memset(&key, 0, sizeof(key));
-            key.il = il;
-            key.island = 0u;
-            key.cur_hc = g->cur ? g->cur->ptr : NULL;
-            key.after_attn_hc = g->tmp ? g->tmp->ptr : NULL;
-            key.after_ffn_hc = g->norm ? g->norm->ptr : NULL;
-            key.attn_norm = g->qkv ? g->qkv->ptr : NULL;
-            for (;;) {
-                const int state = ds4_gpu_decode_graph_begin(&key);
-                if (state == 1) { ok = true; break; }        /* replayed */
-                if (state == 0) {
-                    ok = qwen35_encode_layer(g, model, weights, il, pos0, n);
-                    if (!ok) {
-                        ds4_gpu_decode_graph_abort(&key);
-                        ok = qwen35_encode_layer(g, model, weights, il, pos0, n);
-                        break;
-                    }
-                    if (ds4_gpu_decode_graph_end(&key) == 0) break;
-                    /* Capture retired without running anything: re-encode. */
-                    continue;
-                }
-                ok = qwen35_encode_layer(g, model, weights, il, pos0, n);
-                break;
-            }
-        } else {
-            ok = qwen35_encode_layer(g, model, weights, il, pos0, n);
-        }
+        /* No decode-graph capture here.  It was wired up and measured: the gain
+         * was within noise, and ncu then showed why -- 48 real launch failures
+         * per run, "operation would make the legacy stream depend on a capturing
+         * blocking stream".  Several kernels in this layer launch on the legacy
+         * stream rather than the decode stream, so during capture they simply do
+         * not run, and the model keeps producing fluent text with layers missing.
+         * Capture becomes possible once every kernel on this path takes the
+         * stream as an argument; until then it trades correctness for nothing. */
+        bool ok = qwen35_encode_layer(g, model, weights, il, pos0, n);
 
         if (!ok) {
             fprintf(stderr, "ds4: qwen35: layer %u failed at position %u (%u tokens)\n",
