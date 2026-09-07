@@ -65931,6 +65931,51 @@ static bool qwen35_graph_reset_state(ds4_qwen35_graph *g) {
     }
     return true;
 }
+/* Where a token's time goes, under DS4_QWEN35_TIMING.
+ *
+ * These are wall-clock seconds spent INSIDE the calls, not GPU time: the
+ * launches are asynchronous, so a large number here means the call blocked,
+ * which is precisely the thing the profiles kept pointing at without being
+ * able to attribute.  A final synchronise before reading the logits makes the
+ * totals comparable with the token time. */
+static struct {
+    double matmul;
+    double gdn;
+    double attn;
+    double norm;
+    double other;
+    double total;
+    unsigned long tokens;
+    unsigned long matmuls;
+} g_qwen35_timing;
+
+static int qwen35_timing_on(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("DS4_QWEN35_TIMING") != NULL;
+    return cached;
+}
+
+static void qwen35_timing_report(void) {
+    if (!qwen35_timing_on() || g_qwen35_timing.tokens == 0) return;
+    const double t = g_qwen35_timing.total;
+    const double pct = t > 0.0 ? 100.0 / t : 0.0;
+    fprintf(stderr,
+            "ds4: qwen35 timing over %lu tokens (%.3f s total, %.1f ms/token):\n"
+            "  matmul %6.3f s (%4.1f%%, %lu calls)\n"
+            "  gdn    %6.3f s (%4.1f%%)\n"
+            "  attn   %6.3f s (%4.1f%%)\n"
+            "  norm   %6.3f s (%4.1f%%)\n"
+            "  other  %6.3f s (%4.1f%%)\n",
+            g_qwen35_timing.tokens, t,
+            1000.0 * t / (double)g_qwen35_timing.tokens,
+            g_qwen35_timing.matmul, g_qwen35_timing.matmul * pct,
+            g_qwen35_timing.matmuls,
+            g_qwen35_timing.gdn, g_qwen35_timing.gdn * pct,
+            g_qwen35_timing.attn, g_qwen35_timing.attn * pct,
+            g_qwen35_timing.norm, g_qwen35_timing.norm * pct,
+            g_qwen35_timing.other, g_qwen35_timing.other * pct);
+    memset(&g_qwen35_timing, 0, sizeof(g_qwen35_timing));
+}
 /* One quantised matmul of a single row. Wrapped only to keep the forward pass
  * below readable: the argument list is the same every time except for three
  * things, and spelling it out fourteen times would hide the shape of the
@@ -65943,9 +65988,18 @@ static bool qwen35_mm(ds4_gpu_tensor *out,
                       uint64_t out_dim,
                       uint64_t n_tok) {
     if (!w) return false;
-    return ds4_gpu_matmul_quant_tensor(out, model->map, model->size,
-                                       w->abs_offset, w->type,
-                                       in_dim, out_dim, x, n_tok) != 0;
+    if (!qwen35_timing_on()) {
+        return ds4_gpu_matmul_quant_tensor(out, model->map, model->size,
+                                           w->abs_offset, w->type,
+                                           in_dim, out_dim, x, n_tok) != 0;
+    }
+    const double t0 = now_sec();
+    const bool ok = ds4_gpu_matmul_quant_tensor(out, model->map, model->size,
+                                                w->abs_offset, w->type,
+                                                in_dim, out_dim, x, n_tok) != 0;
+    g_qwen35_timing.matmul += now_sec() - t0;
+    g_qwen35_timing.matmuls++;
+    return ok;
 }
 
 /* Runs `n` tokens through the whole model in one pass, writing the logits of
@@ -65990,6 +66044,7 @@ static bool qwen35_encode_layer(
              qwen35_mm(g->beta, model, l->kda_beta, g->norm,
                        DS4_N_EMBD, DS4_N_KDA_HEAD, n);
         if (ok) {
+            const double t_gdn = qwen35_timing_on() ? now_sec() : 0.0;
             ok = ds4_gpu_qwen35_gdn_prefill(
                 g->gdn_out, g->conv_state[il], g->recur_state[il],
                 g->qkv, g->alpha, g->beta, g->z,
@@ -66001,6 +66056,7 @@ static bool qwen35_encode_layer(
                 DS4_N_KDA_KV_HEAD, DS4_N_KDA_HEAD,
                 DS4_N_KDA_HEAD_DIM, DS4_N_KDA_CONV,
                 n, DS4_RMS_EPS) != 0;
+            if (qwen35_timing_on()) g_qwen35_timing.gdn += now_sec() - t_gdn;
         }
         if (ok) ok = qwen35_mm(g->tmp, model, l->kda_output, g->gdn_out,
                                g->v_dim, DS4_N_EMBD, n);
@@ -66036,6 +66092,7 @@ static bool qwen35_encode_layer(
         if (ok) ok = ds4_gpu_qwen35_store_kv_tensor(
             g->k_cache[il], g->v_cache[il], g->k, g->v,
             g->ctx_cap, pos0, n, DS4_N_HEAD_KV, DS4_N_HEAD_DIM) != 0;
+        const double t_attn = qwen35_timing_on() ? now_sec() : 0.0;
         if (ok) ok = ds4_gpu_qwen35_attention_gqa_tensor(
             g->heads, g->q, g->k_cache[il], g->v_cache[il],
             pos0, n, pos0 + n, g->ctx_cap,
@@ -66043,6 +66100,7 @@ static bool qwen35_encode_layer(
             DS4_N_HEAD_DIM, DS4_N_HEAD_DIM, true) != 0;
         if (ok) ok = ds4_gpu_qwen35_attn_gate_tensor(
             g->heads, g->qg, n, DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
+        if (qwen35_timing_on()) g_qwen35_timing.attn += now_sec() - t_attn;
         if (ok) ok = qwen35_mm(g->tmp, model, l->attn_output, g->heads,
                                g->q_dim, DS4_N_EMBD, n);
     }
@@ -66087,6 +66145,7 @@ static bool qwen35_graph_forward_tokens(
             return false;
         }
     }
+    const double t_token = qwen35_timing_on() ? now_sec() : 0.0;
     if (!ds4_gpu_tensor_write(g->tokens, 0, tokens,
                               (uint64_t)n * sizeof(int32_t))) {
         return false;
@@ -66167,6 +66226,13 @@ static bool qwen35_graph_forward_tokens(
     if (!ds4_gpu_tensor_read(g->logits, 0, logits_out,
                              (uint64_t)DS4_N_VOCAB * sizeof(float))) {
         return false;
+    }
+    if (qwen35_timing_on()) {
+        /* The read above synchronises, so everything queued for this token
+         * has finished and the totals are comparable with the token time. */
+        g_qwen35_timing.total += now_sec() - t_token;
+        g_qwen35_timing.tokens++;
+        if ((g_qwen35_timing.tokens % 20ul) == 0ul) qwen35_timing_report();
     }
     /* DS4_QWEN35_TRACE prints the top logit of every step.  A graph that is
      * wired but numerically wrong produces tokens all the same, or NaN, and
