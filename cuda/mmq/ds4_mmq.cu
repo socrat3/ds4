@@ -3193,6 +3193,41 @@ int ds4_mmq_dense_vec_impl(
     // per matmul was most of the launches.  A miss simply quantises here.
     cudaError_t err = cudaSuccess;
     const char *shared = ds4_mmq_q81_lookup(X_f32, K, N);
+    /* DS4_QWEN35_Q81_DIFF=1: la riga pubblicata e' davvero uguale a quella che
+     * questo matmul produrrebbe da solo?  La piega sposta i logit di rms 1,0 e
+     * la spiegazione "layout diverso" e' gia' caduta (quantize_row_q8_1_cuda
+     * ignora type_src0), quindi la domanda va posta ai BYTE.  Memoria propria,
+     * non il pool: uno strumento che prende dall'arena del misurato misura se
+     * stesso, ed e' gia' successo oggi. */
+    if (shared && getenv("DS4_QWEN35_Q81_DIFF")) {
+        char *mio = nullptr;
+        if (cudaMalloc((void **)&mio, nbytes_q8_1) == cudaSuccess && mio) {
+            quantize_row_q8_1_cuda(
+                X_f32, nullptr, (void *)mio, type, K,
+                (int64_t)K, (int64_t)K * N, (int64_t)K * N,
+                ne10_padded, N, 1, 1, stream);
+            char *a = (char *)malloc(nbytes_q8_1);
+            char *b = (char *)malloc(nbytes_q8_1);
+            if (a && b &&
+                cudaMemcpyAsync(a, shared, nbytes_q8_1, cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
+                cudaMemcpyAsync(b, mio, nbytes_q8_1, cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
+                cudaStreamSynchronize(stream) == cudaSuccess) {
+                size_t diversi = 0;
+                for (size_t i = 0; i < nbytes_q8_1; i++) if (a[i] != b[i]) diversi++;
+                static unsigned long chiamate, con_differenze;
+                chiamate++;
+                if (diversi) con_differenze++;
+                if ((chiamate % 100ul) == 0ul) {
+                    fprintf(stderr,
+                            "ds4: q81 diff: %lu/%lu chiamate differiscono; ultima %zu byte su %zu (K=%d, %s)\n",
+                            con_differenze, chiamate, diversi, nbytes_q8_1, K, tag);
+                }
+            }
+            free(a);
+            free(b);
+            cudaFree(mio);
+        }
+    }
     ggml_cuda_pool_alloc<char> src1_q8_1;
     const char *q81 = shared;
     if (!q81) {

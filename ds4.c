@@ -66219,6 +66219,21 @@ static bool qwen35_graph_forward_tokens(
             weights->output_norm->abs_offset, DS4_N_EMBD, 1u, DS4_RMS_EPS)) {
         return false;
     }
+    /* Questa normalizzazione riscrive g->norm come tutte le altre, e come tutte
+     * le altre deve ripubblicare.  Non lo faceva, ed era il difetto: la cache
+     * dell'attivazione q8_1 e' indicizzata su (puntatore, K), e dopo la norma
+     * FFN dell'ultimo layer teneva ancora `src = g->norm->ptr, K = 5120`.  La
+     * proiezione sul vocabolario arriva con lo stesso puntatore e la stessa K,
+     * faceva HIT, e moltiplicava l'attivazione del layer precedente invece di
+     * questa: i logit uscivano da una riga vecchia.  E' esattamente cio' contro
+     * cui mette in guardia il commento della cache in cuda/mmq/ds4_mmq.cu --
+     * «a buffer written again without republishing would be served stale» -- e
+     * questa era l'unica normalizzazione del grafo che non ripubblicava.
+     *
+     * Ripubblicare, e non invalidare: l'invariante dichiarata e' che il grafo
+     * pubblica dopo OGNI normalizzazione, e un'eccezione qui rimetterebbe la
+     * prossima aggiunta nella stessa trappola. */
+    (void)ds4_gpu_publish_activation_q81(g->norm, 1u, DS4_N_EMBD);
     if (!qwen35_mm(g->logits, model, weights->output, g->norm,
                    DS4_N_EMBD, DS4_N_VOCAB, 1u)) {
         return false;
