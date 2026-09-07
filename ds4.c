@@ -65958,6 +65958,116 @@ static bool qwen35_mm(ds4_gpu_tensor *out,
  * the output head: 248320 logits times a chunk would be hundreds of megabytes
  * for rows nobody reads, so the last row is copied out and only that one goes
  * through the vocabulary projection. */
+/* One layer, encoded into the current stream.  Split out of the loop so the
+ * decode-graph capture below can replay it: the capture protocol needs to be
+ * able to run the same island again when a capture attempt is retired. */
+static bool qwen35_encode_layer(
+        ds4_qwen35_graph  *g,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        uint32_t           il,
+        uint32_t           pos0,
+        uint32_t           n) {
+    const uint64_t rows = (uint64_t)n * DS4_N_EMBD;
+    (void)rows;
+    const ds4_layer_weights *l = &weights->layer[il];
+    bool ok = ds4_gpu_rms_norm_weight_rows_tensor(
+        g->norm, g->cur, model->map, model->size,
+        l->attn_norm->abs_offset, DS4_N_EMBD, n, DS4_RMS_EPS) != 0;
+    /* One normalised row feeds four projections in a recurrent layer and
+     * three in an attention one: quantise it once here instead of once
+     * per matmul.  With more than one token there is nothing to share and
+     * this invalidates instead. */
+    if (ok) (void)ds4_gpu_publish_activation_q81(g->norm, n, DS4_N_EMBD);
+
+    if (ok && ds4_qwen35_layer_is_gdn(il)) {
+        ok = qwen35_mm(g->qkv, model, l->qwen_ssm_qkv, g->norm,
+                       DS4_N_EMBD, g->qkv_dim, n) &&
+             qwen35_mm(g->z, model, l->qwen_ssm_gate, g->norm,
+                       DS4_N_EMBD, g->v_dim, n) &&
+             qwen35_mm(g->alpha, model, l->qwen_ssm_alpha, g->norm,
+                       DS4_N_EMBD, DS4_N_KDA_HEAD, n) &&
+             qwen35_mm(g->beta, model, l->kda_beta, g->norm,
+                       DS4_N_EMBD, DS4_N_KDA_HEAD, n);
+        if (ok) {
+            ok = ds4_gpu_qwen35_gdn_prefill(
+                g->gdn_out, g->conv_state[il], g->recur_state[il],
+                g->qkv, g->alpha, g->beta, g->z,
+                model->map, model->size,
+                l->qwen_ssm_conv1d->abs_offset,
+                l->kda_a_log->abs_offset,
+                l->kda_dt_bias->abs_offset,
+                l->kda_o_norm->abs_offset,
+                DS4_N_KDA_KV_HEAD, DS4_N_KDA_HEAD,
+                DS4_N_KDA_HEAD_DIM, DS4_N_KDA_CONV,
+                n, DS4_RMS_EPS) != 0;
+        }
+        if (ok) ok = qwen35_mm(g->tmp, model, l->kda_output, g->gdn_out,
+                               g->v_dim, DS4_N_EMBD, n);
+    } else if (ok) {
+        const float rope_base = layer_rope_freq_base(il);
+        const float rope_scale = layer_rope_freq_scale(il);
+        ok = qwen35_mm(g->qg, model, l->qwen_attn_q, g->norm,
+                       DS4_N_EMBD, (uint64_t)g->q_dim * 2u, n) &&
+             ds4_gpu_qwen35_extract_q_tensor(g->q, g->qg, n,
+                                             DS4_N_HEAD, DS4_N_HEAD_DIM) != 0 &&
+             ds4_gpu_qwen35_head_rms_norm_tensor(
+                 g->q, model->map, model->size,
+                 l->qwen_attn_q_norm->abs_offset,
+                 n, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0 &&
+             qwen35_mm(g->k, model, l->qwen_attn_k, g->norm,
+                       DS4_N_EMBD, g->kv_dim, n) &&
+             ds4_gpu_qwen35_head_rms_norm_tensor(
+                 g->k, model->map, model->size,
+                 l->qwen_attn_k_norm->abs_offset,
+                 n, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0 &&
+             qwen35_mm(g->v, model, l->qwen_attn_v, g->norm,
+                       DS4_N_EMBD, g->kv_dim, n);
+        /* Text-only input, so the multimodal rope sections all carry the
+         * same position and this reduces to the ordinary rotation. */
+        if (ok) ok = ds4_gpu_rope_tail_tensor(
+            g->q, n, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos0,
+            0, false, rope_base, rope_scale, 0.0f, 1.0f,
+            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+        if (ok) ok = ds4_gpu_rope_tail_tensor(
+            g->k, n, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, pos0,
+            0, false, rope_base, rope_scale, 0.0f, 1.0f,
+            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+        if (ok) ok = ds4_gpu_qwen35_store_kv_tensor(
+            g->k_cache[il], g->v_cache[il], g->k, g->v,
+            g->ctx_cap, pos0, n, DS4_N_HEAD_KV, DS4_N_HEAD_DIM) != 0;
+        if (ok) ok = ds4_gpu_qwen35_attention_gqa_tensor(
+            g->heads, g->q, g->k_cache[il], g->v_cache[il],
+            pos0, n, pos0 + n, g->ctx_cap,
+            DS4_N_HEAD, DS4_N_HEAD_KV,
+            DS4_N_HEAD_DIM, DS4_N_HEAD_DIM, true) != 0;
+        if (ok) ok = ds4_gpu_qwen35_attn_gate_tensor(
+            g->heads, g->qg, n, DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
+        if (ok) ok = qwen35_mm(g->tmp, model, l->attn_output, g->heads,
+                               g->q_dim, DS4_N_EMBD, n);
+    }
+    if (ok) ok = ds4_gpu_add_tensor(g->cur, g->cur, g->tmp,
+                                    (uint32_t)rows) != 0;
+
+    if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(
+        g->norm, g->cur, model->map, model->size,
+        l->ffn_norm->abs_offset, DS4_N_EMBD, n, DS4_RMS_EPS) != 0;
+    if (ok) (void)ds4_gpu_publish_activation_q81(g->norm, n, DS4_N_EMBD);
+    if (ok) ok = qwen35_mm(g->ffn_gate, model, l->ffn_gate, g->norm,
+                           DS4_N_EMBD, DS4_N_FF_DENSE, n) &&
+                 qwen35_mm(g->ffn_up, model, l->ffn_up, g->norm,
+                           DS4_N_EMBD, DS4_N_FF_DENSE, n) &&
+                 ds4_gpu_qwen35_silu_mul_tensor(
+                     g->ffn_mid, g->ffn_gate, g->ffn_up,
+                     (uint64_t)n * DS4_N_FF_DENSE) != 0 &&
+                 qwen35_mm(g->tmp, model, l->ffn_down, g->ffn_mid,
+                           DS4_N_FF_DENSE, DS4_N_EMBD, n);
+    if (ok) ok = ds4_gpu_add_tensor(g->cur, g->cur, g->tmp,
+                                    (uint32_t)rows) != 0;
+
+    return ok;
+}
+
 static bool qwen35_graph_forward_tokens(
         ds4_qwen35_graph  *g,
         const ds4_model   *model,
@@ -65991,100 +66101,43 @@ static bool qwen35_graph_forward_tokens(
 
     const uint64_t rows = (uint64_t)n * DS4_N_EMBD;
     for (uint32_t il = 0; il < g->n_exec; il++) {
-        const ds4_layer_weights *l = &weights->layer[il];
-        bool ok = ds4_gpu_rms_norm_weight_rows_tensor(
-            g->norm, g->cur, model->map, model->size,
-            l->attn_norm->abs_offset, DS4_N_EMBD, n, DS4_RMS_EPS) != 0;
-        /* One normalised row feeds four projections in a recurrent layer and
-         * three in an attention one: quantise it once here instead of once
-         * per matmul.  With more than one token there is nothing to share and
-         * this invalidates instead. */
-        if (ok) (void)ds4_gpu_publish_activation_q81(g->norm, n, DS4_N_EMBD);
-
-        if (ok && ds4_qwen35_layer_is_gdn(il)) {
-            ok = qwen35_mm(g->qkv, model, l->qwen_ssm_qkv, g->norm,
-                           DS4_N_EMBD, g->qkv_dim, n) &&
-                 qwen35_mm(g->z, model, l->qwen_ssm_gate, g->norm,
-                           DS4_N_EMBD, g->v_dim, n) &&
-                 qwen35_mm(g->alpha, model, l->qwen_ssm_alpha, g->norm,
-                           DS4_N_EMBD, DS4_N_KDA_HEAD, n) &&
-                 qwen35_mm(g->beta, model, l->kda_beta, g->norm,
-                           DS4_N_EMBD, DS4_N_KDA_HEAD, n);
-            if (ok) {
-                ok = ds4_gpu_qwen35_gdn_prefill(
-                    g->gdn_out, g->conv_state[il], g->recur_state[il],
-                    g->qkv, g->alpha, g->beta, g->z,
-                    model->map, model->size,
-                    l->qwen_ssm_conv1d->abs_offset,
-                    l->kda_a_log->abs_offset,
-                    l->kda_dt_bias->abs_offset,
-                    l->kda_o_norm->abs_offset,
-                    DS4_N_KDA_KV_HEAD, DS4_N_KDA_HEAD,
-                    DS4_N_KDA_HEAD_DIM, DS4_N_KDA_CONV,
-                    n, DS4_RMS_EPS) != 0;
+        bool ok;
+        /* Recurrent layers do not depend on the position, so a decode step can
+         * be captured once and replayed.  Attention layers rotate by position
+         * and bake it into the capture, so they stay eager: that is what the
+         * island field of the key is for upstream, and here the whole layer is
+         * either capturable or it is not.  Prefill never captures: it has more
+         * than one token and different shapes. */
+        if (n == 1u && ds4_qwen35_layer_is_gdn(il) &&
+            ds4_gpu_decode_graphs_supported()) {
+            ds4_decode_graph_key key;
+            memset(&key, 0, sizeof(key));
+            key.il = il;
+            key.island = 0u;
+            key.cur_hc = g->cur ? g->cur->ptr : NULL;
+            key.after_attn_hc = g->tmp ? g->tmp->ptr : NULL;
+            key.after_ffn_hc = g->norm ? g->norm->ptr : NULL;
+            key.attn_norm = g->qkv ? g->qkv->ptr : NULL;
+            for (;;) {
+                const int state = ds4_gpu_decode_graph_begin(&key);
+                if (state == 1) { ok = true; break; }        /* replayed */
+                if (state == 0) {
+                    ok = qwen35_encode_layer(g, model, weights, il, pos0, n);
+                    if (!ok) {
+                        ds4_gpu_decode_graph_abort(&key);
+                        ok = qwen35_encode_layer(g, model, weights, il, pos0, n);
+                        break;
+                    }
+                    if (ds4_gpu_decode_graph_end(&key) == 0) break;
+                    /* Capture retired without running anything: re-encode. */
+                    continue;
+                }
+                ok = qwen35_encode_layer(g, model, weights, il, pos0, n);
+                break;
             }
-            if (ok) ok = qwen35_mm(g->tmp, model, l->kda_output, g->gdn_out,
-                                   g->v_dim, DS4_N_EMBD, n);
-        } else if (ok) {
-            const float rope_base = layer_rope_freq_base(il);
-            const float rope_scale = layer_rope_freq_scale(il);
-            ok = qwen35_mm(g->qg, model, l->qwen_attn_q, g->norm,
-                           DS4_N_EMBD, (uint64_t)g->q_dim * 2u, n) &&
-                 ds4_gpu_qwen35_extract_q_tensor(g->q, g->qg, n,
-                                                 DS4_N_HEAD, DS4_N_HEAD_DIM) != 0 &&
-                 ds4_gpu_qwen35_head_rms_norm_tensor(
-                     g->q, model->map, model->size,
-                     l->qwen_attn_q_norm->abs_offset,
-                     n, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0 &&
-                 qwen35_mm(g->k, model, l->qwen_attn_k, g->norm,
-                           DS4_N_EMBD, g->kv_dim, n) &&
-                 ds4_gpu_qwen35_head_rms_norm_tensor(
-                     g->k, model->map, model->size,
-                     l->qwen_attn_k_norm->abs_offset,
-                     n, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0 &&
-                 qwen35_mm(g->v, model, l->qwen_attn_v, g->norm,
-                           DS4_N_EMBD, g->kv_dim, n);
-            /* Text-only input, so the multimodal rope sections all carry the
-             * same position and this reduces to the ordinary rotation. */
-            if (ok) ok = ds4_gpu_rope_tail_tensor(
-                g->q, n, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos0,
-                0, false, rope_base, rope_scale, 0.0f, 1.0f,
-                DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
-            if (ok) ok = ds4_gpu_rope_tail_tensor(
-                g->k, n, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, pos0,
-                0, false, rope_base, rope_scale, 0.0f, 1.0f,
-                DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
-            if (ok) ok = ds4_gpu_qwen35_store_kv_tensor(
-                g->k_cache[il], g->v_cache[il], g->k, g->v,
-                g->ctx_cap, pos0, n, DS4_N_HEAD_KV, DS4_N_HEAD_DIM) != 0;
-            if (ok) ok = ds4_gpu_qwen35_attention_gqa_tensor(
-                g->heads, g->q, g->k_cache[il], g->v_cache[il],
-                pos0, n, pos0 + n, g->ctx_cap,
-                DS4_N_HEAD, DS4_N_HEAD_KV,
-                DS4_N_HEAD_DIM, DS4_N_HEAD_DIM, true) != 0;
-            if (ok) ok = ds4_gpu_qwen35_attn_gate_tensor(
-                g->heads, g->qg, n, DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
-            if (ok) ok = qwen35_mm(g->tmp, model, l->attn_output, g->heads,
-                                   g->q_dim, DS4_N_EMBD, n);
+        } else {
+            ok = qwen35_encode_layer(g, model, weights, il, pos0, n);
         }
-        if (ok) ok = ds4_gpu_add_tensor(g->cur, g->cur, g->tmp,
-                                        (uint32_t)rows) != 0;
-
-        if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(
-            g->norm, g->cur, model->map, model->size,
-            l->ffn_norm->abs_offset, DS4_N_EMBD, n, DS4_RMS_EPS) != 0;
-        if (ok) (void)ds4_gpu_publish_activation_q81(g->norm, n, DS4_N_EMBD);
-        if (ok) ok = qwen35_mm(g->ffn_gate, model, l->ffn_gate, g->norm,
-                               DS4_N_EMBD, DS4_N_FF_DENSE, n) &&
-                     qwen35_mm(g->ffn_up, model, l->ffn_up, g->norm,
-                               DS4_N_EMBD, DS4_N_FF_DENSE, n) &&
-                     ds4_gpu_qwen35_silu_mul_tensor(
-                         g->ffn_mid, g->ffn_gate, g->ffn_up,
-                         (uint64_t)n * DS4_N_FF_DENSE) != 0 &&
-                     qwen35_mm(g->tmp, model, l->ffn_down, g->ffn_mid,
-                               DS4_N_FF_DENSE, DS4_N_EMBD, n);
-        if (ok) ok = ds4_gpu_add_tensor(g->cur, g->cur, g->tmp,
-                                        (uint32_t)rows) != 0;
 
         if (!ok) {
             fprintf(stderr, "ds4: qwen35: layer %u failed at position %u (%u tokens)\n",
