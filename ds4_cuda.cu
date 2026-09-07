@@ -35302,6 +35302,17 @@ extern "C" int ds4_gpu_matmul_quant_rows_scalar_tensor(
     return 0;
 }
 
+/* Read once: getenv on every matmul of every layer would show up in a decode
+ * profile, and the setting cannot change while the process runs. */
+static int cuda_dense_mmvq_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4_QWEN35_MMVQ");
+        cached = (v && v[0] == '0') ? 0 : 1;
+    }
+    return cached;
+}
+
 static int cuda_matmul_mmq_dense_quant(
         ds4_gpu_tensor       *out,
         const void           *model_map,
@@ -35359,8 +35370,13 @@ static int cuda_matmul_mmq_dense_quant(
      * output and most of each tile holds a single useful row.  mmvq reads one
      * row of activations against many rows of weights, which is exactly what
      * decode does.  It needs K a multiple of 256; everything in this model is,
-     * and anything that is not falls through to mmq below. */
-    if (n_tok == 1u && (in_dim % 256u) == 0u) {
+     * and anything that is not falls through to mmq below.
+     *
+     * DS4_QWEN35_MMVQ=0 sends decode down the mmq path instead.  The two
+     * compute the same product, so text that differs between the settings is a
+     * defect in one of the kernels rather than a property of the model -- which
+     * is the only way to tell those two apart from the outside. */
+    if (n_tok == 1u && (in_dim % 256u) == 0u && cuda_dense_mmvq_enabled()) {
         int vrc = 1;
         switch (weight_type) {
         case 10u: vrc = ds4_mmq_q2_K_dense_vec(weights, (const float *)x->ptr,

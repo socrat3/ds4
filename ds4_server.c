@@ -972,12 +972,19 @@ static const tool_schema_order *tool_schema_orders_find(const tool_schema_orders
     return idx >= 0 ? &orders->v[idx] : NULL;
 }
 
+/* Defined below, next to the other model-identity helpers; declared here so the
+ * default identity of a request comes from the loaded model rather than from a
+ * literal that is right for one family only. */
+static const char *server_model_id_from_engine(ds4_engine *engine);
+
 static void request_init(request *r, req_kind kind, int max_tokens) {
     memset(r, 0, sizeof(*r));
     r->kind = kind;
     r->api = API_OPENAI;
     r->model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK;
-    r->model = xstrdup("deepseek-v4-flash");
+    /* The family predicates read the loaded shape, not this pointer, so the
+     * identity is right without threading an engine through every caller. */
+    r->model = xstrdup(server_model_id_from_engine(NULL));
     r->max_tokens = max_tokens;
     r->reasoning_budget = -1;
     r->top_k = 0;
@@ -1170,6 +1177,7 @@ static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
 }
 
 static const char *server_model_id_from_engine(ds4_engine *engine) {
+    if (ds4_engine_is_qwen35(engine)) return "qwen3.8-27b";
     if (ds4_engine_is_glm53(engine)) return "glm-5.3-flash";
     if (ds4_engine_is_glm_dsa(engine)) return "glm-5.2";
     return ds4_engine_model_id(engine) == 1 ?
@@ -1178,7 +1186,8 @@ static const char *server_model_id_from_engine(ds4_engine *engine) {
 
 static bool server_model_alias_known(const char *id) {
     return id &&
-           (!strcmp(id, "deepseek-v4-flash") ||
+           (!strcmp(id, "qwen3.8-27b") ||
+            !strcmp(id, "deepseek-v4-flash") ||
             !strcmp(id, "deepseek-v4-pro") ||
             !strcmp(id, "glm-5.2") ||
             !strcmp(id, "glm-5.2-chat") ||
@@ -13822,7 +13831,12 @@ static bool send_model(server *s, int fd, const char *id) {
 static bool send_models(server *s, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    if (ds4_engine_is_glm_dsa(s->engine)) {
+    if (ds4_engine_is_qwen35(s->engine)) {
+        /* One entry, and it is the model actually loaded: a client that reads
+         * this list to label an answer must not be handed the name of a family
+         * this server is not serving. */
+        append_model_json(&b, s, server_model_id_from_engine(s->engine));
+    } else if (ds4_engine_is_glm_dsa(s->engine)) {
         append_model_json(&b, s, "glm-5.2");
         buf_putc(&b, ',');
         append_model_json(&b, s, "glm-5.2-chat");
