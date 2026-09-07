@@ -4960,6 +4960,59 @@ extern "C" int ds4_mmq_q8_0_dense_vec(
         "ds4_mmq_q8_0_dense_vec", W, X, out, M, N, K, stream);
 }
 
+// Vector entries for the quantisations a dense model actually carries.  mmvq
+// reads one row of activations against many rows of weights, which is what
+// decode does; mmq is built for the opposite shape and on a single token it
+// spends most of its time on tiles that hold one useful row.
+extern "C" int ds4_mmq_q2_K_dense_vec(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, cudaStream_t stream) {
+    return ds4_mmq_dense_vec_impl<GGML_TYPE_Q2_K>(
+        "ds4_mmq_q2_K_dense_vec", W, X, out, M, N, K, stream);
+}
+
+extern "C" int ds4_mmq_q3_K_dense_vec(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, cudaStream_t stream) {
+    return ds4_mmq_dense_vec_impl<GGML_TYPE_Q3_K>(
+        "ds4_mmq_q3_K_dense_vec", W, X, out, M, N, K, stream);
+}
+
+extern "C" int ds4_mmq_q4_K_dense_vec(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, cudaStream_t stream) {
+    return ds4_mmq_dense_vec_impl<GGML_TYPE_Q4_K>(
+        "ds4_mmq_q4_K_dense_vec", W, X, out, M, N, K, stream);
+}
+
+extern "C" int ds4_mmq_iq2_xxs_dense_vec(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, cudaStream_t stream) {
+    return ds4_mmq_dense_vec_impl<GGML_TYPE_IQ2_XXS>(
+        "ds4_mmq_iq2_xxs_dense_vec", W, X, out, M, N, K, stream);
+}
+
+extern "C" int ds4_mmq_iq3_xxs_dense_vec(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, cudaStream_t stream) {
+    return ds4_mmq_dense_vec_impl<GGML_TYPE_IQ3_XXS>(
+        "ds4_mmq_iq3_xxs_dense_vec", W, X, out, M, N, K, stream);
+}
+
+extern "C" int ds4_mmq_iq3_s_dense_vec(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, cudaStream_t stream) {
+    return ds4_mmq_dense_vec_impl<GGML_TYPE_IQ3_S>(
+        "ds4_mmq_iq3_s_dense_vec", W, X, out, M, N, K, stream);
+}
+
+extern "C" int ds4_mmq_iq4_xs_dense_vec(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, cudaStream_t stream) {
+    return ds4_mmq_dense_vec_impl<GGML_TYPE_IQ4_XS>(
+        "ds4_mmq_iq4_xs_dense_vec", W, X, out, M, N, K, stream);
+}
+
 extern "C" int ds4_mmq_q4_K_dense_pair_vec(
         const void *W0, const void *W1, const float *X,
         float *out0, float *out1, int M, int K, cudaStream_t stream) {

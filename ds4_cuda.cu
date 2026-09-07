@@ -35261,6 +35261,35 @@ static int cuda_matmul_mmq_dense_quant(
     const void *weights = cuda_resolve_weight_ptr(
         model_map, weight_offset, weight_bytes, tier, label);
     if (!weights) return 0;
+
+    /* One token is decode, and mmq is the wrong shape for it: it tiles the
+     * output and most of each tile holds a single useful row.  mmvq reads one
+     * row of activations against many rows of weights, which is exactly what
+     * decode does.  It needs K a multiple of 256; everything in this model is,
+     * and anything that is not falls through to mmq below. */
+    if (n_tok == 1u && (in_dim % 256u) == 0u) {
+        int vrc = 1;
+        switch (weight_type) {
+        case 10u: vrc = ds4_mmq_q2_K_dense_vec(weights, (const float *)x->ptr,
+            (float *)out->ptr, (int)out_dim, 1, (int)in_dim, cuda_decode_stream()); break;
+        case 11u: vrc = ds4_mmq_q3_K_dense_vec(weights, (const float *)x->ptr,
+            (float *)out->ptr, (int)out_dim, 1, (int)in_dim, cuda_decode_stream()); break;
+        case 12u: vrc = ds4_mmq_q4_K_dense_vec(weights, (const float *)x->ptr,
+            (float *)out->ptr, (int)out_dim, 1, (int)in_dim, cuda_decode_stream()); break;
+        case 16u: vrc = ds4_mmq_iq2_xxs_dense_vec(weights, (const float *)x->ptr,
+            (float *)out->ptr, (int)out_dim, 1, (int)in_dim, cuda_decode_stream()); break;
+        case 18u: vrc = ds4_mmq_iq3_xxs_dense_vec(weights, (const float *)x->ptr,
+            (float *)out->ptr, (int)out_dim, 1, (int)in_dim, cuda_decode_stream()); break;
+        case 21u: vrc = ds4_mmq_iq3_s_dense_vec(weights, (const float *)x->ptr,
+            (float *)out->ptr, (int)out_dim, 1, (int)in_dim, cuda_decode_stream()); break;
+        case 23u: vrc = ds4_mmq_iq4_xs_dense_vec(weights, (const float *)x->ptr,
+            (float *)out->ptr, (int)out_dim, 1, (int)in_dim, cuda_decode_stream()); break;
+        default: break;
+        }
+        if (vrc == 0) {
+            return cuda_ok(cudaGetLastError(), "CUDA dense MMVQ");
+        }
+    }
     int rc = -1;
     switch (weight_type) {
     case 10u:

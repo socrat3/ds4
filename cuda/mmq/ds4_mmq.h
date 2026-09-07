@@ -910,6 +910,71 @@ int ds4_mmq_q8_0_dense_vec(
     int           K,
     cudaStream_t  stream);
 
+// Same contract, for the quantisations a dense checkpoint carries.
+int ds4_mmq_q2_K_dense_vec(
+    const void  * W,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
+int ds4_mmq_q3_K_dense_vec(
+    const void  * W,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
+int ds4_mmq_q4_K_dense_vec(
+    const void  * W,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
+int ds4_mmq_iq2_xxs_dense_vec(
+    const void  * W,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
+int ds4_mmq_iq3_xxs_dense_vec(
+    const void  * W,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
+int ds4_mmq_iq3_s_dense_vec(
+    const void  * W,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
+int ds4_mmq_iq4_xs_dense_vec(
+    const void  * W,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
+
 int ds4_mmq_q4_K_dense_pair_vec(
     const void  * W0_q4_K,
     const void  * W1_q4_K,
