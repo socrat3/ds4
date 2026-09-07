@@ -177,6 +177,32 @@ static void usage(FILE *fp, const char *topic) {
     ds4_help_print(fp, DS4_HELP_DS4, topic);
 }
 
+#ifndef DS4_BUILD_ID
+#define DS4_BUILD_ID "unknown"
+#endif
+
+/* Dice QUALE ds4 e' in esecuzione. Prima non c'era modo di saperlo: nessuna
+ * macro di versione, nessun commit dentro il binario, e `--version` rispondeva
+ * «unknown option». Un identificatore che finisce in `-dirty` avverte che
+ * l'albero aveva modifiche non committate quando e' stato compilato, cioe' che
+ * quella build non e' ricostruibile da nessun altro. Le famiglie elencate sono
+ * quelle che il programma sa CARICARE: per `qwen35` il caricamento c'e' e la
+ * generazione no, e va detto qui invece che scoprirlo dopo dieci giga di pesi. */
+static void print_version(FILE *fp) {
+    fprintf(fp, "ds4 build %s\n", DS4_BUILD_ID);
+    fprintf(fp, "model families: deepseek4, glm-dsa, glm5-next"
+                " (load + generate); qwen35 (load only: no compute graph yet)\n");
+#if defined(DS4_NO_GPU)
+    fprintf(fp, "gpu backend: none (CPU build)\n");
+#elif defined(__APPLE__)
+    fprintf(fp, "gpu backend: metal\n");
+#elif defined(DS4_ROCM_BUILD)
+    fprintf(fp, "gpu backend: rocm\n");
+#else
+    fprintf(fp, "gpu backend: cuda\n");
+#endif
+}
+
 static int parse_int(const char *s, const char *opt) {
     char *end = NULL;
     long v = strtol(s, &end, 10);
@@ -2203,6 +2229,9 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--server")) {
             fprintf(stderr, "ds4: use ds4-server for the HTTP server\n");
             exit(2);
+        } else if (!strcmp(arg, "--version") || !strcmp(arg, "-V")) {
+            print_version(stdout);
+            exit(0);
         } else {
             fprintf(stderr, "ds4: unknown option: %s\n", arg);
             usage(stderr, NULL);

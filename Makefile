@@ -11,7 +11,17 @@ GLM53_KDA_TEST := tests/test_glm53_kda
 GLM53_KDA_ROCM_TEST := tests/test_glm53_kda_rocm
 
 DEBUG_FLAGS ?= -g
+# Identita' della build. Prima non esisteva: nessuna macro di versione, nessun
+# `--version`, nessun commit dentro il binario — chi eseguiva ds4 non aveva modo
+# di sapere QUALE ds4 stava eseguendo, e un numero riportato a mano in un bug
+# report sarebbe stato una supposizione. Qui la si prende da git al momento della
+# compilazione: commit abbreviato, e `-dirty` se l'albero ha modifiche non
+# committate — cioe' la sola cosa che distingue una build riproducibile da una
+# che esiste solo su questa macchina. Fuori da un clone git resta "unknown",
+# che e' vero e non finge un numero.
+DS4_BUILD_ID ?= $(shell git describe --always --dirty --abbrev=8 2>/dev/null || echo unknown)
 CFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
+CFLAGS += -DDS4_BUILD_ID=\"$(DS4_BUILD_ID)\"
 OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fobjc-arc
 QUALITY_CFLAGS ?= -O3 $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c11
 
@@ -49,6 +59,10 @@ endif
 
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
+# Dopo il `?=`, mai prima: un `+=` su una variabile ancora indefinita la
+# DEFINISCE, e il `?=` che segue non assegnerebbe piu' nulla — sparirebbero
+# ottimizzazione e flag di architettura, in silenzio.
+NVCCFLAGS += -DDS4_BUILD_ID=\"$(DS4_BUILD_ID)\"
 # Vendored llama.cpp mmq prefill tier (cuda/mmq/, see cuda/mmq/VENDOR.md).
 MMQ_INCLUDES := -Icuda/mmq
 MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.o cuda/mmq/ds4_mmq.o cuda/mmq/ds4_mmq_d2r.o cuda/mmq/quantize.o cuda/mmq/mmid.o cuda/mmq/mmvq.o cuda/mmq/ds4_repack.o

@@ -5167,8 +5167,31 @@ static bool weights_glm_dsa_layer_has_required(const ds4_layer_weights *l, uint3
     return true;
 }
 
+/* Un layer di Qwen3.8 e' completo quando ha le due norm, la FFN densa e il
+ * mescolatore che gli compete: la ricorrenza oppure l'attenzione piena.
+ * Senza questo ramo la domanda «ci sono layer caricati?» veniva girata al
+ * controllo di DeepSeek, che chiede tensori di attenzione latente e
+ * hyper-connection che qui non esistono: rispondeva NO su tutti e 65, e
+ * l'utente si vedeva «no transformer layers are loaded» dopo aver caricato e
+ * validato dieci giga di pesi. Il messaggio era vero rispetto al controllo, e
+ * falso rispetto alla realta'. */
+static bool weights_qwen35_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
+    if (!l->attn_norm || !l->ffn_norm) return false;
+    if (!l->ffn_gate || !l->ffn_up || !l->ffn_down) return false;
+    if (ds4_qwen35_layer_is_gdn(il)) {
+        return l->qwen_ssm_qkv && l->qwen_ssm_gate && l->qwen_ssm_conv1d &&
+               l->qwen_ssm_alpha && l->kda_beta && l->kda_a_log &&
+               l->kda_dt_bias && l->kda_o_norm && l->kda_output;
+    }
+    return l->qwen_attn_q && l->qwen_attn_k && l->qwen_attn_v &&
+           l->qwen_attn_q_norm && l->qwen_attn_k_norm && l->attn_output;
+}
+
 static bool weights_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
     if (!l) return false;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
+        return weights_qwen35_layer_has_required(l, il);
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         return weights_glm_dsa_layer_has_required(l, il);
     }
@@ -5411,7 +5434,9 @@ static void tensor_expect_qwen35_layout(
         uint64_t          d2) {
     if (!t) ds4_die("internal error: missing tensor while validating qwen35 layout");
     if (!tensor_type_is_qwen35_quant(t->type)) {
-        fprintf(stderr, "ds4: tensor %.*s has unsupported type %s for qwen35\n",
+        fprintf(stderr, "ds4: tensor %.*s has type %s, which this build does not support for qwen35 "
+                "(supported: f32, f16, bf16, q4_0, q8_0, q2_k, q3_k, q4_k, q5_k, q6_k, "
+                "iq2_xxs, iq3_xxs, iq3_s, iq4_xs)\n",
                 (int)t->name.len, t->name.ptr, tensor_type_name(t->type));
         exit(1);
     }
@@ -6445,7 +6470,7 @@ static void config_validate_glm53_model(const ds4_model *m) {
  * guasto compaia dopo, in un kernel, sotto forma di numeri sbagliati. */
 static uint32_t qwen35_bounded(const char *name, uint32_t got, uint32_t max) {
     if (got == 0u || got > max) {
-        fprintf(stderr, "ds4: qwen35: %s = %u fuori dai limiti (1..%u)\n", name, got, max);
+        fprintf(stderr, "ds4: qwen35: %s = %u out of range (1..%u)\n", name, got, max);
         exit(1);
     }
     return got;
@@ -6509,25 +6534,25 @@ static void config_validate_qwen35_model(const ds4_model *m) {
                       DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM);
     if (DS4_N_KDA_HEAD % DS4_N_KDA_KV_HEAD != 0u) {
         fprintf(stderr,
-                "ds4: qwen35: teste di valore (%u) non multiple di quelle di chiave (%u): "
-                "l'indicizzazione a gruppi della ricorrenza non sarebbe definita\n",
+                "ds4: qwen35: %u value heads is not a multiple of %u key heads: "
+                "the recurrence would have no defined head grouping\n",
                 DS4_N_KDA_HEAD, DS4_N_KDA_KV_HEAD);
         exit(1);
     }
     if (DS4_N_HEAD % DS4_N_HEAD_KV != 0u) {
-        fprintf(stderr, "ds4: qwen35: teste (%u) non multiple delle teste kv (%u)\n",
+        fprintf(stderr, "ds4: qwen35: %u heads is not a multiple of %u kv heads\n",
                 DS4_N_HEAD, DS4_N_HEAD_KV);
         exit(1);
     }
     if (DS4_N_NEXTN_PREDICT >= DS4_N_LAYER) {
-        fprintf(stderr, "ds4: qwen35: layer MTP (%u) non minori dei layer totali (%u)\n",
+        fprintf(stderr, "ds4: qwen35: %u MTP layers is not fewer than %u total layers\n",
                 DS4_N_NEXTN_PREDICT, DS4_N_LAYER);
         exit(1);
     }
 
     fprintf(stderr,
-            "ds4: qwen35: %u layer (%u con ricorrenza, %u con attenzione piena, %u MTP), "
-            "embd %u, teste %u/%u da %u, GDN %ux%u da %u conv %u, FFN densa %u\n",
+            "ds4: qwen35: %u layers (%u recurrent, %u full attention, %u MTP), "
+            "embd %u, heads %u/%u of %u, GDN %ux%u of %u conv %u, dense FFN %u\n",
             DS4_N_LAYER,
             DS4_N_LAYER - DS4_N_NEXTN_PREDICT - (DS4_N_LAYER - DS4_N_NEXTN_PREDICT) / DS4_N_FULL_ATTN_INTERVAL,
             (DS4_N_LAYER - DS4_N_NEXTN_PREDICT) / DS4_N_FULL_ATTN_INTERVAL,
@@ -65737,6 +65762,22 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size,
                                                         e->prefill_chunk);
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
+    /* Qwen3.8 si ferma QUI, e lo dice. Il caricamento e' completo — geometria,
+     * tensori, quantizzazioni, tokenizzatore — ma il grafo di calcolo per questa
+     * famiglia non e' ancora scritto, e da questo punto in poi il codice e'
+     * quello di DeepSeek: proseguire significa dereferenziare tensori che questo
+     * modello non ha, cioe' un crash invece di un errore. Meglio una frase che
+     * dice cosa e' successo e cosa si puo' fare intanto. */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
+        fprintf(stderr,
+                "ds4: qwen35: the model loaded and validated (%u layers), but this build has "
+                "no compute graph for the qwen35 family yet, so it cannot generate.\n"
+                "ds4: qwen35: use --inspect to examine the model without running it; "
+                "run --version to see which families this build can generate with.\n",
+                DS4_N_LAYER);
+        free(s);
+        return 1;
+    }
     const ds4_layer_weights *shape_layer = weights_first_bound_layer(&e->weights);
     if (!shape_layer) {
         fprintf(stderr, "ds4: no transformer layers are loaded\n");
