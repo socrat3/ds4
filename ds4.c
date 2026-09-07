@@ -65906,6 +65906,10 @@ static bool qwen35_graph_forward_token(
     if (!g || !model || !weights || !logits_out || pos >= g->ctx_cap) {
         return false;
     }
+    if (token < 0 || (uint32_t)token >= (uint32_t)DS4_N_VOCAB) {
+        fprintf(stderr, "ds4: qwen35: token %d is outside the vocabulary\n", token);
+        return false;
+    }
     const int32_t id = (int32_t)token;
     if (!ds4_gpu_tensor_write(g->tokens, 0, &id, sizeof(id))) return false;
     if (!ds4_gpu_embed_tokens_quant_tensor(g->cur, g->tokens, model->map,
@@ -66035,8 +66039,8 @@ static bool qwen35_graph_forward_token(
             else if (logits_out[i] > top) { top = logits_out[i]; best = (int)i; }
         }
         fprintf(stderr,
-                "ds4: qwen35: pos %u -> token %d (logit %.4f), %u NaN of %u\n",
-                pos, best, (double)top, nans, (uint32_t)DS4_N_VOCAB);
+                "ds4: qwen35: pos %u in %d -> token %d (logit %.4f), %u NaN of %u\n",
+                pos, token, best, (double)top, nans, (uint32_t)DS4_N_VOCAB);
     }
     return true;
 }
@@ -67810,7 +67814,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             }
         }
         s->checkpoint.len = prompt->len;
-        s->checkpoint_valid = false;
+        s->checkpoint_valid = true;
         return 0;
     }
 #endif
@@ -70046,7 +70050,13 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
             return 1;
         }
         s->checkpoint.len = (int)pos + 1;
-        s->checkpoint_valid = false;   /* snapshots are not wired for this family yet */
+        /* Says the logits in s->logits are current, which is what sampling
+         * checks before it will return a token.  Setting it false here, on the
+         * assumption that it only concerned snapshots, made ds4_session_sample
+         * return -1 and the caller feed -1 back in as the next token: the
+         * embedding then read a row that does not exist and the model repeated
+         * one token forever, with plausible finite logits throughout. */
+        s->checkpoint_valid = true;
         return 0;
     }
 #endif
