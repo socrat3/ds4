@@ -30435,6 +30435,241 @@ extern "C" int ds4_gpu_qwen35_attention_gqa_tensor(
     return cuda_ok(cudaGetLastError(), "qwen35 GQA attention launch");
 }
 
+/* ---------------------------------------------------------------------------
+ * Small kernels the qwen35 graph needs and the tree did not already have.
+ * Each does one thing; none of them is worth a file of its own.
+ * ------------------------------------------------------------------------- */
+
+/* SwiGLU: mid = silu(gate) * up.  The tree has this fused with a q8_0 matmul,
+ * which is no use here because these weights are IQ3/IQ4. */
+__global__ static void qwen35_silu_mul_kernel(
+        float       *mid,
+        const float *gate,
+        const float *up,
+        uint64_t     n) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float g = gate[i];
+    mid[i] = (g / (1.0f + expf(-g))) * up[i];
+}
+
+extern "C" int ds4_gpu_qwen35_silu_mul_tensor(
+        ds4_gpu_tensor       *mid,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up,
+        uint64_t              n) {
+    if (!mid || !gate || !up || n == 0u ||
+        !glm53_cuda_tensor_has(mid, n, sizeof(float)) ||
+        !glm53_cuda_tensor_has(gate, n, sizeof(float)) ||
+        !glm53_cuda_tensor_has(up, n, sizeof(float))) {
+        fprintf(stderr, "ds4: qwen35 SwiGLU received invalid buffers\n");
+        return 0;
+    }
+    const uint32_t blocks = (uint32_t)((n + 255ull) / 256ull);
+    qwen35_silu_mul_kernel<<<blocks, 256u, 0, cuda_decode_stream()>>>(
+        (float *)mid->ptr, (const float *)gate->ptr, (const float *)up->ptr, n);
+    return cuda_ok(cudaGetLastError(), "qwen35 SwiGLU launch");
+}
+
+/* Per-head RMSNorm over a [n_tokens][n_head][dim] activation, weight shared by
+ * every head.  Qwen normalises q and k this way before the rotation. */
+__global__ static void qwen35_head_rms_norm_kernel(
+        float       *x,
+        const float *weight,
+        uint32_t     n_head,
+        uint32_t     dim,
+        float        eps) {
+    const uint32_t row = blockIdx.x;          /* token * n_head + head */
+    const uint32_t tid = threadIdx.x;
+    extern __shared__ float reduce[];
+    float sumsq = 0.0f;
+    for (uint32_t d = tid; d < dim; d += blockDim.x) {
+        const float v = x[(uint64_t)row * dim + d];
+        sumsq = fmaf(v, v, sumsq);
+    }
+    reduce[tid] = sumsq;
+    __syncthreads();
+    for (uint32_t step = blockDim.x >> 1u; step > 0u; step >>= 1u) {
+        if (tid < step) reduce[tid] += reduce[tid + step];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(reduce[0] / (float)dim + eps);
+    (void)n_head;
+    for (uint32_t d = tid; d < dim; d += blockDim.x) {
+        x[(uint64_t)row * dim + d] *= scale * weight[d];
+    }
+}
+
+extern "C" int ds4_gpu_qwen35_head_rms_norm_tensor(
+        ds4_gpu_tensor *x,
+        const void     *model_map,
+        uint64_t        model_size,
+        uint64_t        weight_offset,
+        uint32_t        n_tokens,
+        uint32_t        n_head,
+        uint32_t        dim,
+        float           eps) {
+    uint64_t elements = 0;
+    if (!x || n_tokens == 0u || n_head == 0u || dim == 0u || dim > 1024u ||
+        !glm53_cuda_mul_u64((uint64_t)n_tokens * n_head, dim, &elements) ||
+        !glm53_cuda_tensor_has(x, elements, sizeof(float))) {
+        fprintf(stderr, "ds4: qwen35 head RMSNorm received invalid buffers\n");
+        return 0;
+    }
+    const int tier = ds4_tensor_device_idx(x);
+    const float *weight = glm53_cuda_weight_f32(model_map, model_size,
+        weight_offset, dim, tier, "qwen35 head norm");
+    if (!weight) return 0;
+    uint32_t threads = 32u;
+    while (threads < dim) threads <<= 1u;
+    qwen35_head_rms_norm_kernel<<<n_tokens * n_head, threads,
+        (size_t)threads * sizeof(float), cuda_decode_stream()>>>(
+            (float *)x->ptr, weight, n_head, dim, eps);
+    return cuda_ok(cudaGetLastError(), "qwen35 head RMSNorm launch");
+}
+
+/* Store one token's K and V into the fp16 caches.  Separate from the tree's
+ * raw-KV store because that one assumes a single latent head. */
+__global__ static void qwen35_store_kv_kernel(
+        __half      *k_cache,
+        __half      *v_cache,
+        const float *k,
+        const float *v,
+        uint32_t     cache_cap,
+        uint32_t     pos0,
+        uint32_t     n_tokens,
+        uint32_t     n_head_kv,
+        uint32_t     dim) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t per_token = (uint64_t)n_head_kv * dim;
+    if (i >= per_token * n_tokens) return;
+    const uint32_t t = (uint32_t)(i / per_token);
+    const uint64_t within = i % per_token;
+    const uint32_t row = pos0 + t;
+    if (row >= cache_cap) return;
+    const uint64_t dst = (uint64_t)row * per_token + within;
+    k_cache[dst] = __float2half(k[i]);
+    v_cache[dst] = __float2half(v[i]);
+}
+
+extern "C" int ds4_gpu_qwen35_store_kv_tensor(
+        ds4_gpu_tensor       *k_cache,
+        ds4_gpu_tensor       *v_cache,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t              cache_cap,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              n_head_kv,
+        uint32_t              dim) {
+    uint64_t per_token = 0, elements = 0, cache_elements = 0;
+    if (!k_cache || !v_cache || !k || !v ||
+        n_tokens == 0u || n_head_kv == 0u || dim == 0u ||
+        pos0 > cache_cap || n_tokens > cache_cap - pos0 ||
+        !glm53_cuda_mul_u64(n_head_kv, dim, &per_token) ||
+        !glm53_cuda_mul_u64(per_token, n_tokens, &elements) ||
+        !glm53_cuda_mul_u64(per_token, cache_cap, &cache_elements) ||
+        !glm53_cuda_tensor_has(k, elements, sizeof(float)) ||
+        !glm53_cuda_tensor_has(v, elements, sizeof(float)) ||
+        !glm53_cuda_tensor_has(k_cache, cache_elements, sizeof(__half)) ||
+        !glm53_cuda_tensor_has(v_cache, cache_elements, sizeof(__half))) {
+        fprintf(stderr, "ds4: qwen35 KV store received invalid buffers\n");
+        return 0;
+    }
+    const uint32_t blocks = (uint32_t)((elements + 255ull) / 256ull);
+    qwen35_store_kv_kernel<<<blocks, 256u, 0, cuda_decode_stream()>>>(
+        (__half *)k_cache->ptr, (__half *)v_cache->ptr,
+        (const float *)k->ptr, (const float *)v->ptr,
+        cache_cap, pos0, n_tokens, n_head_kv, dim);
+    return cuda_ok(cudaGetLastError(), "qwen35 KV store launch");
+}
+
+/* out *= sigmoid(gate), where gate is interleaved with the query inside the
+ * joint projection: head h holds query at 2*h*dim and gate at (2*h+1)*dim.
+ * Sigmoid here, unlike the GDN output gate, which is SiLU.  Both were read
+ * from llama.cpp rather than from each other. */
+__global__ static void qwen35_attn_gate_kernel(
+        float       *out,
+        const float *qg,
+        uint32_t     n_head,
+        uint32_t     dim) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t total = (uint64_t)gridDim.y * n_head * dim;
+    (void)total;
+    const uint64_t per_token = (uint64_t)n_head * dim;
+    if (i >= per_token) return;
+    const uint32_t t = blockIdx.y;
+    const uint32_t head = (uint32_t)(i / dim);
+    const uint32_t d = (uint32_t)(i % dim);
+    const float g = qg[(uint64_t)t * 2u * per_token +
+                       (uint64_t)(2u * head + 1u) * dim + d];
+    out[(uint64_t)t * per_token + i] *= 1.0f / (1.0f + expf(-g));
+}
+
+extern "C" int ds4_gpu_qwen35_attn_gate_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *qg,
+        uint32_t              n_tokens,
+        uint32_t              n_head,
+        uint32_t              dim) {
+    uint64_t per_token = 0, out_elements = 0, qg_elements = 0;
+    if (!out || !qg || n_tokens == 0u || n_head == 0u || dim == 0u ||
+        !glm53_cuda_mul_u64(n_head, dim, &per_token) ||
+        !glm53_cuda_mul_u64(per_token, n_tokens, &out_elements) ||
+        !glm53_cuda_mul_u64(out_elements, 2u, &qg_elements) ||
+        !glm53_cuda_tensor_has(out, out_elements, sizeof(float)) ||
+        !glm53_cuda_tensor_has(qg, qg_elements, sizeof(float))) {
+        fprintf(stderr, "ds4: qwen35 attention gate received invalid buffers\n");
+        return 0;
+    }
+    const uint32_t blocks = (uint32_t)((per_token + 255ull) / 256ull);
+    qwen35_attn_gate_kernel<<<dim3(blocks, n_tokens, 1u), 256u, 0,
+        cuda_decode_stream()>>>(
+            (float *)out->ptr, (const float *)qg->ptr, n_head, dim);
+    return cuda_ok(cudaGetLastError(), "qwen35 attention gate launch");
+}
+
+/* Pull the query out of the joint query+gate projection into a contiguous
+ * [n_tokens][n_head][dim] buffer, which is what the rotation and the attention
+ * both expect. */
+__global__ static void qwen35_extract_q_kernel(
+        float       *q,
+        const float *qg,
+        uint32_t     n_head,
+        uint32_t     dim) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t per_token = (uint64_t)n_head * dim;
+    if (i >= per_token) return;
+    const uint32_t t = blockIdx.y;
+    const uint32_t head = (uint32_t)(i / dim);
+    const uint32_t d = (uint32_t)(i % dim);
+    q[(uint64_t)t * per_token + i] =
+        qg[(uint64_t)t * 2u * per_token + (uint64_t)(2u * head) * dim + d];
+}
+
+extern "C" int ds4_gpu_qwen35_extract_q_tensor(
+        ds4_gpu_tensor       *q,
+        const ds4_gpu_tensor *qg,
+        uint32_t              n_tokens,
+        uint32_t              n_head,
+        uint32_t              dim) {
+    uint64_t per_token = 0, q_elements = 0, qg_elements = 0;
+    if (!q || !qg || n_tokens == 0u || n_head == 0u || dim == 0u ||
+        !glm53_cuda_mul_u64(n_head, dim, &per_token) ||
+        !glm53_cuda_mul_u64(per_token, n_tokens, &q_elements) ||
+        !glm53_cuda_mul_u64(q_elements, 2u, &qg_elements) ||
+        !glm53_cuda_tensor_has(q, q_elements, sizeof(float)) ||
+        !glm53_cuda_tensor_has(qg, qg_elements, sizeof(float))) {
+        fprintf(stderr, "ds4: qwen35 query extract received invalid buffers\n");
+        return 0;
+    }
+    const uint32_t blocks = (uint32_t)((per_token + 255ull) / 256ull);
+    qwen35_extract_q_kernel<<<dim3(blocks, n_tokens, 1u), 256u, 0,
+        cuda_decode_stream()>>>(
+            (float *)q->ptr, (const float *)qg->ptr, n_head, dim);
+    return cuda_ok(cudaGetLastError(), "qwen35 query extract launch");
+}
+
 extern "C" int ds4_gpu_flush_encoder(void) {
     /* Metal encoder flush: CUDA kernels are already queued in stream
      * order, nothing to split. */

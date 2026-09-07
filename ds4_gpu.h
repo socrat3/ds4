@@ -3321,6 +3321,31 @@ int ds4_gpu_qwen35_attention_gqa_tensor(
         uint32_t              value_dim,
         bool                  cache_f16);
 
+/* Small pieces the qwen35 graph needs. */
+int ds4_gpu_qwen35_silu_mul_tensor(
+        ds4_gpu_tensor *mid, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up, uint64_t n);
+
+int ds4_gpu_qwen35_head_rms_norm_tensor(
+        ds4_gpu_tensor *x, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t n_tokens, uint32_t n_head,
+        uint32_t dim, float eps);
+
+int ds4_gpu_qwen35_store_kv_tensor(
+        ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
+        uint32_t cache_cap, uint32_t pos0, uint32_t n_tokens,
+        uint32_t n_head_kv, uint32_t dim);
+
+int ds4_gpu_qwen35_attn_gate_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *qg,
+        uint32_t n_tokens, uint32_t n_head, uint32_t dim);
+
+int ds4_gpu_qwen35_extract_q_tensor(
+        ds4_gpu_tensor *q, const ds4_gpu_tensor *qg,
+        uint32_t n_tokens, uint32_t n_head, uint32_t dim);
+
+
 
 
 /* Decode-island CUDA graph capture (CUDA backend; Metal/ROCm/CPU stub it
