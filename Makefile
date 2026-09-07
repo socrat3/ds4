@@ -10,6 +10,7 @@ SAMPLING_TEST := tests/test_sampling
 GLM53_KDA_TEST := tests/test_glm53_kda
 QWEN35_GDN_TEST := tests/test_qwen35_gdn
 QWEN35_ATTN_TEST := tests/test_qwen35_attn
+QWEN35_PD_TEST := tests/test_qwen35_prefill_decode
 GLM53_KDA_ROCM_TEST := tests/test_glm53_kda_rocm
 
 DEBUG_FLAGS ?= -g
@@ -827,7 +828,21 @@ $(QWEN35_ATTN_TEST): tests/test_qwen35_attn.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
 test-qwen35-attn: $(QWEN35_ATTN_TEST)
 	./$(QWEN35_ATTN_TEST)
 
-# Tutto il supporto qwen35 verificabile in un colpo.
+# Prefill contro decode a livello di GRAFO, non di kernel: e' l'unico posto in
+# cui si vede se lo stato che un passo di decode eredita e' quello che il
+# prefill avrebbe lasciato. Serve un modello vero, quindi non entra in
+# `test-qwen35`, che deve restare eseguibile senza pesi.
+tests/test_qwen35_prefill_decode.o: tests/test_qwen35_prefill_decode.c ds4.h ds4_gpu_args.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_qwen35_prefill_decode.c
+
+$(QWEN35_PD_TEST): tests/test_qwen35_prefill_decode.o $(CORE_OBJS) ds4_gpu_args.o
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+.PHONY: test-qwen35-prefill-decode
+test-qwen35-prefill-decode: $(QWEN35_PD_TEST)
+	./$(QWEN35_PD_TEST)
+
+# Tutto il supporto qwen35 verificabile SENZA pesi, in un colpo.
 .PHONY: test-qwen35
 test-qwen35: test-qwen35-gdn test-qwen35-attn
 
