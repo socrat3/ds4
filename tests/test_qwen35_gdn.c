@@ -350,6 +350,71 @@ int main(void) {
     }
     printf("prefill vs decode over %d tokens: PASS\n", TOKENS);
 
+    /* Chunked continuation: 2 + 1 + 6 tokens through three calls must equal one
+     * run of 9.  This is the shape real generation has, a prefill followed by
+     * decode steps, and it is the only check here that exercises entering a
+     * call with a non-zero convolution history AND a non-zero recurrent state.
+     * Requested by a reviewer; the earlier checks all started from zero. */
+    {
+        const uint32_t chunks[3] = {2u, 1u, 6u};
+        require_ok(ds4_gpu_tensor_fill_f32(p_conv, 0.0f, CONV_HISTORY * QKV_DIM),
+                   "chunk conv clear");
+        require_ok(ds4_gpu_tensor_fill_f32(p_state, 0.0f, (uint64_t)V_HEADS * D * D),
+                   "chunk state clear");
+        static float chunk_out[TOKENS][V_DIM];
+        uint32_t done = 0;
+        for (uint32_t c = 0; c < 3u; c++) {
+            const uint32_t n = chunks[c];
+            require_ok(ds4_gpu_tensor_write(p_qkv, 0, qkv[done],
+                                            (size_t)n * QKV_DIM * sizeof(float)),
+                       "chunk qkv write");
+            require_ok(ds4_gpu_tensor_write(p_alpha, 0, alpha[done],
+                                            (size_t)n * V_HEADS * sizeof(float)),
+                       "chunk alpha write");
+            require_ok(ds4_gpu_tensor_write(p_beta, 0, beta[done],
+                                            (size_t)n * V_HEADS * sizeof(float)),
+                       "chunk beta write");
+            require_ok(ds4_gpu_tensor_write(p_ogate, 0, ogate[done],
+                                            (size_t)n * V_DIM * sizeof(float)),
+                       "chunk gate write");
+            require_ok(ds4_gpu_qwen35_gdn_prefill(
+                p_out, p_conv, p_state, p_qkv, p_alpha, p_beta, p_ogate,
+                model, MODEL_BYTES, CONV_OFFSET, SSM_A_OFFSET, DT_BIAS_OFFSET,
+                NORM_OFFSET, K_HEADS, V_HEADS, n, norm_eps), "chunk prefill");
+            require_ok(ds4_gpu_tensor_read(p_out, 0, chunk_out[done],
+                                           (size_t)n * V_DIM * sizeof(float)),
+                       "chunk output read");
+            done += n;
+        }
+        for (uint32_t t = 0; t < TOKENS; t++) {
+            for (uint32_t i = 0; i < V_DIM; i++) {
+                require_close("chunked vs decode", t * V_DIM + i,
+                              chunk_out[t][i], (double)decode_out[t][i], 5.0e-4);
+            }
+        }
+        if (failures) {
+            fprintf(stderr, "%d mismatches in chunked continuation\n", failures);
+            return 1;
+        }
+        printf("chunked continuation 2+1+6 vs decode: PASS\n");
+    }
+
+    /* Refusals: the entry point must reject a shape it cannot serve rather than
+     * read past a buffer.  48 value heads over 5 key heads does not divide, and
+     * zero tokens has no meaning. */
+    {
+        const int bad_ratio = ds4_gpu_qwen35_gdn_decode(
+            g_out, g_conv, g_state, g_qkv, g_alpha, g_beta, g_ogate,
+            model, MODEL_BYTES, CONV_OFFSET, SSM_A_OFFSET, DT_BIAS_OFFSET,
+            NORM_OFFSET, 5u, V_HEADS, 1u, norm_eps);
+        const int bad_tokens = ds4_gpu_qwen35_gdn_decode(
+            g_out, g_conv, g_state, g_qkv, g_alpha, g_beta, g_ogate,
+            model, MODEL_BYTES, CONV_OFFSET, SSM_A_OFFSET, DT_BIAS_OFFSET,
+            NORM_OFFSET, K_HEADS, V_HEADS, 0u, norm_eps);
+        require_ok(!bad_ratio && !bad_tokens, "invalid shapes must be refused");
+        printf("invalid shapes refused: PASS\n");
+    }
+
     ds4_gpu_tensor_free(p_state);
     ds4_gpu_tensor_free(p_conv);
     ds4_gpu_tensor_free(p_out);
