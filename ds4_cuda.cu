@@ -35313,6 +35313,94 @@ static int cuda_dense_mmvq_enabled(void) {
     return cached;
 }
 
+/* Il confronto numerico fra i due percorsi di matmul, per DS4_QWEN35_MM_CHECK.
+ * Rifa' il prodotto con mmq in un buffer di servizio e riporta errore massimo e
+ * RMS contro quello che mmvq ha appena scritto in `out`.  Aggrega per tipo di
+ * peso: una riga per matmul sarebbe illeggibile a 65 layer per token. */
+static void cuda_dense_mmvq_vs_mmq_report(const void *weights,
+                                          uint32_t weight_type,
+                                          const ds4_gpu_tensor *x,
+                                          const ds4_gpu_tensor *out,
+                                          uint64_t in_dim, uint64_t out_dim,
+                                          const char *label) {
+    static double peggiore[32];
+    static double somma_quad[32];
+    static unsigned long long conteggio[32];
+    static unsigned long chiamate;
+    if (weight_type >= 32u) return;
+
+    const size_t bytes = (size_t)out_dim * sizeof(float);
+    /* MEMORIA PROPRIA, non `cuda_tmp_alloc_on`.  Quello restituisce `ctx->scratch`,
+     * un buffer di servizio UNICO, e ds4_mmq_dense_impl ci mette dentro la propria
+     * attivazione quantizzata: il risultato era che mmq sovrascriveva il buffer in
+     * cui questa funzione stava raccogliendo il confronto, e la misura riportava uno
+     * scarto enorme su IQ3_S che era interamente prodotto dallo strumento.  Una
+     * cudaMalloc per chiamata e' lenta e va bene: e' una misura, non un modo di
+     * servire. */
+    float *mmq_dev = NULL;
+    if (cudaMalloc((void **)&mmq_dev, bytes) != cudaSuccess || !mmq_dev) {
+        (void)cudaGetLastError();
+        return;
+    }
+    /* Il risultato di mmvq si porta a casa PRIMA: se mmq tocca qualcosa che
+     * condivide, il confronto deve avere gia' in mano il termine di paragone. */
+    float *a = (float *)malloc(bytes);
+    if (a && cudaMemcpy(a, out->ptr, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void)cudaGetLastError();
+        free(a);
+        a = NULL;
+    }
+    int rc = -1;
+    cudaStream_t stream = cuda_decode_stream();
+    switch (weight_type) {
+    case 10u: rc = ds4_mmq_q2_K_dense(weights, (const float *)x->ptr, mmq_dev,
+        (int)out_dim, 1, (int)in_dim, stream); break;
+    case 11u: rc = ds4_mmq_q3_K_dense(weights, (const float *)x->ptr, mmq_dev,
+        (int)out_dim, 1, (int)in_dim, stream); break;
+    case 12u: rc = ds4_mmq_q4_K_dense(weights, (const float *)x->ptr, mmq_dev,
+        (int)out_dim, 1, (int)in_dim, stream); break;
+    case 16u: rc = ds4_mmq_iq2_xxs_dense(weights, (const float *)x->ptr, mmq_dev,
+        (int)out_dim, 1, (int)in_dim, stream); break;
+    case 18u: rc = ds4_mmq_iq3_xxs_dense(weights, (const float *)x->ptr, mmq_dev,
+        (int)out_dim, 1, (int)in_dim, stream); break;
+    case 21u: rc = ds4_mmq_iq3_s_dense(weights, (const float *)x->ptr, mmq_dev,
+        (int)out_dim, 1, (int)in_dim, stream); break;
+    case 23u: rc = ds4_mmq_iq4_xs_dense(weights, (const float *)x->ptr, mmq_dev,
+        (int)out_dim, 1, (int)in_dim, stream); break;
+    default: break;
+    }
+    if (rc != 0) {
+        cudaFree(mmq_dev);
+        free(a);
+        return;
+    }
+
+    float *b = (float *)malloc(bytes);
+    if (a && b &&
+        cudaMemcpyAsync(b, mmq_dev, bytes, cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
+        cudaStreamSynchronize(stream) == cudaSuccess) {
+        for (uint64_t i = 0; i < out_dim; i++) {
+            const double d = fabs((double)a[i] - (double)b[i]);
+            if (d > peggiore[weight_type]) peggiore[weight_type] = d;
+            somma_quad[weight_type] += d * d;
+            conteggio[weight_type]++;
+        }
+        if ((++chiamate % 200ul) == 0ul) {
+            for (uint32_t t = 0; t < 32u; t++) {
+                if (!conteggio[t]) continue;
+                fprintf(stderr,
+                        "ds4: mm check type %u (%s): max %.6g rms %.6g su %llu valori\n",
+                        t, label ? label : "?", peggiore[t],
+                        sqrt(somma_quad[t] / (double)conteggio[t]),
+                        conteggio[t]);
+            }
+        }
+    }
+    cudaFree(mmq_dev);
+    free(a);
+    free(b);
+}
+
 static int cuda_matmul_mmq_dense_quant(
         ds4_gpu_tensor       *out,
         const void           *model_map,
@@ -35404,6 +35492,16 @@ static int cuda_matmul_mmq_dense_quant(
                 fprintf(stderr, "ds4: qwen35: mmvq %lu taken, %lu fell back\n",
                         hits, misses);
             }
+        }
+        /* DS4_QWEN35_MM_CHECK=1 runs the SAME product through mmq as well and
+         * reports how far the two land apart.  Comparing generated text only
+         * shows whether the two agree on the argmax; a distribution can be
+         * wrong while the largest logit is still the largest, which is exactly
+         * the shape of the defect being chased here.  Slow on purpose: it is a
+         * measurement, not a mode to serve from. */
+        if (vrc == 0 && getenv("DS4_QWEN35_MM_CHECK")) {
+            cuda_dense_mmvq_vs_mmq_report(weights, weight_type, x, out,
+                                          in_dim, out_dim, label);
         }
         if (vrc == 0) {
             return cuda_ok(cudaGetLastError(), "CUDA dense MMVQ");
