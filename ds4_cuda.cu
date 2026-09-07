@@ -30590,10 +30590,27 @@ __global__ static void qwen35_silu_mul_kernel(
  * quantising it.  Only worth calling when a single row feeds several
  * projections, which is what decode does and prefill does not: with more than
  * one token there is nothing to share and this is a no-op. */
+/* DS4_QWEN35_Q81_FOLD=0 spegne la pubblicazione: ogni matmul torna a
+ * quantizzare da se' l'attivazione, come fa il prefill.  La piega vale SOLO per
+ * n == 1, quindi e' una delle poche cose che il decode fa e il prefill no --
+ * ed e' l'unico modo di sapere se e' lei a far divergere le due strade. */
+static int cuda_q81_fold_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4_QWEN35_Q81_FOLD");
+        cached = (v && v[0] == '0') ? 0 : 1;
+    }
+    return cached;
+}
+
 extern "C" int ds4_gpu_publish_activation_q81(
         const ds4_gpu_tensor *x,
         uint32_t              n_tokens,
         uint32_t              dim) {
+    if (!cuda_q81_fold_enabled()) {
+        ds4_mmq_q81_invalidate();
+        return 0;
+    }
     if (!x || n_tokens != 1u || dim == 0u) {
         ds4_mmq_q81_invalidate();
         return 0;
