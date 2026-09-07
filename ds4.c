@@ -471,9 +471,16 @@ static const char *glm_graph_env_value(const char *rocm_name,
 enum {
     DS4_MAX_LAYER            = 79,
     DS4_MAX_EMBD             = 7168,
-    DS4_MAX_VOCAB            = 154880,
+    /* 248320 e' il vocabolario di Qwen3.8; prima era 154880, quello di GLM 5.3.
+     * Queste costanti non dimensionano nulla (nessun altro uso in tutto
+     * l'albero): descrivono i limiti che il codice si aspetta, e servono a chi
+     * legge. Alzarle non cambia il comportamento dei modelli gia' supportati. */
+    DS4_MAX_VOCAB            = 248320,
     DS4_MAX_HEAD             = 128,
-    DS4_MAX_HEAD_KV          = 1,
+    /* Era 1 perche' DeepSeek V4 e GLM usano attenzione latente (MLA), che ha
+     * una sola testa di chiave/valore. Qwen3.8 usa GQA con 4: il percorso di
+     * attenzione va verificato su questo punto, non solo la costante. */
+    DS4_MAX_HEAD_KV          = 8,
     DS4_MAX_HEAD_DIM         = 576,
     DS4_MAX_VALUE_DIM        = 512,
     DS4_MAX_ROT              = 64,
@@ -484,6 +491,9 @@ enum {
     DS4_MAX_EXPERT_USED      = 8,
     DS4_MAX_EXPERT_SHARED    = 1,
     DS4_MAX_FF_EXP           = 3072,
+    /* FFN densa: 12288 in GLM 5.3, 17408 in Qwen3.8-27B. Come gli altri
+     * massimi qui sopra, e' un limite dichiarato, non una dimensione. */
+    DS4_MAX_FF_DENSE         = 32768,
     DS4_MAX_HASH_LAYER       = 3,
     DS4_MAX_SWA              = 128,
     DS4_MAX_INDEXER_HEAD     = 64,
@@ -499,6 +509,11 @@ enum {
 typedef enum {
     DS4_MODEL_FAMILY_DEEPSEEK4 = 0,
     DS4_MODEL_FAMILY_GLM_DSA   = 1,
+    /* Qwen3.8 denso (architettura GGUF "qwen35"): ibrido Gated DeltaNet +
+     * attenzione piena ogni quarto layer, FFN densa, nessun esperto. La
+     * ricorrenza e' la stessa delta-rule di GLM 5.3 (kernel glm53_kda_*),
+     * con una differenza sola: q/k hanno meno teste di v (teste raggruppate). */
+    DS4_MODEL_FAMILY_QWEN35    = 2,
 } ds4_model_family;
 
 typedef enum {
@@ -506,6 +521,7 @@ typedef enum {
     DS4_VARIANT_PRO   = 1,
     DS4_VARIANT_GLM52 = 2,
     DS4_VARIANT_GLM53 = 3,
+    DS4_VARIANT_QWEN35_27B = 4,
 } ds4_variant;
 
 typedef struct {
@@ -543,6 +559,15 @@ typedef struct {
     uint32_t n_kda_head;
     uint32_t n_kda_head_dim;
     uint32_t n_kda_conv;
+    /* Teste q/k della ricorrenza. In GLM 5.3 coincidono con n_kda_head e il
+     * campo resta 0: i suoi percorsi non lo leggono. In Qwen3.8 sono MENO
+     * delle teste v (16 contro 48): ogni testa di chiave ne serve tre, e
+     * l'indicizzazione dei kernel deve tenerne conto. */
+    uint32_t n_kda_kv_head;
+    /* Ogni quanti layer c'e' attenzione piena invece della ricorrenza. GLM 5.3
+     * lo ha cablato a 4 dentro `ds4_glm53_layer_is_kda`; qui e' un dato letto
+     * dal modello, perche' il file lo dichiara (`qwen35.full_attention_interval`). */
+    uint32_t n_full_attn_interval;
     float rms_eps;
     float hc_eps;
     float expert_weight_scale;
@@ -716,6 +741,45 @@ static const ds4_shape DS4_SHAPE_GLM53 = {
     .kda_gate_lower_bound = -5.0f,
 };
 
+/* Qwen3.8-27B, architettura GGUF "qwen35". Numeri LETTI dal file dell'utente
+ * (866 tensori, 27 schemi di nome), non dedotti dal nome:
+ *   65 blocchi = 64 di trunk + 1 di MTP;
+ *   48 layer di ricorrenza (attn_qkv, attn_gate, ssm_*) e 17 di attenzione
+ *   piena (attn_q/k/v/output, attn_q_norm, attn_k_norm), cioe' uno ogni
+ *   quattro piu' quello finale di MTP;
+ *   attn_qkv proietta 5120 -> 10240 = 2048 (q) + 2048 (k) + 6144 (v),
+ *   cioe' 16 teste q/k e 48 teste v da 128 ciascuna, con conv causale di
+ *   ampiezza 4 (quindi storia 3, la stessa di GLM 5.3);
+ *   attenzione piena: 24 teste su 4 di chiave/valore, dimensione 256;
+ *   FFN densa 17408, nessun esperto.
+ * RoPE su 64 dimensioni: le sezioni [11,11,10,0] del file sono M-RoPE, ma per
+ * il solo testo le quattro posizioni coincidono e il risultato e' identico al
+ * NEOX standard (verificato in llama.cpp, `llama-batch.cpp`: le posizioni
+ * t/h/w/e vengono forzate uguali prima del kernel). */
+static const ds4_shape DS4_SHAPE_QWEN35_27B = {
+    .name = "Qwen3.8 27B",
+    .family = DS4_MODEL_FAMILY_QWEN35,
+    .variant = DS4_VARIANT_QWEN35_27B,
+    .n_layer = 65,
+    .n_embd = 5120,
+    .n_vocab = 248320,
+    .n_head = 24,
+    .n_head_kv = 4,
+    .n_head_dim = 256,
+    .n_value_dim = 256,
+    .n_rot = 64,
+    .n_ff_dense = 17408,
+    .n_nextn_predict = 1,
+    .n_kda_head = 48,
+    .n_kda_head_dim = 128,
+    .n_kda_conv = 4,
+    .n_kda_kv_head = 16,
+    .n_full_attn_interval = 4,
+    .rms_eps = 1.0e-6f,
+    .rope_freq_base = 10000000.0f,
+    .rope_orig_ctx = 262144,
+};
+
 static ds4_shape g_ds4_shape = {
     .name = "DeepSeek V4 Flash",
     .family = DS4_MODEL_FAMILY_DEEPSEEK4,
@@ -792,6 +856,8 @@ static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 #define DS4_N_KDA_HEAD                (g_ds4_shape.n_kda_head)
 #define DS4_N_KDA_HEAD_DIM            (g_ds4_shape.n_kda_head_dim)
 #define DS4_N_KDA_CONV                (g_ds4_shape.n_kda_conv)
+#define DS4_N_KDA_KV_HEAD             (g_ds4_shape.n_kda_kv_head)
+#define DS4_N_FULL_ATTN_INTERVAL      (g_ds4_shape.n_full_attn_interval)
 #define DS4_RMS_EPS                   (g_ds4_shape.rms_eps)
 #define DS4_HC_EPS                    (g_ds4_shape.hc_eps)
 #define DS4_EXPERT_WEIGHT_SCALE       (g_ds4_shape.expert_weight_scale)
@@ -817,6 +883,24 @@ static bool ds4_glm53_layer_is_kda(uint32_t il) {
     return ds4_model_is_glm53() &&
            il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER &&
            il % 4u != 3u;
+}
+
+static bool ds4_model_is_qwen35(void) {
+    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35;
+}
+
+/* Un layer di Qwen3.8 fa ricorrenza (Gated DeltaNet) tranne che ogni
+ * `full_attention_interval`-esimo, e tranne i layer di MTP in coda, che sono
+ * sempre di attenzione piena. Con 65 layer, intervallo 4 e un layer MTP:
+ * ricorrenza su 48 layer, attenzione piena su 16 di trunk piu' quello MTP.
+ * Stessa forma di `ds4_glm53_layer_is_kda`, ma con l'intervallo letto dal
+ * modello invece che scritto nel codice. */
+static bool ds4_qwen35_layer_is_gdn(uint32_t il) {
+    const uint32_t interval = DS4_N_FULL_ATTN_INTERVAL;
+    return ds4_model_is_qwen35() &&
+           interval > 0u &&
+           il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER &&
+           (il + 1u) % interval != 0u;
 }
 
 static int g_ds4_lock_fd = -1;
@@ -4268,6 +4352,25 @@ typedef struct {
     ds4_tensor *kda_g_b;
     ds4_tensor *kda_o_norm;
     ds4_tensor *kda_output;
+    /* Qwen3.8 (famiglia QWEN35). Riusa i campi kda_* dove il significato e' lo
+     * stesso di GLM 5.3 — `kda_a_log` (ssm_a), `kda_dt_bias` (ssm_dt.bias),
+     * `kda_beta` (ssm_beta), `kda_o_norm` (ssm_norm), `kda_output` (ssm_out) —
+     * e aggiunge questi quattro, che hanno forma diversa: q/k/v arrivano fusi
+     * in una proiezione sola, la convoluzione causale e' una sola per tutti e
+     * tre, e decadimento e gate d'uscita sono proiezioni piene invece che a
+     * rango ridotto (dove GLM usa le coppie kda_f_a/f_b e kda_g_a/g_b). */
+    ds4_tensor *qwen_ssm_qkv;
+    ds4_tensor *qwen_ssm_conv1d;
+    ds4_tensor *qwen_ssm_alpha;
+    ds4_tensor *qwen_ssm_gate;
+    /* Attenzione piena classica (GQA con norm per testa), senza le proiezioni
+     * a rango ridotto dell'attenzione latente di DeepSeek e GLM. Nel tensore
+     * di q viaggia anche il gate, interlacciato a passo doppio. */
+    ds4_tensor *qwen_attn_q;
+    ds4_tensor *qwen_attn_k;
+    ds4_tensor *qwen_attn_v;
+    ds4_tensor *qwen_attn_q_norm;
+    ds4_tensor *qwen_attn_k_norm;
     ds4_tensor *attn_compressor_ape;
     ds4_tensor *attn_compressor_kv;
     ds4_tensor *attn_compressor_gate;
@@ -4423,6 +4526,16 @@ static ds4_tensor *required_tensorf(const ds4_model *m, const char *fmt, uint32_
     int n = snprintf(name, sizeof(name), fmt, layer);
     if (n < 0 || (size_t)n >= sizeof(name)) ds4_die("tensor name is too long");
     return required_tensor(m, name);
+}
+
+/* Come sopra, ma il tensore puo' non esserci: torna NULL invece di morire.
+ * Serve ai tensori che alcuni checkpoint hanno e altri no (per esempio quelli
+ * del layer MTP, che non tutti i file portano). */
+static ds4_tensor *optional_tensorf(const ds4_model *m, const char *fmt, uint32_t layer) {
+    char name[128];
+    int n = snprintf(name, sizeof(name), fmt, layer);
+    if (n < 0 || (size_t)n >= sizeof(name)) ds4_die("tensor name is too long");
+    return model_find_tensor(m, name);
 }
 
 static ds4_tensor *tensor_by_mtp_stage_suffix(
@@ -6182,6 +6295,102 @@ static void config_validate_glm53_model(const ds4_model *m) {
     config_validate_glm53_layer_types(m);
 }
 
+/* Limite generico: un valore letto dal file deve stare dentro cio' che il
+ * motore sa reggere. Fallisce SUBITO e dicendo cosa, invece di lasciare che il
+ * guasto compaia dopo, in un kernel, sotto forma di numeri sbagliati. */
+static uint32_t qwen35_bounded(const char *name, uint32_t got, uint32_t max) {
+    if (got == 0u || got > max) {
+        fprintf(stderr, "ds4: qwen35: %s = %u fuori dai limiti (1..%u)\n", name, got, max);
+        exit(1);
+    }
+    return got;
+}
+
+/* Qwen3.8 denso, architettura GGUF "qwen35".
+ *
+ * A differenza di DeepSeek e GLM, qui la geometria si LEGGE dal file invece di
+ * essere verificata contro una tabella fissa: la famiglia comprende piu' taglie
+ * (4B, 27B, ...) e legare il motore a un solo checkpoint significherebbe
+ * rifiutare gli altri senza motivo. La tabella `DS4_SHAPE_QWEN35_27B` resta come
+ * base — nome, epsilon, valori di riposo — e i campi che il file dichiara la
+ * sovrascrivono. Cio' che NON si legge dal file si controlla: ogni valore deve
+ * stare nei limiti del motore, e le relazioni fra i valori devono tornare.
+ *
+ * I nomi delle chiavi `ssm.*` vengono da Mamba ma qui descrivono un Gated
+ * DeltaNet: `group_count` sono le teste di chiave, `time_step_rank` quelle di
+ * valore, `state_size` la dimensione della testa, `inner_size` il prodotto
+ * delle ultime due. Il file non dichiara `vocab_size`: il vocabolario si conta
+ * dai token del tokenizer, quindi qui non si tocca. */
+static void config_validate_qwen35_model(const ds4_model *m) {
+    g_ds4_shape = DS4_SHAPE_QWEN35_27B;
+
+    g_ds4_shape.n_layer = qwen35_bounded(
+        "block_count", required_u32(m, "qwen35.block_count"), DS4_MAX_LAYER);
+    g_ds4_shape.n_embd = qwen35_bounded(
+        "embedding_length", required_u32(m, "qwen35.embedding_length"), DS4_MAX_EMBD);
+    g_ds4_shape.n_ff_dense = qwen35_bounded(
+        "feed_forward_length", required_u32(m, "qwen35.feed_forward_length"), DS4_MAX_FF_DENSE);
+    g_ds4_shape.n_head = qwen35_bounded(
+        "attention.head_count", required_u32(m, "qwen35.attention.head_count"), DS4_MAX_HEAD);
+    g_ds4_shape.n_head_kv = qwen35_bounded(
+        "attention.head_count_kv", required_u32(m, "qwen35.attention.head_count_kv"),
+        DS4_MAX_HEAD_KV);
+    g_ds4_shape.n_head_dim = qwen35_bounded(
+        "attention.key_length", required_u32(m, "qwen35.attention.key_length"), DS4_MAX_HEAD_DIM);
+    g_ds4_shape.n_value_dim = qwen35_bounded(
+        "attention.value_length", required_u32(m, "qwen35.attention.value_length"),
+        DS4_MAX_VALUE_DIM);
+    g_ds4_shape.n_rot = qwen35_bounded(
+        "rope.dimension_count", required_u32(m, "qwen35.rope.dimension_count"), DS4_MAX_ROT);
+    g_ds4_shape.n_full_attn_interval = qwen35_bounded(
+        "full_attention_interval", required_u32(m, "qwen35.full_attention_interval"),
+        DS4_MAX_LAYER);
+    g_ds4_shape.n_nextn_predict = required_u32(m, "qwen35.nextn_predict_layers");
+    g_ds4_shape.n_kda_conv = qwen35_bounded(
+        "ssm.conv_kernel", required_u32(m, "qwen35.ssm.conv_kernel"), DS4_MAX_KDA_CONV);
+    g_ds4_shape.n_kda_kv_head = qwen35_bounded(
+        "ssm.group_count", required_u32(m, "qwen35.ssm.group_count"), DS4_MAX_KDA_HEAD);
+    g_ds4_shape.n_kda_head = qwen35_bounded(
+        "ssm.time_step_rank", required_u32(m, "qwen35.ssm.time_step_rank"), DS4_MAX_KDA_HEAD);
+    g_ds4_shape.n_kda_head_dim = qwen35_bounded(
+        "ssm.state_size", required_u32(m, "qwen35.ssm.state_size"), DS4_MAX_KDA_HEAD_DIM);
+    g_ds4_shape.rope_orig_ctx = required_u64_compat(m, "qwen35.context_length");
+    g_ds4_shape.rope_freq_base = required_f32(m, "qwen35.rope.freq_base");
+    g_ds4_shape.rms_eps = required_f32(m, "qwen35.attention.layer_norm_rms_epsilon");
+
+    /* Le relazioni che il codice da' per buone piu' avanti. Se una non torna,
+     * il file non e' quello che dice di essere, e si smette qui. */
+    config_expect_u32("ssm.inner_size", required_u32(m, "qwen35.ssm.inner_size"),
+                      DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM);
+    if (DS4_N_KDA_HEAD % DS4_N_KDA_KV_HEAD != 0u) {
+        fprintf(stderr,
+                "ds4: qwen35: teste di valore (%u) non multiple di quelle di chiave (%u): "
+                "l'indicizzazione a gruppi della ricorrenza non sarebbe definita\n",
+                DS4_N_KDA_HEAD, DS4_N_KDA_KV_HEAD);
+        exit(1);
+    }
+    if (DS4_N_HEAD % DS4_N_HEAD_KV != 0u) {
+        fprintf(stderr, "ds4: qwen35: teste (%u) non multiple delle teste kv (%u)\n",
+                DS4_N_HEAD, DS4_N_HEAD_KV);
+        exit(1);
+    }
+    if (DS4_N_NEXTN_PREDICT >= DS4_N_LAYER) {
+        fprintf(stderr, "ds4: qwen35: layer MTP (%u) non minori dei layer totali (%u)\n",
+                DS4_N_NEXTN_PREDICT, DS4_N_LAYER);
+        exit(1);
+    }
+
+    fprintf(stderr,
+            "ds4: qwen35: %u layer (%u con ricorrenza, %u con attenzione piena, %u MTP), "
+            "embd %u, teste %u/%u da %u, GDN %ux%u da %u conv %u, FFN densa %u\n",
+            DS4_N_LAYER,
+            DS4_N_LAYER - DS4_N_NEXTN_PREDICT - (DS4_N_LAYER - DS4_N_NEXTN_PREDICT) / DS4_N_FULL_ATTN_INTERVAL,
+            (DS4_N_LAYER - DS4_N_NEXTN_PREDICT) / DS4_N_FULL_ATTN_INTERVAL,
+            DS4_N_NEXTN_PREDICT, DS4_N_EMBD, DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
+            DS4_N_KDA_KV_HEAD, DS4_N_KDA_HEAD, DS4_N_KDA_HEAD_DIM, DS4_N_KDA_CONV,
+            DS4_N_FF_DENSE);
+}
+
 static void config_validate_model(const ds4_model *m) {
     g_ds4_flash_vision_exp = false;
     ds4_str arch = {0};
@@ -6192,6 +6401,10 @@ static void config_validate_model(const ds4_model *m) {
         }
         if (ds4_streq(arch, "glm5-next")) {
             config_validate_glm53_model(m);
+            return;
+        }
+        if (ds4_streq(arch, "qwen35")) {
+            config_validate_qwen35_model(m);
             return;
         }
     }
@@ -6512,7 +6725,10 @@ static void weights_bind_output(
         const ds4_model *m,
         bool             required,
         bool             optional) {
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+    /* Qwen3.8 come GLM: testa d'uscita semplice, senza le hyper-connection
+     * che invece DeepSeek mette in coda (output_hc_base/fn/scale). */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
         if (required) {
             w->output_norm = required_tensor(m, "output_norm.weight");
             w->output      = required_tensor(m, "output.weight");
@@ -6617,9 +6833,54 @@ static void weights_bind_glm_dsa_layer(ds4_layer_weights *l, const ds4_model *m,
     }
 }
 
+/* Qwen3.8: un layer ha SEMPRE la norm d'ingresso, la norm prima della FFN e la
+ * FFN densa; cambia solo il mezzo con cui mescola i token — ricorrenza oppure
+ * attenzione piena. L'ultimo layer e' quello di MTP: llama.cpp lo carica e non
+ * lo esegue nel passo normale, e qui si fa lo stesso (i tensori si legano, la
+ * loro assenza non e' un errore). */
+static void weights_bind_qwen35_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
+    l->attn_norm = required_tensorf(m, "blk.%u.attn_norm.weight", il);
+    l->ffn_norm  = required_tensorf(m, "blk.%u.post_attention_norm.weight", il);
+
+    if (ds4_qwen35_layer_is_gdn(il)) {
+        l->qwen_ssm_qkv    = required_tensorf(m, "blk.%u.attn_qkv.weight", il);
+        l->qwen_ssm_gate   = required_tensorf(m, "blk.%u.attn_gate.weight", il);
+        l->qwen_ssm_conv1d = required_tensorf(m, "blk.%u.ssm_conv1d.weight", il);
+        l->qwen_ssm_alpha  = required_tensorf(m, "blk.%u.ssm_alpha.weight", il);
+        l->kda_beta        = required_tensorf(m, "blk.%u.ssm_beta.weight", il);
+        l->kda_a_log       = required_tensorf(m, "blk.%u.ssm_a", il);
+        l->kda_dt_bias     = required_tensorf(m, "blk.%u.ssm_dt.bias", il);
+        l->kda_o_norm      = required_tensorf(m, "blk.%u.ssm_norm.weight", il);
+        l->kda_output      = required_tensorf(m, "blk.%u.ssm_out.weight", il);
+    } else {
+        l->qwen_attn_q      = required_tensorf(m, "blk.%u.attn_q.weight", il);
+        l->qwen_attn_k      = required_tensorf(m, "blk.%u.attn_k.weight", il);
+        l->qwen_attn_v      = required_tensorf(m, "blk.%u.attn_v.weight", il);
+        l->qwen_attn_q_norm = required_tensorf(m, "blk.%u.attn_q_norm.weight", il);
+        l->qwen_attn_k_norm = required_tensorf(m, "blk.%u.attn_k_norm.weight", il);
+        l->attn_output      = required_tensorf(m, "blk.%u.attn_output.weight", il);
+    }
+
+    l->ffn_gate = required_tensorf(m, "blk.%u.ffn_gate.weight", il);
+    l->ffn_up   = required_tensorf(m, "blk.%u.ffn_up.weight", il);
+    l->ffn_down = required_tensorf(m, "blk.%u.ffn_down.weight", il);
+
+    if (il + DS4_N_NEXTN_PREDICT >= DS4_N_LAYER) {
+        l->nextn_eh_proj          = optional_tensorf(m, "blk.%u.nextn.eh_proj.weight", il);
+        l->nextn_enorm            = optional_tensorf(m, "blk.%u.nextn.enorm.weight", il);
+        l->nextn_hnorm            = optional_tensorf(m, "blk.%u.nextn.hnorm.weight", il);
+        l->nextn_shared_head_norm =
+            optional_tensorf(m, "blk.%u.nextn.shared_head_norm.weight", il);
+    }
+}
+
 static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         weights_bind_glm_dsa_layer(l, m, il);
+        return;
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
+        weights_bind_qwen35_layer(l, m, il);
         return;
     }
 
