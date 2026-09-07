@@ -2221,11 +2221,19 @@ enum {
     DS4_TENSOR_Q4_0     = 2,
     DS4_TENSOR_Q8_0     = 8,
     DS4_TENSOR_Q2_K     = 10,
+    DS4_TENSOR_Q3_K     = 11,
     DS4_TENSOR_Q4_K     = 12,
     DS4_TENSOR_Q5_K     = 13,
     DS4_TENSOR_Q6_K     = 14,
     DS4_TENSOR_Q8_K     = 15,
     DS4_TENSOR_IQ2_XXS  = 16,
+    /* Le quantizzazioni che usano i checkpoint Qwen3.8 della comunita'. I
+     * numeri sono quelli di GGUF, gia' presenti nella tabella dei tipi qui
+     * sopra con blocco e dimensione giusti: mancavano solo le costanti con
+     * cui il codice li nomina. */
+    DS4_TENSOR_IQ3_XXS  = 18,
+    DS4_TENSOR_IQ3_S    = 21,
+    DS4_TENSOR_IQ4_XS   = 23,
     DS4_TENSOR_I32      = 26,
     DS4_TENSOR_BF16     = 30,
     DS4_TENSOR_MXFP4    = 39,
@@ -4596,6 +4604,29 @@ static bool tensor_type_is_glm_dense_quant(uint32_t type) {
            type == DS4_TENSOR_BF16;
 }
 
+/* I tipi che un tensore di Qwen3.8 puo' avere. E' un elenco aperto perche' i
+ * checkpoint della comunita' mescolano quantizzazioni diverse dentro lo stesso
+ * file, e per layer: nel file misurato, iq3_xxs sulle proiezioni della
+ * ricorrenza, iq3_s sull'attenzione piena e sulla testa d'uscita, iq4_xs sulla
+ * FFN, q3_k su un layer solo, q2_k sull'embedding. Elencare i tipi invece di
+ * fissarne uno serve proprio a non legare il motore a un file particolare. */
+static bool tensor_type_is_qwen35_quant(uint32_t type) {
+    return type == DS4_TENSOR_F32 ||
+           type == DS4_TENSOR_F16 ||
+           type == DS4_TENSOR_BF16 ||
+           type == DS4_TENSOR_Q4_0 ||
+           type == DS4_TENSOR_Q8_0 ||
+           type == DS4_TENSOR_Q2_K ||
+           type == DS4_TENSOR_Q3_K ||
+           type == DS4_TENSOR_Q4_K ||
+           type == DS4_TENSOR_Q5_K ||
+           type == DS4_TENSOR_Q6_K ||
+           type == DS4_TENSOR_IQ2_XXS ||
+           type == DS4_TENSOR_IQ3_XXS ||
+           type == DS4_TENSOR_IQ3_S ||
+           type == DS4_TENSOR_IQ4_XS;
+}
+
 static bool tensor_type_is_dense_quant(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 ||
            type == DS4_TENSOR_Q4_K ||
@@ -5042,7 +5073,10 @@ static void tensor_expect_routed_expert(
 }
 
 static bool weights_have_output_head(const ds4_weights *w) {
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+    /* Qwen3.8 come GLM: testa d'uscita semplice, senza le hyper-connection
+     * che DeepSeek mette in coda. */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
         return w && w->output_norm && w->output;
     }
     return w &&
@@ -5054,7 +5088,8 @@ static bool weights_have_output_head(const ds4_weights *w) {
 }
 
 static bool weights_have_partial_output_head(const ds4_weights *w) {
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
         return w && (w->output_norm || w->output);
     }
     return w &&
@@ -5363,12 +5398,122 @@ static void weights_validate_glm_dsa_layout(
     }
 }
 
+/* Un tensore di Qwen3.8: il TIPO puo' essere uno qualunque di quelli che i
+ * checkpoint della comunita' usano (vedi `tensor_type_is_qwen35_quant`), la
+ * FORMA no — quella deve tornare con la geometria letta dai metadati. E' la
+ * seconda meta' del controllo: i metadati dicono cosa il file dichiara di
+ * essere, le forme dicono se lo e' davvero. */
+static void tensor_expect_qwen35_layout(
+        const ds4_tensor *t,
+        uint32_t          ndim,
+        uint64_t          d0,
+        uint64_t          d1,
+        uint64_t          d2) {
+    if (!t) ds4_die("internal error: missing tensor while validating qwen35 layout");
+    if (!tensor_type_is_qwen35_quant(t->type)) {
+        fprintf(stderr, "ds4: tensor %.*s has unsupported type %s for qwen35\n",
+                (int)t->name.len, t->name.ptr, tensor_type_name(t->type));
+        exit(1);
+    }
+    tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
+}
+
+static void weights_validate_qwen35_layout(
+        const ds4_weights *w,
+        uint32_t           layer_start,
+        uint32_t           layer_end,
+        bool               require_token_embd,
+        bool               require_output) {
+    const uint64_t n_embd   = DS4_N_EMBD;
+    const uint64_t q_dim    = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t kv_dim   = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    /* La ricorrenza: k e q hanno n_kda_kv_head teste, v ne ha n_kda_head; la
+     * proiezione fusa le porta tutte e tre, la convoluzione agisce su tutte. */
+    const uint64_t gdn_k    = (uint64_t)DS4_N_KDA_KV_HEAD * DS4_N_KDA_HEAD_DIM;
+    const uint64_t gdn_v    = (uint64_t)DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM;
+    const uint64_t gdn_qkv  = 2u * gdn_k + gdn_v;
+
+    if (!w) ds4_die("internal error: missing weights while validating qwen35 layout");
+    if (layer_start >= DS4_N_LAYER) ds4_die("invalid first layer in qwen35 layout validation");
+    if (layer_end == UINT32_MAX) layer_end = DS4_N_LAYER - 1u;
+    if (layer_end >= DS4_N_LAYER || layer_end < layer_start) {
+        ds4_die("invalid layer range in qwen35 layout validation");
+    }
+
+    if (require_token_embd && !w->token_embd) ds4_die("required token embedding tensor is missing");
+    if (w->token_embd) {
+        tensor_expect_qwen35_layout(w->token_embd, 2, n_embd, DS4_N_VOCAB, 0);
+    }
+    if (require_output && !weights_have_output_head(w)) {
+        ds4_die("required output head tensors are missing");
+    }
+    if (w->output_norm) tensor_expect_layout(w->output_norm, DS4_TENSOR_F32, 1, n_embd, 0, 0);
+    if (w->output)      tensor_expect_qwen35_layout(w->output, 2, n_embd, DS4_N_VOCAB, 0);
+
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+
+        tensor_expect_layout(l->attn_norm, DS4_TENSOR_F32, 1, n_embd, 0, 0);
+        tensor_expect_layout(l->ffn_norm,  DS4_TENSOR_F32, 1, n_embd, 0, 0);
+
+        if (ds4_qwen35_layer_is_gdn(il)) {
+            tensor_expect_qwen35_layout(l->qwen_ssm_qkv,   2, n_embd, gdn_qkv, 0);
+            tensor_expect_qwen35_layout(l->qwen_ssm_gate,  2, n_embd, gdn_v, 0);
+            /* La convoluzione causale: una colonna per canale, ampiezza kernel. */
+            tensor_expect_layout(l->qwen_ssm_conv1d, DS4_TENSOR_F32, 2,
+                                 DS4_N_KDA_CONV, gdn_qkv, 0);
+            tensor_expect_layout(l->qwen_ssm_alpha, DS4_TENSOR_F32, 2, n_embd, DS4_N_KDA_HEAD, 0);
+            tensor_expect_qwen35_layout(l->kda_beta, 2, n_embd, DS4_N_KDA_HEAD, 0);
+            tensor_expect_layout(l->kda_a_log,   DS4_TENSOR_F32, 1, DS4_N_KDA_HEAD, 0, 0);
+            tensor_expect_layout(l->kda_dt_bias, DS4_TENSOR_F32, 1, DS4_N_KDA_HEAD, 0, 0);
+            /* La norm della ricorrenza e' PER TESTA: una riga da head_dim,
+             * condivisa da tutte le teste di valore. */
+            tensor_expect_layout(l->kda_o_norm,  DS4_TENSOR_F32, 1, DS4_N_KDA_HEAD_DIM, 0, 0);
+            tensor_expect_qwen35_layout(l->kda_output, 2, gdn_v, n_embd, 0);
+        } else {
+            /* Nel tensore di q c'e' anche il gate, interlacciato: da qui il
+             * fattore due. Se un giorno un checkpoint li separasse, questo
+             * controllo lo direbbe subito invece di leggere meta' matrice. */
+            tensor_expect_qwen35_layout(l->qwen_attn_q, 2, n_embd, 2u * q_dim, 0);
+            tensor_expect_qwen35_layout(l->qwen_attn_k, 2, n_embd, kv_dim, 0);
+            tensor_expect_qwen35_layout(l->qwen_attn_v, 2, n_embd, kv_dim, 0);
+            tensor_expect_layout(l->qwen_attn_q_norm, DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0, 0);
+            tensor_expect_layout(l->qwen_attn_k_norm, DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0, 0);
+            tensor_expect_qwen35_layout(l->attn_output, 2, q_dim, n_embd, 0);
+        }
+
+        tensor_expect_qwen35_layout(l->ffn_gate, 2, n_embd, DS4_N_FF_DENSE, 0);
+        tensor_expect_qwen35_layout(l->ffn_up,   2, n_embd, DS4_N_FF_DENSE, 0);
+        tensor_expect_qwen35_layout(l->ffn_down, 2, DS4_N_FF_DENSE, n_embd, 0);
+
+        if (DS4_N_NEXTN_PREDICT != 0 && il + DS4_N_NEXTN_PREDICT >= DS4_N_LAYER) {
+            if (l->nextn_eh_proj) {
+                tensor_expect_qwen35_layout(l->nextn_eh_proj, 2, 2u * n_embd, n_embd, 0);
+            }
+            if (l->nextn_enorm) {
+                tensor_expect_layout(l->nextn_enorm, DS4_TENSOR_F32, 1, n_embd, 0, 0);
+            }
+            if (l->nextn_hnorm) {
+                tensor_expect_layout(l->nextn_hnorm, DS4_TENSOR_F32, 1, n_embd, 0, 0);
+            }
+            if (l->nextn_shared_head_norm) {
+                tensor_expect_layout(l->nextn_shared_head_norm, DS4_TENSOR_F32, 1, n_embd, 0, 0);
+            }
+        }
+    }
+}
+
 static void weights_validate_layout(
         const ds4_weights *w,
         uint32_t           layer_start,
         uint32_t           layer_end,
         bool               require_token_embd,
         bool               require_output) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
+        weights_validate_qwen35_layout(w, layer_start, layer_end,
+                                       require_token_embd, require_output);
+        return;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         weights_validate_glm_dsa_layout(w,
                                         layer_start,
@@ -39007,6 +39152,11 @@ struct ds4_vocab {
     int arg_value_start_id;
     int arg_value_end_id;
     int dsml_id;
+    /* ChatML (Qwen3.8): il ruolo non e' un token proprio come in DeepSeek e
+     * GLM, ma testo fra `<|im_start|>` e `<|im_end|>`. Servono quindi i due
+     * delimitatori, non tre token di ruolo. */
+    int im_start_id;
+    int im_end_id;
     str_i32_table token_to_id;
     str_i32_table merge_rank;
 };
@@ -39982,6 +40132,36 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         return;
     }
 
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
+        /* Qwen3.8 usa ChatML. bos ed eos si leggono dai metadati, come in GLM,
+         * perche' il file li dichiara e i nomi dei token non bastano a
+         * indovinarli: qui `<|endoftext|>` e' il bos e `<|im_end|>` l'eos. */
+        if (!model_get_token_id(model, "tokenizer.ggml.bos_token_id", &vocab->bos_id)) {
+            vocab->bos_id = vocab_lookup_optional(vocab, "<|endoftext|>");
+        }
+        if (!model_get_token_id(model, "tokenizer.ggml.eos_token_id", &vocab->eos_id)) {
+            vocab->eos_id = vocab_lookup_optional(vocab, "<|im_end|>");
+        }
+        vocab->im_start_id = vocab_lookup_optional(vocab, "<|im_start|>");
+        vocab->im_end_id   = vocab_lookup_optional(vocab, "<|im_end|>");
+        /* I ruoli sono testo dentro i delimitatori: nessun token dedicato. */
+        vocab->system_id = vocab->user_id = vocab->assistant_id = -1;
+        vocab->observation_id = -1;
+        vocab->sop_id = -1;
+        vocab->think_start_id = vocab_lookup_optional(vocab, "<think>");
+        vocab->think_end_id   = vocab_lookup_optional(vocab, "</think>");
+        vocab->tool_call_start_id = vocab_lookup_optional(vocab, "<tool_call>");
+        vocab->tool_call_end_id   = vocab_lookup_optional(vocab, "</tool_call>");
+        vocab->tool_response_start_id = -1;
+        vocab->tool_response_end_id = -1;
+        vocab->arg_key_start_id = -1;
+        vocab->arg_key_end_id = -1;
+        vocab->arg_value_start_id = -1;
+        vocab->arg_value_end_id = -1;
+        vocab->dsml_id = -1;
+        return;
+    }
+
     vocab->bos_id       = vocab_lookup(vocab, "<｜begin▁of▁sentence｜>");
     vocab->eos_id       = vocab_lookup(vocab, "<｜end▁of▁sentence｜>");
     vocab->system_id    = -1;
@@ -40041,12 +40221,107 @@ static void chat_push_think_prefix(const ds4_vocab *vocab,
     }
 }
 
+/* ChatML, il formato di Qwen3.8: ogni turno e' `<|im_start|>` + il nome del
+ * ruolo come TESTO, il contenuto, `<|im_end|>` e un a capo; l'ultimo resta
+ * aperto sul ruolo assistant, perche' e' li' che il modello continua. Niente
+ * token di ruolo dedicati: e' la differenza con DeepSeek e GLM.
+ *
+ * La forma qui sotto NON e' inventata: viene dal fork `ivanfioravanti/ds4-metal`
+ * (ramo `qwen3.8-flash-next`, `ds4.c::qwen4_chat_open/_close/_system/
+ * _assistant_prefix`), che serve un modello della stessa famiglia con lo stesso
+ * tokenizzatore — vocabolario 248320 e gli stessi identificatori speciali. Una
+ * prima versione scritta a mano emetteva `<think></think>` attaccati; il
+ * modello di chat di riferimento emette `<think>\n\n</think>\n\n`, e quegli a
+ * capo il modello li ha visti in addestramento. Stesso progetto, licenza MIT.
+ * L'istruzione di sforzo nel turno di sistema e' la loro, tradotta nei modi
+ * di ragionamento che questo albero conosce (qui non esistono LOW e MEDIUM). */
+static const char *DS4_QWEN35_REASONING_XHIGH =
+    "Reasoning effort is set to xhigh. Please think carefully through the task, "
+    "validate key assumptions, consider plausible alternatives, and prioritize "
+    "correctness, consistency, and clarity in the final answer.";
+
+static const char *qwen35_reasoning_effort_text(ds4_think_mode mode) {
+    switch (mode) {
+    case DS4_THINK_HIGH:
+    case DS4_THINK_MAX:  return DS4_QWEN35_REASONING_XHIGH;
+    case DS4_THINK_NONE: return NULL;
+    }
+    return NULL;
+}
+
+static void qwen35_chat_open(const ds4_vocab *vocab, const char *role, token_vec *out) {
+    token_vec_push(out, vocab->im_start_id);
+    bpe_tokenize_text(vocab, role, out);
+    bpe_tokenize_text(vocab, "\n", out);
+}
+
+static void qwen35_chat_close(const ds4_vocab *vocab, token_vec *out) {
+    token_vec_push(out, vocab->im_end_id);
+    bpe_tokenize_text(vocab, "\n", out);
+}
+
+static void qwen35_chat_system(
+        const ds4_vocab *vocab,
+        const char      *system,
+        ds4_think_mode   think_mode,
+        token_vec       *out) {
+    const char *instruction = qwen35_reasoning_effort_text(think_mode);
+    const bool have_system = system && system[0];
+    if (!instruction && !have_system) return;
+    qwen35_chat_open(vocab, "system", out);
+    if (instruction) {
+        bpe_tokenize_text(vocab, instruction, out);
+        if (have_system) bpe_tokenize_text(vocab, "\n\n", out);
+    }
+    if (have_system) bpe_tokenize_text(vocab, system, out);
+    qwen35_chat_close(vocab, out);
+}
+
+/* Con il ragionamento acceso si apre `<think>` e si lascia parlare il modello;
+ * con quello spento si chiude subito un blocco vuoto, come fa il modello di
+ * chat di riferimento — gli a capo compresi. */
+static void qwen35_chat_assistant_prefix(
+        const ds4_vocab *vocab,
+        ds4_think_mode   think_mode,
+        token_vec       *out) {
+    qwen35_chat_open(vocab, "assistant", out);
+    token_vec_push(out, vocab->think_start_id);
+    if (ds4_think_mode_enabled(think_mode)) {
+        bpe_tokenize_text(vocab, "\n", out);
+    } else {
+        bpe_tokenize_text(vocab, "\n\n", out);
+        token_vec_push(out, vocab->think_end_id);
+        bpe_tokenize_text(vocab, "\n\n", out);
+    }
+}
+
+static void encode_chat_prompt_qwen35(
+        const ds4_vocab *vocab,
+        const char      *system,
+        const char      *prompt,
+        ds4_think_mode   think_mode,
+        token_vec       *out) {
+    if (vocab->im_start_id < 0 || vocab->im_end_id < 0 ||
+        vocab->think_start_id < 0 || vocab->think_end_id < 0) {
+        ds4_die("this tokenizer does not provide the Qwen chat markers; use raw prompt tokenization");
+    }
+    qwen35_chat_system(vocab, system, think_mode, out);
+    qwen35_chat_open(vocab, "user", out);
+    bpe_tokenize_text(vocab, prompt ? prompt : "", out);
+    qwen35_chat_close(vocab, out);
+    qwen35_chat_assistant_prefix(vocab, think_mode, out);
+}
+
 static void encode_chat_prompt(
         const ds4_vocab *vocab,
         const char      *system,
         const char      *prompt,
         ds4_think_mode   think_mode,
         token_vec       *out) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
+        encode_chat_prompt_qwen35(vocab, system, prompt, think_mode, out);
+        return;
+    }
     const bool need_think_start =
         ds4_think_mode_enabled(think_mode) ||
         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;

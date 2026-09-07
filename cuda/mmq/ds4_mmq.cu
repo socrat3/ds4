@@ -4953,3 +4953,17 @@ template void mul_mat_q_case<GGML_TYPE_Q4_K>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_MXFP4>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+// Le quattro quantizzazioni dei checkpoint Qwen3.8 della comunita': un solo file
+// ne mescola fino a quattro (in quello misurato: iq3_xxs sulle proiezioni della
+// ricorrenza, iq3_s sull'attenzione piena e sulla testa d'uscita, iq4_xs sulla
+// FFN e su ssm_out, q3_k su un layer). I kernel esistono gia' in mmq.cuh, che
+// viene da llama.cpp: mancava solo l'istanza esplicita, senza la quale il
+// dispatcher li riconosce ma il collegamento non trova il simbolo.
+template void mul_mat_q_case<GGML_TYPE_Q3_K>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_IQ3_XXS>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_IQ3_S>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_IQ4_XS>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
