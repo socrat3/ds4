@@ -29877,6 +29877,12 @@ enum {
     QWEN35_CUDA_GDN_HISTORY = QWEN35_CUDA_GDN_CONV - 1,
 };
 
+/* The reductions below split 128 threads into exactly four warps and reduce
+ * through a four-element shared array. Changing the head dimension without
+ * revisiting them would keep compiling and quietly return wrong sums. */
+static_assert(QWEN35_CUDA_GDN_DIM == 128,
+              "qwen35 GDN reductions assume 128 threads, four warps");
+
 __device__ __forceinline__ static float qwen35_cuda_silu(float x) {
     return x / (1.0f + expf(-x));
 }
@@ -29894,6 +29900,34 @@ __device__ __forceinline__ static float qwen35_cuda_softplus(float x) {
     return log1pf(expf(x));
 }
 
+/* Working buffer for the mixed projection, grown as needed and never shrunk.
+ * Deliberately NOT the token-tile scratch a few hundred lines up: that one
+ * belongs to the dense attention path, and borrowing it would be a conflict
+ * waiting for the day both run in the same graph.  A buffer whose name says
+ * what it is for cannot be taken by accident. */
+static void *g_qwen35_gdn_scratch;
+static uint64_t g_qwen35_gdn_scratch_bytes;
+
+static void *qwen35_gdn_scratch_ensure(uint64_t bytes) {
+    if (bytes == 0) return NULL;
+    if (g_qwen35_gdn_scratch_bytes >= bytes) return g_qwen35_gdn_scratch;
+    if (g_qwen35_gdn_scratch) {
+        if (!cuda_ok(cudaDeviceSynchronize(),
+                     "synchronize qwen35 GDN scratch growth")) {
+            return NULL;
+        }
+        (void)cudaFree(g_qwen35_gdn_scratch);
+        g_qwen35_gdn_scratch = NULL;
+        g_qwen35_gdn_scratch_bytes = 0;
+    }
+    if (!cuda_ok(cudaMalloc(&g_qwen35_gdn_scratch, (size_t)bytes),
+                 "allocate qwen35 GDN scratch")) {
+        g_qwen35_gdn_scratch = NULL;
+        return NULL;
+    }
+    g_qwen35_gdn_scratch_bytes = bytes;
+    return g_qwen35_gdn_scratch;
+}
 /* Causal depthwise convolution over 4 taps, then SiLU, for every token at
  * once.  Token t tap w reads input t + w - 3, which for the first tokens falls
  * into the carried history: that is what lets prefill run in parallel while
@@ -30149,8 +30183,7 @@ static int qwen35_gdn_run(
         fprintf(stderr, "ds4: qwen35 GDN %s scratch size overflow\n", what);
         return 0;
     }
-    float *mixed = (float *)tt_scratch_ensure(scratch_bytes,
-        "allocate qwen35 GDN scratch");
+    float *mixed = (float *)qwen35_gdn_scratch_ensure(scratch_bytes);
     if (!mixed) return 0;
 
     cudaStream_t stream = cuda_decode_stream();
