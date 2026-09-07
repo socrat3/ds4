@@ -4658,7 +4658,8 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint
     int d = ds4_tensor_device_idx(tensor);
     int ok = 0;
     WITH_DEVICE(g_gpu[d].device_id) {
-        fill_f32_kernel<<<(count + 255u) / 256u, 256>>>((float *)tensor->ptr, count, value);
+        fill_f32_kernel<<<(count + 255u) / 256u, 256, 0, cuda_decode_stream()>>>(
+            (float *)tensor->ptr, count, value);
         ok = cuda_ok(cudaGetLastError(), "tensor fill f32 launch");
     }
     return ok;
@@ -18107,7 +18108,7 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds
     const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, (uint64_t)n * sizeof(float), logical_tier, "rms_weight");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
-    rms_norm_weight_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
+    rms_norm_weight_kernel<<<rows, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
 extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
@@ -18261,7 +18262,7 @@ extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_row
 extern "C" int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
     if (!x || n_rot > head_dim || (n_rot & 1) || x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
     uint32_t pairs = n_tok * n_head * (n_rot / 2);
-    rope_tail_kernel<<<(pairs + 255) / 256, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, 1, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+    rope_tail_kernel<<<(pairs + 255) / 256, 256, 0, cuda_decode_stream()>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, 1, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
     return cuda_ok(cudaGetLastError(), "rope_tail launch");
 }
 extern "C" int ds4_gpu_rope_tail_decode_rows_tensor(
@@ -18289,7 +18290,7 @@ extern "C" int ds4_gpu_rope_tail_decode_rows_tensor(
     memset(&table, 0, sizeof(table));
     for (uint32_t i = 0; i < n_rows; i++) table.row[i].pos = rows[i].pos;
     const uint32_t pairs = n_rows * n_head * (n_rot / 2u);
-    rope_tail_decode_rows_kernel<<<(pairs + 255u) / 256u, 256>>>(
+    rope_tail_decode_rows_kernel<<<(pairs + 255u) / 256u, 256, 0, cuda_decode_stream()>>>(
             (float *)x->ptr, table, n_rows, n_head, head_dim, n_rot,
             n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow);
@@ -18609,7 +18610,7 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
                                                    head_dim, n_comp, rms_eps)) return 0;
         if (n_rot != 0) {
             const uint32_t pairs = n_comp * (n_rot / 2u);
-            rope_tail_kernel<<<(pairs + 255) / 256, 256>>>(
+            rope_tail_kernel<<<(pairs + 255) / 256, 256, 0, cuda_decode_stream()>>>(
                     (float *)comp_cache->ptr, n_comp, 1, head_dim, n_rot,
                     pos0, ratio, n_ctx_orig, 0, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow);
@@ -18685,7 +18686,7 @@ extern "C" int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
                                                head_dim, n_comp, rms_eps)) return 0;
     if (n_rot != 0) {
         const uint32_t pairs = n_comp * (n_rot / 2u);
-        rope_tail_kernel<<<(pairs + 255) / 256, 256>>>(
+        rope_tail_kernel<<<(pairs + 255) / 256, 256, 0, cuda_decode_stream()>>>(
                 (float *)comp_cache->ptr, n_comp, 1, head_dim, n_rot,
                 pos0, ratio, n_ctx_orig, 0, freq_base, freq_scale,
                 ext_factor, attn_factor, beta_fast, beta_slow);
@@ -19286,7 +19287,7 @@ extern "C" int ds4_gpu_attention_decode_rows_rope_tensor(
     }
 
     const uint32_t pairs = n_rows * n_head * (n_rot / 2u);
-    rope_tail_decode_rows_kernel<<<(pairs + 255u) / 256u, 256>>>(
+    rope_tail_decode_rows_kernel<<<(pairs + 255u) / 256u, 256, 0, cuda_decode_stream()>>>(
         (float *)heads->ptr, table, n_rows, n_head, head_dim, n_rot,
         n_ctx_orig, 1, freq_base, freq_scale, ext_factor, attn_factor,
         beta_fast, beta_slow);
