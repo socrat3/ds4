@@ -177,6 +177,14 @@ static void usage(FILE *fp, const char *topic) {
     ds4_help_print(fp, DS4_HELP_DS4, topic);
 }
 
+/* Scritto dal Makefile e riscritto solo quando cambia: e' cio' che fa
+ * ricompilare questo file quando cambia il commit. Fuori da un clone git
+ * resta "unknown", che e' vero e non finge un numero. */
+#if defined(__has_include)
+#  if __has_include("ds4_build_id.h")
+#    include "ds4_build_id.h"
+#  endif
+#endif
 #ifndef DS4_BUILD_ID
 #define DS4_BUILD_ID "unknown"
 #endif

@@ -21,11 +21,27 @@ DEBUG_FLAGS ?= -g
 # che e' vero e non finge un numero.
 DS4_BUILD_ID ?= $(shell git describe --always --dirty --abbrev=8 2>/dev/null || echo unknown)
 CFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
-CFLAGS += -DDS4_BUILD_ID=\"$(DS4_BUILD_ID)\"
 OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fobjc-arc
 QUALITY_CFLAGS ?= -O3 $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c11
 
 LDLIBS ?= -lm -pthread
+
+# L'identita' di build arriva al programma da un HEADER GENERATO, non dal solo
+# -D. Con il solo -D l'oggetto che la contiene non veniva ricompilato quando
+# cambiava il commit, perche' nessuna dipendenza glielo diceva: il 07/09 il
+# binario dichiarava fcd83a42 mentre l'albero era a 85121fb2. Uno strumento che
+# serve a sapere QUALE binario si sta usando non puo' mentire: e' peggio di non
+# averlo. Il file si riscrive solo quando il contenuto cambia, quindi una build
+# senza commit nuovi non ricompila niente. I .cu restano col -D qui sotto:
+# non includono questo header e non stampano la versione.
+.PHONY: forza_build_id
+forza_build_id:
+ds4_build_id.h: forza_build_id
+	@echo '/* generato dal Makefile: non modificare a mano */' > $@.tmp
+	@echo '#define DS4_BUILD_ID "$(DS4_BUILD_ID)"' >> $@.tmp
+	@cmp -s $@.tmp $@ 2>/dev/null || mv -f $@.tmp $@
+	@rm -f $@.tmp
+
 METAL_SRCS := $(wildcard metal/*.metal)
 ROCM_SRCS := $(wildcard rocm/*.cuh)
 DS4_TEST_MODEL ?= ds4flash.gguf
@@ -331,7 +347,7 @@ ds4_image.o: ds4_image.c ds4_image.h third_party/iris/jpeg.h third_party/iris/pn
 ds4_ssd.o: ds4_ssd.c ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_ssd.c
 
-ds4_cli.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_prompt_prefix.h linenoise.h
+ds4_cli.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_prompt_prefix.h linenoise.h ds4_build_id.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
 
 ds4_distributed.o: ds4_distributed.c ds4_distributed.h ds4.h ds4_ssd.h
