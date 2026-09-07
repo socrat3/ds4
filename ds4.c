@@ -55049,6 +55049,40 @@ typedef struct ds4_dspark_spec_stats {
 #endif
 
 typedef struct {
+    uint32_t ctx_cap;
+    uint32_t n_exec;            /* layers actually run: total minus the MTP block */
+    uint32_t qkv_dim;
+    uint32_t v_dim;             /* GDN value width  = n_kda_head * head_dim */
+    uint32_t q_dim;             /* attention width  = n_head * n_head_dim */
+    uint32_t kv_dim;            /* cached width     = n_head_kv * n_head_dim */
+
+    ds4_gpu_tensor *tokens;
+    ds4_gpu_tensor *cur;
+    ds4_gpu_tensor *tmp;
+    ds4_gpu_tensor *norm;
+    ds4_gpu_tensor *qkv;
+    ds4_gpu_tensor *z;
+    ds4_gpu_tensor *alpha;
+    ds4_gpu_tensor *beta;
+    ds4_gpu_tensor *gdn_out;
+    ds4_gpu_tensor *qg;
+    ds4_gpu_tensor *q;
+    ds4_gpu_tensor *k;
+    ds4_gpu_tensor *v;
+    ds4_gpu_tensor *heads;
+    ds4_gpu_tensor *ffn_gate;
+    ds4_gpu_tensor *ffn_up;
+    ds4_gpu_tensor *ffn_mid;
+    ds4_gpu_tensor *logits;
+
+    /* Indexed by layer, null where the layer is of the other kind. */
+    ds4_gpu_tensor **conv_state;
+    ds4_gpu_tensor **recur_state;
+    ds4_gpu_tensor **k_cache;
+    ds4_gpu_tensor **v_cache;
+} ds4_qwen35_graph;
+
+typedef struct {
     uint32_t token_start;
     uint32_t token_count;
     uint8_t fingerprint[32];
@@ -55062,6 +55096,8 @@ struct ds4_session {
 #ifndef DS4_NO_GPU
     ds4_gpu_graph graph;
     ds4_glm_gpu_graph glm_graph;
+    ds4_qwen35_graph qwen35_graph;
+    bool qwen35_graph_ready;
     bool glm_graph_ready;
     uint32_t glm_dense_cache_len;
     /* GLM MTP speculative state.  parent is the token that conditioned the
@@ -56065,6 +56101,10 @@ static void ds4_session_dspark_capture_note_checkpoint(ds4_session *s) {
 
 static bool ds4_session_is_glm(const ds4_session *s) {
     return s && s->engine && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
+}
+
+static bool ds4_session_is_qwen35(const ds4_session *s) {
+    return s && s->engine && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35;
 }
 
 #ifndef DS4_NO_GPU
@@ -65680,6 +65720,327 @@ static int ds4_session_tp_register(ds4_session *s) {
     return 1;
 }
 
+
+/* ===========================================================================
+ * Qwen3.5 compute graph (CUDA).
+ *
+ * 65 layers: 48 recurrent, 16 full attention every fourth, 1 MTP block at the
+ * end which this graph does not execute.  Both the recurrence and the grouped
+ * attention are new kernels; everything else — embedding, RMSNorm, the
+ * quantised matmul, the rotation, the residuals — is the tree's own.
+ *
+ * Layer order, taken from llama.cpp qwen35.cpp and not from a neighbouring
+ * family:
+ *
+ *   x = embed(token)
+ *   for each layer:
+ *       h = rmsnorm(x, attn_norm)
+ *       recurrent:  qkv/z/alpha/beta projections -> GDN -> ssm_out
+ *       attention:  joint query+gate projection, query norm, k/v projections,
+ *                   key norm, rotation, cache store, grouped attention,
+ *                   sigmoid gate, output projection
+ *       x += that
+ *       h = rmsnorm(x, ffn_norm)
+ *       x += down(silu(gate(h)) * up(h))
+ *   logits = output(rmsnorm(x, output_norm))
+ *
+ * The two gates are not the same function and neither was copied from the
+ * other: the GDN output gate is SiLU, the attention gate is sigmoid.
+ *
+ * The KV cache is fp16.  In fp32 the 16 attention layers would want about a
+ * gigabyte at 4096 tokens, which does not fit beside 10.2 GiB of weights on a
+ * 12 GiB card; the recurrent state adds another 151 MB that the pre-existing
+ * memory plan does not count.
+ * ======================================================================== */
+
+
+static void qwen35_graph_free(ds4_qwen35_graph *g) {
+    if (!g) return;
+    for (uint32_t il = 0; g->conv_state && il < g->n_exec; il++) {
+        ds4_gpu_tensor_free(g->conv_state[il]);
+        ds4_gpu_tensor_free(g->recur_state[il]);
+        ds4_gpu_tensor_free(g->k_cache[il]);
+        ds4_gpu_tensor_free(g->v_cache[il]);
+    }
+    free(g->conv_state);
+    free(g->recur_state);
+    free(g->k_cache);
+    free(g->v_cache);
+    ds4_gpu_tensor_free(g->tokens);
+    ds4_gpu_tensor_free(g->cur);
+    ds4_gpu_tensor_free(g->tmp);
+    ds4_gpu_tensor_free(g->norm);
+    ds4_gpu_tensor_free(g->qkv);
+    ds4_gpu_tensor_free(g->z);
+    ds4_gpu_tensor_free(g->alpha);
+    ds4_gpu_tensor_free(g->beta);
+    ds4_gpu_tensor_free(g->gdn_out);
+    ds4_gpu_tensor_free(g->qg);
+    ds4_gpu_tensor_free(g->q);
+    ds4_gpu_tensor_free(g->k);
+    ds4_gpu_tensor_free(g->v);
+    ds4_gpu_tensor_free(g->heads);
+    ds4_gpu_tensor_free(g->ffn_gate);
+    ds4_gpu_tensor_free(g->ffn_up);
+    ds4_gpu_tensor_free(g->ffn_mid);
+    ds4_gpu_tensor_free(g->logits);
+    memset(g, 0, sizeof(*g));
+}
+
+/* Reports what it could not allocate and how much it wanted, because on a card
+ * this full the answer is almost always "the context is too long", and a bare
+ * failure would not say so. */
+static bool qwen35_graph_alloc(ds4_gpu_tensor **out, uint64_t bytes,
+                               const char *what) {
+    *out = ds4_gpu_tensor_alloc(bytes);
+    if (*out) return true;
+    fprintf(stderr, "ds4: qwen35: cannot allocate %.1f MiB for %s\n",
+            (double)bytes / (1024.0 * 1024.0), what);
+    return false;
+}
+
+static bool qwen35_graph_init(ds4_qwen35_graph *g, uint32_t ctx_cap) {
+    memset(g, 0, sizeof(*g));
+    if (ctx_cap == 0u || DS4_N_LAYER <= DS4_N_NEXTN_PREDICT) return false;
+    g->ctx_cap = ctx_cap;
+    g->n_exec = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    g->v_dim = DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM;
+    g->qkv_dim = 2u * DS4_N_KDA_KV_HEAD * DS4_N_KDA_HEAD_DIM + g->v_dim;
+    g->q_dim = DS4_N_HEAD * DS4_N_HEAD_DIM;
+    g->kv_dim = DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+
+    const uint64_t f = sizeof(float);
+    bool ok =
+        qwen35_graph_alloc(&g->tokens, sizeof(int32_t), "token id") &&
+        qwen35_graph_alloc(&g->cur, (uint64_t)DS4_N_EMBD * f, "residual") &&
+        qwen35_graph_alloc(&g->tmp, (uint64_t)DS4_N_EMBD * f, "layer output") &&
+        qwen35_graph_alloc(&g->norm, (uint64_t)DS4_N_EMBD * f, "normalised input") &&
+        qwen35_graph_alloc(&g->qkv, (uint64_t)g->qkv_dim * f, "GDN projection") &&
+        qwen35_graph_alloc(&g->z, (uint64_t)g->v_dim * f, "GDN gate") &&
+        qwen35_graph_alloc(&g->alpha, (uint64_t)DS4_N_KDA_HEAD * f, "GDN alpha") &&
+        qwen35_graph_alloc(&g->beta, (uint64_t)DS4_N_KDA_HEAD * f, "GDN beta") &&
+        qwen35_graph_alloc(&g->gdn_out, (uint64_t)g->v_dim * f, "GDN output") &&
+        qwen35_graph_alloc(&g->qg, (uint64_t)g->q_dim * 2u * f, "query and gate") &&
+        qwen35_graph_alloc(&g->q, (uint64_t)g->q_dim * f, "query") &&
+        qwen35_graph_alloc(&g->k, (uint64_t)g->kv_dim * f, "key") &&
+        qwen35_graph_alloc(&g->v, (uint64_t)g->kv_dim * f, "value") &&
+        qwen35_graph_alloc(&g->heads, (uint64_t)g->q_dim * f, "attention heads") &&
+        qwen35_graph_alloc(&g->ffn_gate, (uint64_t)DS4_N_FF_DENSE * f, "FFN gate") &&
+        qwen35_graph_alloc(&g->ffn_up, (uint64_t)DS4_N_FF_DENSE * f, "FFN up") &&
+        qwen35_graph_alloc(&g->ffn_mid, (uint64_t)DS4_N_FF_DENSE * f, "FFN mid") &&
+        qwen35_graph_alloc(&g->logits, (uint64_t)DS4_N_VOCAB * f, "logits");
+    if (!ok) {
+        qwen35_graph_free(g);
+        return false;
+    }
+
+    g->conv_state = xcalloc(g->n_exec, sizeof(*g->conv_state));
+    g->recur_state = xcalloc(g->n_exec, sizeof(*g->recur_state));
+    g->k_cache = xcalloc(g->n_exec, sizeof(*g->k_cache));
+    g->v_cache = xcalloc(g->n_exec, sizeof(*g->v_cache));
+
+    const uint64_t conv_bytes =
+        (uint64_t)(DS4_N_KDA_CONV - 1u) * g->qkv_dim * f;
+    const uint64_t state_bytes =
+        (uint64_t)g->v_dim * DS4_N_KDA_HEAD_DIM * f;
+    const uint64_t cache_bytes = (uint64_t)ctx_cap * g->kv_dim * sizeof(uint16_t);
+    for (uint32_t il = 0; il < g->n_exec; il++) {
+        if (ds4_qwen35_layer_is_gdn(il)) {
+            if (!qwen35_graph_alloc(&g->conv_state[il], conv_bytes, "convolution state") ||
+                !qwen35_graph_alloc(&g->recur_state[il], state_bytes, "recurrent state")) {
+                qwen35_graph_free(g);
+                return false;
+            }
+            /* A fresh sequence starts from a zero state; nothing else clears it. */
+            if (!ds4_gpu_tensor_fill_f32(g->conv_state[il], 0.0f,
+                                         conv_bytes / f) ||
+                !ds4_gpu_tensor_fill_f32(g->recur_state[il], 0.0f,
+                                         state_bytes / f)) {
+                qwen35_graph_free(g);
+                return false;
+            }
+        } else {
+            if (!qwen35_graph_alloc(&g->k_cache[il], cache_bytes, "key cache") ||
+                !qwen35_graph_alloc(&g->v_cache[il], cache_bytes, "value cache")) {
+                qwen35_graph_free(g);
+                return false;
+            }
+        }
+    }
+
+    const double mib = 1024.0 * 1024.0;
+    const uint32_t n_gdn = (g->n_exec * (DS4_N_FULL_ATTN_INTERVAL - 1u)) /
+                           DS4_N_FULL_ATTN_INTERVAL;
+    fprintf(stderr,
+            "ds4: qwen35: graph ready, ctx %u: recurrent state %.0f MiB, "
+            "KV cache %.0f MiB (fp16)\n",
+            ctx_cap,
+            (double)(n_gdn * (conv_bytes + state_bytes)) / mib,
+            (double)((g->n_exec - n_gdn) * 2u * cache_bytes) / mib);
+    return true;
+}
+
+/* One quantised matmul of a single row. Wrapped only to keep the forward pass
+ * below readable: the argument list is the same every time except for three
+ * things, and spelling it out fourteen times would hide the shape of the
+ * layer. */
+static bool qwen35_mm(ds4_gpu_tensor *out,
+                      const ds4_model *model,
+                      const ds4_tensor *w,
+                      const ds4_gpu_tensor *x,
+                      uint64_t in_dim,
+                      uint64_t out_dim) {
+    if (!w) return false;
+    return ds4_gpu_matmul_quant_tensor(out, model->map, model->size,
+                                       w->abs_offset, w->type,
+                                       in_dim, out_dim, x, 1u) != 0;
+}
+
+static bool qwen35_graph_forward_token(
+        ds4_qwen35_graph  *g,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        int                token,
+        uint32_t           pos,
+        float             *logits_out) {
+    if (!g || !model || !weights || !logits_out || pos >= g->ctx_cap) {
+        return false;
+    }
+    const int32_t id = (int32_t)token;
+    if (!ds4_gpu_tensor_write(g->tokens, 0, &id, sizeof(id))) return false;
+    if (!ds4_gpu_embed_tokens_quant_tensor(g->cur, g->tokens, model->map,
+                                           model->size,
+                                           weights->token_embd->abs_offset,
+                                           weights->token_embd->type,
+                                           DS4_N_VOCAB, 1u, DS4_N_EMBD)) {
+        return false;
+    }
+
+    for (uint32_t il = 0; il < g->n_exec; il++) {
+        const ds4_layer_weights *l = &weights->layer[il];
+        bool ok = ds4_gpu_rms_norm_weight_rows_tensor(
+            g->norm, g->cur, model->map, model->size,
+            l->attn_norm->abs_offset, DS4_N_EMBD, 1u, DS4_RMS_EPS) != 0;
+
+        if (ok && ds4_qwen35_layer_is_gdn(il)) {
+            ok = qwen35_mm(g->qkv, model, l->qwen_ssm_qkv, g->norm,
+                           DS4_N_EMBD, g->qkv_dim) &&
+                 qwen35_mm(g->z, model, l->qwen_ssm_gate, g->norm,
+                           DS4_N_EMBD, g->v_dim) &&
+                 qwen35_mm(g->alpha, model, l->qwen_ssm_alpha, g->norm,
+                           DS4_N_EMBD, DS4_N_KDA_HEAD) &&
+                 qwen35_mm(g->beta, model, l->kda_beta, g->norm,
+                           DS4_N_EMBD, DS4_N_KDA_HEAD);
+            if (ok) {
+                ok = ds4_gpu_qwen35_gdn_decode(
+                    g->gdn_out, g->conv_state[il], g->recur_state[il],
+                    g->qkv, g->alpha, g->beta, g->z,
+                    model->map, model->size,
+                    l->qwen_ssm_conv1d->abs_offset,
+                    l->kda_a_log->abs_offset,
+                    l->kda_dt_bias->abs_offset,
+                    l->kda_o_norm->abs_offset,
+                    DS4_N_KDA_KV_HEAD, DS4_N_KDA_HEAD,
+                    DS4_N_KDA_HEAD_DIM, DS4_N_KDA_CONV,
+                    1u, DS4_RMS_EPS) != 0;
+            }
+            if (ok) ok = qwen35_mm(g->tmp, model, l->kda_output, g->gdn_out,
+                                   g->v_dim, DS4_N_EMBD);
+        } else if (ok) {
+            const float rope_base = layer_rope_freq_base(il);
+            const float rope_scale = layer_rope_freq_scale(il);
+            ok = qwen35_mm(g->qg, model, l->qwen_attn_q, g->norm,
+                           DS4_N_EMBD, (uint64_t)g->q_dim * 2u) &&
+                 ds4_gpu_qwen35_extract_q_tensor(g->q, g->qg, 1u,
+                                                 DS4_N_HEAD, DS4_N_HEAD_DIM) != 0 &&
+                 ds4_gpu_qwen35_head_rms_norm_tensor(
+                     g->q, model->map, model->size,
+                     l->qwen_attn_q_norm->abs_offset,
+                     1u, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0 &&
+                 qwen35_mm(g->k, model, l->qwen_attn_k, g->norm,
+                           DS4_N_EMBD, g->kv_dim) &&
+                 ds4_gpu_qwen35_head_rms_norm_tensor(
+                     g->k, model->map, model->size,
+                     l->qwen_attn_k_norm->abs_offset,
+                     1u, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0 &&
+                 qwen35_mm(g->v, model, l->qwen_attn_v, g->norm,
+                           DS4_N_EMBD, g->kv_dim);
+            /* Text-only input, so the multimodal rope sections all carry the
+             * same position and this reduces to the ordinary rotation. */
+            if (ok) ok = ds4_gpu_rope_tail_tensor(
+                g->q, 1u, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos,
+                0, false, rope_base, rope_scale, 0.0f, 1.0f,
+                DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+            if (ok) ok = ds4_gpu_rope_tail_tensor(
+                g->k, 1u, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, pos,
+                0, false, rope_base, rope_scale, 0.0f, 1.0f,
+                DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+            if (ok) ok = ds4_gpu_qwen35_store_kv_tensor(
+                g->k_cache[il], g->v_cache[il], g->k, g->v,
+                g->ctx_cap, pos, 1u, DS4_N_HEAD_KV, DS4_N_HEAD_DIM) != 0;
+            if (ok) ok = ds4_gpu_qwen35_attention_gqa_tensor(
+                g->heads, g->q, g->k_cache[il], g->v_cache[il],
+                pos, 1u, pos + 1u, g->ctx_cap,
+                DS4_N_HEAD, DS4_N_HEAD_KV,
+                DS4_N_HEAD_DIM, DS4_N_HEAD_DIM, true) != 0;
+            if (ok) ok = ds4_gpu_qwen35_attn_gate_tensor(
+                g->heads, g->qg, 1u, DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
+            if (ok) ok = qwen35_mm(g->tmp, model, l->attn_output, g->heads,
+                                   g->q_dim, DS4_N_EMBD);
+        }
+        if (ok) ok = ds4_gpu_add_tensor(g->cur, g->cur, g->tmp, DS4_N_EMBD) != 0;
+
+        if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(
+            g->norm, g->cur, model->map, model->size,
+            l->ffn_norm->abs_offset, DS4_N_EMBD, 1u, DS4_RMS_EPS) != 0;
+        if (ok) ok = qwen35_mm(g->ffn_gate, model, l->ffn_gate, g->norm,
+                               DS4_N_EMBD, DS4_N_FF_DENSE) &&
+                     qwen35_mm(g->ffn_up, model, l->ffn_up, g->norm,
+                               DS4_N_EMBD, DS4_N_FF_DENSE) &&
+                     ds4_gpu_qwen35_silu_mul_tensor(g->ffn_mid, g->ffn_gate,
+                                                    g->ffn_up,
+                                                    DS4_N_FF_DENSE) != 0 &&
+                     qwen35_mm(g->tmp, model, l->ffn_down, g->ffn_mid,
+                               DS4_N_FF_DENSE, DS4_N_EMBD);
+        if (ok) ok = ds4_gpu_add_tensor(g->cur, g->cur, g->tmp, DS4_N_EMBD) != 0;
+
+        if (!ok) {
+            fprintf(stderr, "ds4: qwen35: layer %u failed at position %u\n", il, pos);
+            return false;
+        }
+    }
+
+    if (!ds4_gpu_rms_norm_weight_rows_tensor(
+            g->norm, g->cur, model->map, model->size,
+            weights->output_norm->abs_offset, DS4_N_EMBD, 1u, DS4_RMS_EPS)) {
+        return false;
+    }
+    if (!qwen35_mm(g->logits, model, weights->output, g->norm,
+                   DS4_N_EMBD, DS4_N_VOCAB)) {
+        return false;
+    }
+    if (!ds4_gpu_tensor_read(g->logits, 0, logits_out,
+                             (uint64_t)DS4_N_VOCAB * sizeof(float))) {
+        return false;
+    }
+    /* DS4_QWEN35_TRACE prints the top logit of every step.  A graph that is
+     * wired but numerically wrong produces tokens all the same, or NaN, and
+     * from the outside both look like a model that simply says nothing. */
+    if (getenv("DS4_QWEN35_TRACE")) {
+        int best = 0;
+        float top = logits_out[0];
+        uint32_t nans = 0;
+        for (uint32_t i = 0; i < (uint32_t)DS4_N_VOCAB; i++) {
+            if (isnan(logits_out[i])) nans++;
+            else if (logits_out[i] > top) { top = logits_out[i]; best = (int)i; }
+        }
+        fprintf(stderr,
+                "ds4: qwen35: pos %u -> token %d (logit %.4f), %u NaN of %u\n",
+                pos, best, (double)top, nans, (uint32_t)DS4_N_VOCAB);
+    }
+    return true;
+}
+
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
     if (e->backend == DS4_BACKEND_CPU) {
@@ -65864,15 +66225,25 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
      * quello di DeepSeek: proseguire significa dereferenziare tensori che questo
      * modello non ha, cioe' un crash invece di un errore. Meglio una frase che
      * dice cosa e' successo e cosa si puo' fare intanto. */
+    /* qwen35 runs its own graph: recurrence, grouped attention and dense FFN,
+     * with none of the expert routing, indexer or latent cache the code below
+     * this point is built around.  It is therefore served here and returns,
+     * rather than threading a third family through machinery that has no use
+     * for it. */
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
-        fprintf(stderr,
-                "ds4: qwen35: the model loaded and validated (%u layers), but this build has "
-                "no compute graph for the qwen35 family yet, so it cannot generate.\n"
-                "ds4: qwen35: use --inspect to examine the model without running it; "
-                "run --version to see which families this build can generate with.\n",
-                DS4_N_LAYER);
-        free(s);
-        return 1;
+        s->engine = e;
+        s->ctx_size = ctx_size;
+        if (!qwen35_graph_init(&s->qwen35_graph, (uint32_t)ctx_size)) {
+            fprintf(stderr, "ds4: qwen35: could not build the compute graph\n");
+            free(s);
+            return 1;
+        }
+        s->qwen35_graph_ready = true;
+        s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        s->sample_probs =
+            xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
+        *out = s;
+        return 0;
     }
     const ds4_layer_weights *shape_layer = weights_first_bound_layer(&e->weights);
     if (!shape_layer) {
@@ -67412,6 +67783,37 @@ static bool ds4_session_store_vision_identities(ds4_session *s) {
  * once its matching prefill completes, surfacing worker-side failures
  * here instead of as a gate timeout mid-decode. */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+#ifndef DS4_NO_GPU
+    /* qwen35 prefills one token at a time through the same forward the
+     * decode uses.  The kernels can take a batch, but the graph around them
+     * cannot yet, and a slow prefill that is correct is the right first
+     * step: batching it is a measurable change to make afterwards, against
+     * this as the reference. */
+    if (ds4_session_is_qwen35(s)) {
+        if (!s->qwen35_graph_ready || !prompt || prompt->len <= 0) {
+            snprintf(err, errlen, "qwen35: no prompt to process");
+            return 1;
+        }
+        if ((uint32_t)prompt->len > s->qwen35_graph.ctx_cap) {
+            snprintf(err, errlen, "qwen35: prompt of %d tokens exceeds the %u-token context",
+                     prompt->len, s->qwen35_graph.ctx_cap);
+            return 1;
+        }
+        s->checkpoint.len = 0;
+        for (int i = 0; i < prompt->len; i++) {
+            if (!qwen35_graph_forward_token(&s->qwen35_graph, &s->engine->model,
+                                           &s->engine->weights, prompt->v[i],
+                                           (uint32_t)i, s->logits)) {
+                snprintf(err, errlen, "qwen35: prefill failed at token %d of %d",
+                         i, prompt->len);
+                return 1;
+            }
+        }
+        s->checkpoint.len = prompt->len;
+        s->checkpoint_valid = false;
+        return 0;
+    }
+#endif
     if (s && !ds4_session_vision_prefix_matches(
                      s, s->sync_images, s->sync_image_count)) {
         ds4_session_invalidate(s);
@@ -69630,6 +70032,24 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
 }
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
+#ifndef DS4_NO_GPU
+    if (ds4_session_is_qwen35(s)) {
+        if (!s->qwen35_graph_ready) {
+            snprintf(err, errlen, "qwen35 graph is not ready");
+            return 1;
+        }
+        const uint32_t pos = (uint32_t)s->checkpoint.len;
+        if (!qwen35_graph_forward_token(&s->qwen35_graph, &s->engine->model,
+                                        &s->engine->weights, token, pos,
+                                        s->logits)) {
+            snprintf(err, errlen, "qwen35 forward failed at position %u", pos);
+            return 1;
+        }
+        s->checkpoint.len = (int)pos + 1;
+        s->checkpoint_valid = false;   /* snapshots are not wired for this family yet */
+        return 0;
+    }
+#endif
     bool probe_mtp = true;
 #ifndef DS4_NO_GPU
     if (s && s->engine && s->engine->support_kind == DS4_SUPPORT_DSPARK) {

@@ -28969,6 +28969,45 @@ __global__ static void glm_embed_tokens_q8_0_kernel(
     out[gid] = scale * (float)((const int8_t *)(blk + 2))[d & 31u];
 }
 
+/* Embedding rows stored as Q2_K.  The Qwen3.5 checkpoints in circulation put
+ * token_embd there, and the only path here read Q8_0, so a model whose weights
+ * loaded fine could not produce its first activation.  The index arithmetic is
+ * the inverse of dev_q2_K_dot_f32 above: same layout, read one element instead
+ * of a whole row. */
+__global__ static void embed_tokens_q2_K_kernel(
+        float *out,
+        const int32_t *tokens,
+        const unsigned char *w,
+        uint32_t n_tokens,
+        uint32_t n_embd) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)n_tokens * n_embd;
+    if (gid >= n) return;
+    const uint32_t t = (uint32_t)(gid / n_embd);
+    const uint32_t d = (uint32_t)(gid - (uint64_t)t * n_embd);
+    const int32_t tok = tokens[t];
+
+    const uint32_t row_blocks = n_embd / CUDA_QK_K;
+    const uint32_t b = d / CUDA_QK_K;
+    const uint32_t pos = d % CUDA_QK_K;
+    const cuda_block_q2_K *blk = (const cuda_block_q2_K *)w +
+        (uint64_t)tok * row_blocks + b;
+
+    const uint32_t chunk = pos / 128u;
+    const uint32_t rest = pos % 128u;
+    const uint32_t group = rest / 32u;
+    const uint32_t within = rest % 32u;
+    const uint32_t pair = within / 16u;
+    const uint32_t i = within % 16u;
+    const uint32_t il = chunk * 8u + 2u * group + pair;
+    const uint32_t shift = group * 2u;
+
+    const uint8_t sc = blk->scales[il];
+    const float dl = dev_f16_to_f32(blk->d) * (float)(sc & 0x0fu);
+    const float ml = dev_f16_to_f32(blk->dmin) * (float)(sc >> 4);
+    const uint8_t q = blk->qs[32u * chunk + 16u * pair + i];
+    out[gid] = dl * (float)((q >> shift) & 3u) - ml;
+}
 extern "C" int ds4_gpu_embed_tokens_quant_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *tokens,
@@ -28982,6 +29021,26 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
     if (!out || !tokens || !model_map || n_tokens == 0 || n_embd == 0 ||
         (n_embd & 31u) != 0u) {
         return 0;
+    }
+    if (weight_type == 10u) {   /* DS4_TENSOR_Q2_K */
+        if ((n_embd % CUDA_QK_K) != 0u) {
+            fprintf(stderr, "ds4: embed_tokens_quant: Q2_K needs n_embd a multiple of %d\n",
+                    (int)CUDA_QK_K);
+            return 0;
+        }
+        const uint64_t row_bytes =
+            (uint64_t)(n_embd / CUDA_QK_K) * sizeof(cuda_block_q2_K);
+        const uint64_t bytes = (uint64_t)n_vocab * row_bytes;
+        if (weight_offset > model_size || bytes > model_size - weight_offset) return 0;
+        const int tier = ds4_tensor_device_idx(out);
+        const unsigned char *w = (const unsigned char *)cuda_resolve_weight_ptr(
+            model_map, weight_offset, bytes, tier, "Q2_K token embeddings");
+        if (!w) return 0;
+        const uint64_t total = (uint64_t)n_tokens * n_embd;
+        const uint32_t blocks = (uint32_t)((total + 255ull) / 256ull);
+        embed_tokens_q2_K_kernel<<<blocks, 256u, 0, cuda_decode_stream()>>>(
+            (float *)out->ptr, (const int32_t *)tokens->ptr, w, n_tokens, n_embd);
+        return cuda_ok(cudaGetLastError(), "Q2_K token embedding launch");
     }
     if (weight_type != 8u) {   /* DS4_TENSOR_Q8_0 */
         fprintf(stderr, "ds4: embed_tokens_quant: unsupported type %u\n",
@@ -35271,10 +35330,24 @@ extern "C" int ds4_gpu_matmul_quant_tensor(
         return ds4_gpu_matmul_f16_tensor(out, model_map, model_size,
                                          weight_offset, in_dim, out_dim,
                                          x, n_tok);
+    case 0u:   /* F32.  Qwen3.5 keeps its small projections here: the two GDN
+                * scalars per head, and the norms.  The kernel existed and only
+                * this line was missing. */
+        return ds4_gpu_matmul_f32_tensor(out, model_map, model_size,
+                                         weight_offset, in_dim, out_dim,
+                                         x, n_tok);
     case 10u:  /* Q2_K */
     case 12u:  /* Q4_K */
     case 16u:  /* IQ2_XXS */
     case 39u:  /* MXFP4 */
+    /* The four a Qwen3.5 checkpoint is mostly made of.  Their kernels and
+     * dispatch cases exist; without these four lines the public entry point
+     * still refused them, which is how a model that loads cleanly failed at
+     * its first layer. */
+    case 11u:  /* Q3_K */
+    case 18u:  /* IQ3_XXS */
+    case 21u:  /* IQ3_S */
+    case 23u:  /* IQ4_XS */
         return cuda_matmul_mmq_dense_quant(
             out, model_map, model_size, weight_offset, weight_type,
             in_dim, out_dim, x, n_tok);
