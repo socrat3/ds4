@@ -40218,6 +40218,10 @@ static void vocab_free(ds4_vocab *vocab) {
  * marker, and either <think> or </think> depending on the requested mode.  Max
  * thinking is only a prompt prefix: the model still enters through <think>. */
 static void chat_push_bos_sequence(const ds4_vocab *vocab, token_vec *out) {
+    /* ChatML has no beginning-of-sequence token: the conversation starts at the
+     * first `<|im_start|>`.  Emitting one would put a stray token in front of
+     * every Qwen chat. */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) return;
     token_vec_push(out, vocab->bos_id);
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && vocab->sop_id >= 0)
         token_vec_push(out, vocab->sop_id);
@@ -40511,6 +40515,28 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
     if (!role) role = "user";
     if (!content) content = "";
 
+    /* Qwen: every turn is `<|im_start|>ROLE` ... `<|im_end|>`, where the role
+     * is plain text.  A past assistant turn is appended exactly as the caller
+     * stored it: if it carries a think block, the block is kept.  Dropping the
+     * reasoning of earlier turns is a policy decision for the caller, not
+     * something this encoder should do behind its back. */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
+        if (!strcmp(role, "system") || !strcmp(role, "developer")) {
+            qwen35_chat_open(vocab, "system", tokens);
+            bpe_tokenize_text(vocab, content, tokens);
+        } else if (!strcmp(role, "tool") || !strcmp(role, "function")) {
+            qwen35_chat_open(vocab, "user", tokens);
+            bpe_tokenize_text(vocab, "<tool_response>\n", tokens);
+            bpe_tokenize_tool_response_text(vocab, content, tokens);
+            bpe_tokenize_text(vocab, "\n</tool_response>", tokens);
+        } else {
+            qwen35_chat_open(vocab, !strcmp(role, "assistant") ? "assistant" : "user", tokens);
+            bpe_tokenize_text(vocab, content, tokens);
+        }
+        qwen35_chat_close(vocab, tokens);
+        return;
+    }
+
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         if (!strcmp(role, "system") || !strcmp(role, "developer")) {
             if (vocab->system_id >= 0) token_vec_push(tokens, vocab->system_id);
@@ -40556,6 +40582,14 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
+    /* Qwen speaks ChatML, so the turn opens with the `<|im_start|>assistant`
+     * marker plus the literal role, not with a dedicated assistant token.  Its
+     * think block is the one built by the single-prompt path, which keeps the
+     * newlines the chat model was trained on. */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
+        qwen35_chat_assistant_prefix(&e->vocab, think_mode, tokens);
+        return;
+    }
     token_vec_push(tokens, e->vocab.assistant_id);
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
         !ds4_think_mode_enabled(think_mode)) {
