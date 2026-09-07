@@ -306,6 +306,22 @@ static bool json_int(const char **p, int *out) {
     return true;
 }
 
+/* A reasoning ceiling is the one integer field where a negative value carries
+ * meaning: it is llama.cpp's "no ceiling", while json_int() folds negatives to
+ * zero -- which here means the opposite, close the block before the first
+ * token.  Both spellings of the field read it through this. */
+static bool json_reasoning_budget(const char **p, int *out) {
+    double v = 0.0;
+    if (!json_number(p, &v)) return false;
+    if (!(v >= 0)) {            /* negatives and NaN: no ceiling */
+        *out = -1;
+        return true;
+    }
+    if (v > INT_MAX) v = INT_MAX;
+    *out = (int)v;
+    return true;
+}
+
 static bool json_bool(const char **p, bool *out) {
     json_ws(p);
     if (json_lit(p, "true")) {
@@ -789,6 +805,13 @@ typedef struct {
     char *prompt_text;
     tool_schema_orders tool_orders;
     int max_tokens;
+    /* Ceiling on the tokens the model may spend inside the reasoning block,
+     * as llama.cpp's `reasoning_budget_tokens`: -1 leaves it unlimited, 0
+     * closes the block before the first token, N > 0 allows N tokens and then
+     * forces the closing marker.  Without it a model that reasons its way to
+     * the output limit returns an empty `content` with finish_reason=length,
+     * which reads from outside exactly like a model that had nothing to say. */
+    int reasoning_budget;
     int top_k;
     float temperature;
     float top_p;
@@ -956,6 +979,7 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK;
     r->model = xstrdup("deepseek-v4-flash");
     r->max_tokens = max_tokens;
+    r->reasoning_budget = -1;
     r->top_k = 0;
     r->temperature = DS4_DEFAULT_TEMPERATURE;
     r->top_p = DS4_DEFAULT_TOP_P;
@@ -1034,7 +1058,12 @@ static bool parse_reasoning_effort_value(const char **p, ds4_think_mode *out) {
     return ok;
 }
 
-static bool parse_thinking_control_value(const char **p, bool *thinking_enabled) {
+/* `thinking` carries two independent decisions: whether to reason at all, and
+ * how long.  Anthropic spells the second one `budget_tokens` inside this same
+ * object, so it is read here rather than in a second parser that would have to
+ * re-find the object. */
+static bool parse_thinking_control_value(const char **p, bool *thinking_enabled,
+                                         int *budget_tokens) {
     json_ws(p);
     if (json_lit(p, "null")) return true;
     if (**p == 't' || **p == 'f') return json_bool(p, thinking_enabled);
@@ -1059,6 +1088,11 @@ static bool parse_thinking_control_value(const char **p, bool *thinking_enabled)
             if (!strcmp(type, "enabled")) *thinking_enabled = true;
             else if (!strcmp(type, "disabled")) *thinking_enabled = false;
             free(type);
+        } else if (budget_tokens && !strcmp(key, "budget_tokens")) {
+            if (!json_reasoning_budget(p, budget_tokens)) {
+                free(key);
+                return false;
+            }
         } else if (!json_skip_value(p)) {
             free(key);
             return false;
@@ -3647,6 +3681,15 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "reasoning_budget_tokens") ||
+                   !strcmp(key, "thinking_budget_tokens")) {
+            /* Both spellings are llama.cpp's, and a client sends whichever its
+             * generation of that schema knew.  Anything below zero means the
+             * same thing there and here: no ceiling. */
+            if (!json_reasoning_budget(&p, &r->reasoning_budget)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "temperature")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -3700,7 +3743,8 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 goto bad;
             }
         } else if (!strcmp(key, "thinking")) {
-            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
+            if (!parse_thinking_control_value(&p, &thinking_enabled,
+                                              &r->reasoning_budget)) {
                 free(key);
                 goto bad;
             }
@@ -3914,7 +3958,8 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                 goto bad;
             }
         } else if (!strcmp(key, "thinking")) {
-            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
+            if (!parse_thinking_control_value(&p, &thinking_enabled,
+                                              &r->reasoning_budget)) {
                 free(key);
                 goto bad;
             }
@@ -5142,7 +5187,8 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
                 goto bad;
             }
         } else if (!strcmp(key, "thinking")) {
-            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
+            if (!parse_thinking_control_value(&p, &thinking_enabled,
+                                              &r->reasoning_budget)) {
                 free(key);
                 goto bad;
             }
@@ -12572,6 +12618,40 @@ decode_again:
     dsml_decode_tracker_init(&dsml_tracker);
     dsml_tracker.model_syntax = j->req.model_syntax;
 
+    /* Ceiling on the reasoning block (`reasoning_budget_tokens`).  Counting
+     * starts as soon as the block is open -- for a model whose prompt already
+     * carries `<think>`, that is the first generated token -- and when it runs
+     * out the closing marker is fed in place of the sampled token.  Without a
+     * ceiling a model that reasons all the way to the output limit returns an
+     * empty `content` with finish_reason=length, which from outside is
+     * indistinguishable from a model that had nothing to say.
+     *
+     * The marker is held in a fixed array rather than a ds4_tokens: this
+     * function has many exits and a heap buffer here would leak on most of
+     * them.  Eight is far more than the one or two tokens `</think>` becomes in
+     * every vocabulary DS4 loads; a longer one turns the ceiling off rather
+     * than silently forcing a truncated marker. */
+    int think_close_tok[8];
+    int think_close_len = 0;
+    int think_close_pos = -1;   /* >= 0 while the marker is being forced */
+    int reasoning_left = j->req.reasoning_budget;   /* < 0 = no ceiling */
+    if (reasoning_left >= 0) {
+        ds4_tokens close = {0};
+        ds4_tokenize_rendered_chat(s->engine, "</think>", &close);
+        const int cap = (int)(sizeof(think_close_tok) / sizeof(think_close_tok[0]));
+        if (close.len > 0 && close.len <= cap) {
+            for (int i = 0; i < close.len; i++) think_close_tok[i] = close.v[i];
+            think_close_len = close.len;
+        } else {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: reasoning budget ignored: </think> tokenizes to %d tokens",
+                       close.len);
+            reasoning_left = -1;
+        }
+        ds4_tokens_free(&close);
+    }
+    if (reasoning_left == 0 && thinking.inside) think_close_pos = 0;
+
     server_generation_enter(s);
     while (!g_stop_requested && !job_cancelled(j) && completion < max_tokens &&
            ds4_session_pos(slot->session) < ds4_session_ctx(slot->session)) {
@@ -12602,7 +12682,13 @@ decode_again:
             temperature = 0.0f;
         }
         const int eos_token = ds4_token_eos(s->engine);
-        int token = j->req.ignore_eos ?
+        /* Once the ceiling has run out the marker replaces the sampled token:
+         * the sampler is not consulted at all, so nothing the model would
+         * rather say can keep the reasoning block open. */
+        const bool force_close = think_close_pos >= 0;
+        int token = force_close ?
+            think_close_tok[think_close_pos] :
+            j->req.ignore_eos ?
             ds4_session_argmax_ignoring_eos(slot->session,
                                             j->req.think_mode) :
             ds4_session_sample(slot->session, temperature, top_k,
@@ -12612,7 +12698,12 @@ decode_again:
             snprintf(err, sizeof(err), "failed to select a non-EOS token");
             break;
         }
-        if (ds4_token_is_stop_for_think_mode(s->engine,
+        /* A forced marker is this server's own control token, not a decision by
+         * the model: `ds4_token_is_stop_for_think_mode` calls the thinking tags
+         * stops outside thinking mode, and honouring that here would end the
+         * response with the empty `content` the ceiling exists to prevent. */
+        if (!force_close &&
+            ds4_token_is_stop_for_think_mode(s->engine,
                                              token,
                                              j->req.think_mode)) {
             finish = "stop";
@@ -12624,7 +12715,11 @@ decode_again:
         int toks[17];
         int ntok = 0;
         const int block_start = ds4_session_pos(slot->session);
-        if (!s->batched_mode &&
+        /* No speculation while forcing the marker: the draft continues from a
+         * token the model did not choose, and its extra tokens would land past
+         * the marker without ever passing through the ceiling. */
+        if (!force_close &&
+            !s->batched_mode &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
@@ -12689,6 +12784,31 @@ decode_again:
             const bool was_thinking = thinking.inside;
             if (!dsml_decode_state_is_tool(dsml_tracker.decode))
                 thinking_state_feed(&thinking, piece, piece_len);
+            if (think_close_pos >= 0) {
+                /* A forced token advances the marker; it does not spend a
+                 * budget that has already run out. */
+                if (++think_close_pos >= think_close_len) {
+                    think_close_pos = -1;
+                    /* Re-arm on the next block: a model that opens a second
+                     * one gets a second budget, not an unlimited one. */
+                    reasoning_left = j->req.reasoning_budget;
+                }
+            } else if (reasoning_left > 0 && was_thinking) {
+                reasoning_left--;
+                if (reasoning_left == 0 && thinking.inside) {
+                    think_close_pos = 0;
+                    server_log(DS4_LOG_WARNING,
+                               "ds4-server: chat ctx=%s%s%s reasoning budget of %d tokens spent, closing the block after %d generated tokens",
+                               ctx_span,
+                               req_flags[0] ? " " : "",
+                               req_flags,
+                               j->req.reasoning_budget,
+                               completion);
+                    trace_event(s, trace_id,
+                                "reasoning budget of %d tokens spent after %d generated tokens; forcing the close marker",
+                                j->req.reasoning_budget, completion);
+                }
+            }
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
                 if (thinking.inside) {
                     dsml_decode_tracker_init(&dsml_tracker);
@@ -12866,6 +12986,14 @@ decode_again:
             if (j->req.kind == REQ_CHAT && j->req.has_tools && saw_tool_end) {
                 finish = "tool_calls";
                 stop_decode = true;
+                break;
+            }
+            if (think_close_pos >= 0 && ti + 1 < ntok) {
+                /* The ceiling ran out inside a speculative block.  The drafted
+                 * tail was written on the assumption that reasoning continued,
+                 * so it is discarded here and the rewind below puts the session
+                 * back to the token that exhausted the budget. */
+                resample = true;
                 break;
             }
             const bool next_greedy = !thinking.inside &&
@@ -16080,6 +16208,44 @@ static void test_chat_ignore_eos_contract(void) {
     TEST_ASSERT(!strcmp(err, "invalid JSON request"));
 }
 
+/* The ceiling's contract, in the two places it can be read without a loaded
+ * model: absent means unlimited, and a negative value means the same thing
+ * rather than a very small budget.  A body that parses all the way through
+ * needs an engine to tokenize the prompt, so the OpenAI spelling is covered by
+ * the live server run, not here. */
+static void test_reasoning_budget_parsing(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    TEST_ASSERT(r.reasoning_budget == -1);
+    request_free(&r);
+
+    /* Anthropic spells the ceiling inside the `thinking` object, next to the
+     * on/off decision, and both are read by the same parser. */
+    bool enabled = false;
+    int budget = -1;
+    const char *thinking = "{\"type\":\"enabled\",\"budget_tokens\":2048}";
+    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled, &budget));
+    TEST_ASSERT(enabled);
+    TEST_ASSERT(budget == 2048);
+
+    budget = 7;
+    thinking = "{\"type\":\"enabled\",\"budget_tokens\":-4}";
+    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled, &budget));
+    TEST_ASSERT(budget == -1);
+
+    budget = 5;
+    thinking = "{\"type\":\"disabled\"}";
+    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled, &budget));
+    TEST_ASSERT(!enabled);
+    TEST_ASSERT(budget == 5);
+
+    /* A caller that does not want the ceiling passes NULL and the object still
+     * parses: that is how the two older call sites keep working. */
+    thinking = "{\"type\":\"enabled\",\"budget_tokens\":16}";
+    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled, NULL));
+    TEST_ASSERT(enabled);
+}
+
 static void test_reasoning_effort_mapping(void) {
     ds4_think_mode mode = DS4_THINK_NONE;
     TEST_ASSERT(parse_reasoning_effort_name("low", &mode) && mode == DS4_THINK_HIGH);
@@ -16116,10 +16282,10 @@ static void test_model_alias_thinking_controls(void) {
 static void test_api_thinking_controls_parse(void) {
     bool enabled = true;
     const char *thinking = "{\"type\":\"disabled\",\"budget_tokens\":1024}";
-    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled));
+    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled, NULL));
     TEST_ASSERT(!enabled);
     thinking = "true";
-    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled));
+    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled, NULL));
     TEST_ASSERT(enabled);
 
     ds4_think_mode mode = DS4_THINK_HIGH;
@@ -19817,6 +19983,7 @@ static void ds4_server_unit_tests_run(void) {
     test_batched_live_continuation_slot_binding();
     test_request_defaults_use_min_p_filtering();
     test_chat_ignore_eos_contract();
+    test_reasoning_budget_parsing();
     test_reasoning_effort_mapping();
     test_model_alias_thinking_controls();
     test_api_thinking_controls_parse();
