@@ -5415,6 +5415,66 @@ extern "C" int ds4_gpu_set_aux_model_map_range(
  * This is the no-copy subset of ds4_gpu_set_model_map: same bookkeeping
  * for the host pointer plus cudaHostRegister, but skipping the
  * DS4_CUDA_COPY_MODEL branch that allocates and copies the entire model. */
+/* Should this model live in VRAM instead of being read across PCIe?
+ *
+ * The mapped-and-read design is right for what this engine was built for:
+ * mixture-of-experts models far larger than the card, where each token touches
+ * a few routed experts and the selective cache holds those.  For a dense model
+ * every weight is needed for every token, so reading them over PCIe at ~25 GB/s
+ * instead of from VRAM at ~500 costs a factor of twenty.  Measured on a dense
+ * 10.16 GiB model on a 12 GiB card: 839 ms per token, of which 0.2% was in the
+ * calls and the rest was the card waiting for weights.
+ *
+ * The decision is by size and not by family, because the question really is
+ * whether the weights fit with room left for everything else.  Headroom is
+ * deliberate: the KV cache, the recurrent state and the activations all come
+ * out of the same VRAM, and a model that fits with nothing to spare would then
+ * fail to allocate its context, which is a worse failure than being slow.
+ *
+ * DS4_CUDA_MODEL_RESIDENT forces the answer either way: 1 to copy even when
+ * the margin is thin, 0 to keep mapping.  A model that does not fit maps as
+ * before, so nothing regresses for the cases this engine was designed around. */
+static int cuda_model_should_be_resident(uint64_t model_size) {
+    const char *forced = getenv("DS4_CUDA_MODEL_RESIDENT");
+    if (forced && forced[0] == '0') return 0;
+    if (g_n_gpus > 1) return 0;          /* the selective cache owns this case */
+
+    size_t free_bytes = 0, total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (forced && forced[0] == '1') return 1;
+
+    /* Room for context and activations after the weights.
+     *
+     * 512 MiB, from what this model actually needs and not from a fraction:
+     * recurrent state 150 MiB, KV cache 128 MiB at 2048 tokens, activations
+     * and scratch under 150 MiB.  Two values were tried and rejected by
+     * measurement rather than taste: an eighth of the model is 1.3 GiB for
+     * something that needs 0.4, and 640 MiB missed the real case by 20 MiB
+     * on a card that then ran it comfortably.
+     *
+     * A long context can still exhaust what is left, and then the context
+     * allocation fails with its own message.  That is the right way round:
+     * refusing to make a model resident because a context MIGHT be large
+     * costs a factor of twenty on every run that is not. */
+    const uint64_t headroom = (uint64_t)512 * 1024 * 1024;
+    uint64_t needed = model_size;
+    if (needed > UINT64_MAX - headroom) return 0;
+    needed += headroom;
+    if ((uint64_t)free_bytes < needed) {
+        fprintf(stderr,
+                "ds4: CUDA model stays mapped: %.2f GiB weights + 0.50 GiB headroom "
+                "need %.2f GiB, %.2f GiB free. Weights will be read over PCIe, "
+                "which is roughly 20x slower than VRAM\n",
+                (double)model_size / 1073741824.0,
+                (double)needed / 1073741824.0,
+                (double)free_bytes / 1073741824.0);
+        return 0;
+    }
+    return 1;
+}
 extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
@@ -5460,6 +5520,19 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
         fprintf(stderr,
                 "ds4: CUDA aligned artifacts replace expert residency; "
                 "leaving the %.2f GiB model mmap unpinned\n",
+                (double)model_size / 1073741824.0);
+        return 1;
+    }
+
+    /* Weights in VRAM when they fit: see cuda_model_should_be_resident.
+     * On success the resolver finds them through g_model_device_base and no
+     * weight crosses PCIe again. On failure this falls through to the mapping
+     * below, which is the old behaviour. */
+    if (cuda_model_should_be_resident(model_size) &&
+        cuda_model_copy_chunked(model_map, model_size, 0, model_size)) {
+        g_model_host_base = (const char *)model_map;
+        g_model_registered_size = model_size;
+        fprintf(stderr, "ds4: CUDA model resident in VRAM: %.2f GiB\n",
                 (double)model_size / 1073741824.0);
         return 1;
     }
