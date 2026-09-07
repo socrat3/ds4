@@ -299,7 +299,7 @@ int main(void) {
         require_ok(ds4_gpu_qwen35_gdn_decode(
             g_out, g_conv, g_state, g_qkv, g_alpha, g_beta, g_ogate,
             model, MODEL_BYTES, CONV_OFFSET, SSM_A_OFFSET, DT_BIAS_OFFSET, NORM_OFFSET,
-            K_HEADS, V_HEADS, 1, norm_eps), "qwen35 GDN decode");
+            K_HEADS, V_HEADS, D, CONV_K, 1, norm_eps), "qwen35 GDN decode");
         require_ok(ds4_gpu_tensor_read(g_out, 0, decode_out[t], sizeof(decode_out[t])),
                    "decode output read");
         for (uint32_t i = 0; i < V_DIM; i++) {
@@ -334,7 +334,7 @@ int main(void) {
     require_ok(ds4_gpu_qwen35_gdn_prefill(
         p_out, p_conv, p_state, p_qkv, p_alpha, p_beta, p_ogate,
         model, MODEL_BYTES, CONV_OFFSET, SSM_A_OFFSET, DT_BIAS_OFFSET, NORM_OFFSET,
-        K_HEADS, V_HEADS, TOKENS, norm_eps), "qwen35 GDN prefill");
+        K_HEADS, V_HEADS, D, CONV_K, TOKENS, norm_eps), "qwen35 GDN prefill");
     static float prefill_out[TOKENS][V_DIM];
     require_ok(ds4_gpu_tensor_read(p_out, 0, prefill_out, sizeof(prefill_out)),
                "prefill output read");
@@ -380,7 +380,7 @@ int main(void) {
             require_ok(ds4_gpu_qwen35_gdn_prefill(
                 p_out, p_conv, p_state, p_qkv, p_alpha, p_beta, p_ogate,
                 model, MODEL_BYTES, CONV_OFFSET, SSM_A_OFFSET, DT_BIAS_OFFSET,
-                NORM_OFFSET, K_HEADS, V_HEADS, n, norm_eps), "chunk prefill");
+                NORM_OFFSET, K_HEADS, V_HEADS, D, CONV_K, n, norm_eps), "chunk prefill");
             require_ok(ds4_gpu_tensor_read(p_out, 0, chunk_out[done],
                                            (size_t)n * V_DIM * sizeof(float)),
                        "chunk output read");
@@ -406,11 +406,11 @@ int main(void) {
         const int bad_ratio = ds4_gpu_qwen35_gdn_decode(
             g_out, g_conv, g_state, g_qkv, g_alpha, g_beta, g_ogate,
             model, MODEL_BYTES, CONV_OFFSET, SSM_A_OFFSET, DT_BIAS_OFFSET,
-            NORM_OFFSET, 5u, V_HEADS, 1u, norm_eps);
+            NORM_OFFSET, 5u, V_HEADS, D, CONV_K, 1u, norm_eps);
         const int bad_tokens = ds4_gpu_qwen35_gdn_decode(
             g_out, g_conv, g_state, g_qkv, g_alpha, g_beta, g_ogate,
             model, MODEL_BYTES, CONV_OFFSET, SSM_A_OFFSET, DT_BIAS_OFFSET,
-            NORM_OFFSET, K_HEADS, V_HEADS, 0u, norm_eps);
+            NORM_OFFSET, K_HEADS, V_HEADS, D, CONV_K, 0u, norm_eps);
         require_ok(!bad_ratio && !bad_tokens, "invalid shapes must be refused");
         printf("invalid shapes refused: PASS\n");
     }

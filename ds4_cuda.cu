@@ -30040,10 +30040,19 @@ __global__ static void qwen35_gdn_recur_kernel(
         const float4 q4 = *(const float4 *)(row + (uint64_t)kh * QWEN35_CUDA_GDN_DIM + k0);
         const float4 k4 = *(const float4 *)(row + qk_dim +
                                             (uint64_t)kh * QWEN35_CUDA_GDN_DIM + k0);
+        /* decay and beta depend only on (token, head), so all 32 lanes would
+         * otherwise compute the same expf, log1pf and divide.  One lane does
+         * it and hands the result round: this kernel should be limited by
+         * memory, not by transcendentals. */
         const uint64_t head_idx = (uint64_t)t * n_v_heads + h;
-        const float decay = expf(a_head *
-            qwen35_cuda_softplus(raw_alpha[head_idx] + dt_head));
-        const float beta = qwen35_cuda_sigmoid(raw_beta[head_idx]);
+        float decay = 0.0f, beta = 0.0f;
+        if (lane == 0u) {
+            decay = expf(a_head *
+                qwen35_cuda_softplus(raw_alpha[head_idx] + dt_head));
+            beta = qwen35_cuda_sigmoid(raw_beta[head_idx]);
+        }
+        decay = __shfl_sync(0xffffffffu, decay, 0);
+        beta = __shfl_sync(0xffffffffu, beta, 0);
 
         s.x *= decay;
         s.y *= decay;
@@ -30124,9 +30133,24 @@ static int qwen35_gdn_run(
         uint64_t              output_norm_offset,
         uint32_t              n_k_heads,
         uint32_t              n_v_heads,
+        uint32_t              head_dim,
+        uint32_t              conv_len,
         uint32_t              n_tokens,
         float                 norm_eps,
         const char           *what) {
+    /* The kernels are written for a 128-wide head and a 4-tap convolution:
+     * the reductions assume four warps and the state is walked as float4.
+     * The loader reads the real geometry from the file, so a checkpoint with
+     * a different shape would validate here and then be read out of bounds
+     * by the kernels.  Refuse it instead, and say so. */
+    if (head_dim != QWEN35_CUDA_GDN_DIM || conv_len != QWEN35_CUDA_GDN_CONV) {
+        fprintf(stderr,
+                "ds4: qwen35 GDN %s: this build handles head_dim %d conv %d, "
+                "the model asks for %u and %u\n",
+                what, (int)QWEN35_CUDA_GDN_DIM, (int)QWEN35_CUDA_GDN_CONV,
+                head_dim, conv_len);
+        return 0;
+    }
     uint64_t qk_dim = 0, v_dim = 0, qkv_dim = 0;
     uint64_t qkv_elements = 0, out_elements = 0, head_elements = 0;
     uint64_t conv_elements = 0, state_elements = 0, conv_weights = 0;
@@ -30239,12 +30263,14 @@ extern "C" int ds4_gpu_qwen35_gdn_decode(
         uint64_t              output_norm_offset,
         uint32_t              n_k_heads,
         uint32_t              n_v_heads,
+        uint32_t              head_dim,
+        uint32_t              conv_len,
         uint32_t              n_rows,
         float                 norm_eps) {
     return qwen35_gdn_run(out, conv_state, recurrent_state, qkv, raw_alpha,
         raw_beta, output_gate, model_map, model_size, conv_offset,
         ssm_a_offset, dt_bias_offset, output_norm_offset,
-        n_k_heads, n_v_heads, n_rows, norm_eps, "decode");
+        n_k_heads, n_v_heads, head_dim, conv_len, n_rows, norm_eps, "decode");
 }
 
 extern "C" int ds4_gpu_qwen35_gdn_prefill(
@@ -30263,12 +30289,14 @@ extern "C" int ds4_gpu_qwen35_gdn_prefill(
         uint64_t              output_norm_offset,
         uint32_t              n_k_heads,
         uint32_t              n_v_heads,
+        uint32_t              head_dim,
+        uint32_t              conv_len,
         uint32_t              n_tokens,
         float                 norm_eps) {
     return qwen35_gdn_run(out, conv_state, recurrent_state, qkv, raw_alpha,
         raw_beta, output_gate, model_map, model_size, conv_offset,
         ssm_a_offset, dt_bias_offset, output_norm_offset,
-        n_k_heads, n_v_heads, n_tokens, norm_eps, "prefill");
+        n_k_heads, n_v_heads, head_dim, conv_len, n_tokens, norm_eps, "prefill");
 }
 
 extern "C" int ds4_gpu_flush_encoder(void) {
@@ -34768,6 +34796,13 @@ static int cuda_matmul_mmq_dense_quant(
     case 10u: block_elems = 256u; block_bytes = 84u; label = "Q2_K"; break;
     case 12u: block_elems = 256u; block_bytes = 144u; label = "Q4_K"; break;
     case 16u: block_elems = 256u; block_bytes = 66u; label = "IQ2_XXS"; break;
+    /* The four a real Qwen3.5 checkpoint is mostly made of.  Block sizes are
+     * those of the gguf_types table in ds4.c, which this switch unfortunately
+     * repeats; they were read from it rather than recalled. */
+    case 11u: block_elems = 256u; block_bytes = 110u; label = "Q3_K"; break;
+    case 18u: block_elems = 256u; block_bytes = 98u; label = "IQ3_XXS"; break;
+    case 21u: block_elems = 256u; block_bytes = 110u; label = "IQ3_S"; break;
+    case 23u: block_elems = 256u; block_bytes = 136u; label = "IQ4_XS"; break;
     case 39u: block_elems = 32u; block_bytes = 17u; label = "MXFP4"; break;
     default: return 0;
     }
@@ -34810,6 +34845,26 @@ static int cuda_matmul_mmq_dense_quant(
         break;
     case 16u:
         rc = ds4_mmq_iq2_xxs_dense(weights, (const float *)x->ptr,
+            (float *)out->ptr, (int)out_dim, (int)n_tok, (int)in_dim,
+            cuda_decode_stream());
+        break;
+    case 11u:
+        rc = ds4_mmq_q3_K_dense(weights, (const float *)x->ptr,
+            (float *)out->ptr, (int)out_dim, (int)n_tok, (int)in_dim,
+            cuda_decode_stream());
+        break;
+    case 18u:
+        rc = ds4_mmq_iq3_xxs_dense(weights, (const float *)x->ptr,
+            (float *)out->ptr, (int)out_dim, (int)n_tok, (int)in_dim,
+            cuda_decode_stream());
+        break;
+    case 21u:
+        rc = ds4_mmq_iq3_s_dense(weights, (const float *)x->ptr,
+            (float *)out->ptr, (int)out_dim, (int)n_tok, (int)in_dim,
+            cuda_decode_stream());
+        break;
+    case 23u:
+        rc = ds4_mmq_iq4_xs_dense(weights, (const float *)x->ptr,
             (float *)out->ptr, (int)out_dim, (int)n_tok, (int)in_dim,
             cuda_decode_stream());
         break;

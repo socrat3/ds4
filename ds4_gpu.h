@@ -3276,6 +3276,8 @@ int ds4_gpu_qwen35_gdn_decode(
         uint64_t              output_norm_offset,
         uint32_t              n_k_heads,
         uint32_t              n_v_heads,
+        uint32_t              head_dim,
+        uint32_t              conv_len,
         uint32_t              n_rows,
         float                 norm_eps);
 
@@ -3295,6 +3297,8 @@ int ds4_gpu_qwen35_gdn_prefill(
         uint64_t              output_norm_offset,
         uint32_t              n_k_heads,
         uint32_t              n_v_heads,
+        uint32_t              head_dim,
+        uint32_t              conv_len,
         uint32_t              n_tokens,
         float                 norm_eps);
 

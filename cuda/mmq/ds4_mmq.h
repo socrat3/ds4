@@ -168,6 +168,44 @@ int ds4_mmq_mxfp4_dense(
     int           K,
     cudaStream_t  stream);
 
+// Same contract, for the four quantisations that make up most of a real
+// Qwen3.5 checkpoint (IQ3_XXS alone is 5.9 GiB of the 10.2 GiB one).
+int ds4_mmq_q3_K_dense(
+    const void  * W,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
+int ds4_mmq_iq3_xxs_dense(
+    const void  * W,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
+int ds4_mmq_iq3_s_dense(
+    const void  * W,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
+int ds4_mmq_iq4_xs_dense(
+    const void  * W,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
 // MoE matmul entry points. For each (token, slot-within-token's-top-k) pair
 // the kernel computes:
 //

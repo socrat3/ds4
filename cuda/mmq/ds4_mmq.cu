@@ -901,6 +901,34 @@ extern "C" int ds4_mmq_mxfp4_dense(
     return ds4_mmq_dense_impl<GGML_TYPE_MXFP4>("ds4_mmq_mxfp4_dense", W, X, out, M, N, K, stream);
 }
 
+// The four quantisations a real Qwen3.5 checkpoint is mostly made of.  Their
+// MMQ cases were already instantiated below, but nothing could reach them:
+// there was no C entry point and no dispatch case, so a model whose weights
+// the loader accepted could not have been multiplied.  Found in review.
+extern "C" int ds4_mmq_q3_K_dense(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, cudaStream_t stream) {
+    return ds4_mmq_dense_impl<GGML_TYPE_Q3_K>("ds4_mmq_q3_K_dense", W, X, out, M, N, K, stream);
+}
+
+extern "C" int ds4_mmq_iq3_xxs_dense(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, cudaStream_t stream) {
+    return ds4_mmq_dense_impl<GGML_TYPE_IQ3_XXS>("ds4_mmq_iq3_xxs_dense", W, X, out, M, N, K, stream);
+}
+
+extern "C" int ds4_mmq_iq3_s_dense(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, cudaStream_t stream) {
+    return ds4_mmq_dense_impl<GGML_TYPE_IQ3_S>("ds4_mmq_iq3_s_dense", W, X, out, M, N, K, stream);
+}
+
+extern "C" int ds4_mmq_iq4_xs_dense(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, cudaStream_t stream) {
+    return ds4_mmq_dense_impl<GGML_TYPE_IQ4_XS>("ds4_mmq_iq4_xs_dense", W, X, out, M, N, K, stream);
+}
+
 // ----------------------------------------------------------------------------
 // MoE matmul implementation, shared across all three quant types.
 //
