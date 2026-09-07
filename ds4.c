@@ -67849,7 +67849,15 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                 return 1;
             }
         }
-        s->checkpoint.len = prompt->len;
+        /* The checkpoint must hold the tokens themselves, not just how many.
+         * ds4_session_common_prefix walks checkpoint.v to find how much of a
+         * new prompt it can reuse, and setting only the length left that array
+         * empty: the server segfaulted on its second request, before the
+         * prefill had even started. */
+        memset(&s->checkpoint, 0, sizeof(s->checkpoint));
+        for (int i = 0; i < prompt->len; i++) {
+            token_vec_push(&s->checkpoint, prompt->v[i]);
+        }
         s->checkpoint_valid = true;
         return 0;
     }
@@ -70098,7 +70106,7 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
             snprintf(err, errlen, "qwen35 forward failed at position %u", pos);
             return 1;
         }
-        s->checkpoint.len = (int)pos + 1;
+        token_vec_push(&s->checkpoint, token);
         /* Says the logits in s->logits are current, which is what sampling
          * checks before it will return a token.  Setting it false here, on the
          * assumption that it only concerned snapshots, made ds4_session_sample
