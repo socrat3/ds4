@@ -65995,6 +65995,11 @@ static bool qwen35_graph_forward_tokens(
         bool ok = ds4_gpu_rms_norm_weight_rows_tensor(
             g->norm, g->cur, model->map, model->size,
             l->attn_norm->abs_offset, DS4_N_EMBD, n, DS4_RMS_EPS) != 0;
+        /* One normalised row feeds four projections in a recurrent layer and
+         * three in an attention one: quantise it once here instead of once
+         * per matmul.  With more than one token there is nothing to share and
+         * this invalidates instead. */
+        if (ok) (void)ds4_gpu_publish_activation_q81(g->norm, n, DS4_N_EMBD);
 
         if (ok && ds4_qwen35_layer_is_gdn(il)) {
             ok = qwen35_mm(g->qkv, model, l->qwen_ssm_qkv, g->norm,
@@ -66068,6 +66073,7 @@ static bool qwen35_graph_forward_tokens(
         if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(
             g->norm, g->cur, model->map, model->size,
             l->ffn_norm->abs_offset, DS4_N_EMBD, n, DS4_RMS_EPS) != 0;
+        if (ok) (void)ds4_gpu_publish_activation_q81(g->norm, n, DS4_N_EMBD);
         if (ok) ok = qwen35_mm(g->ffn_gate, model, l->ffn_gate, g->norm,
                                DS4_N_EMBD, DS4_N_FF_DENSE, n) &&
                      qwen35_mm(g->ffn_up, model, l->ffn_up, g->norm,

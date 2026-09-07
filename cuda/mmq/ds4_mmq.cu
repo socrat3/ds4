@@ -173,6 +173,75 @@ extern "C" void *ds4_mmq_q81_scratch_ptr(void) {
 // reset by the producing entry every layer and pops are one-shot).
 extern "C" int ds4_cuda_q8_fold_take_q81(const void *src, uint64_t in_dim,
                                          const void **q81);
+/* Activation cache for decode.
+ *
+ * Every dense_vec call quantises its input to q8_1 before multiplying, and in
+ * decode the same activation feeds several projections in a row: the four GDN
+ * projections share one normalised row, the two FFN projections share another.
+ * That was one quantise launch per matmul, roughly 650 per token.
+ *
+ * ds4_cuda_q8_fold_take_q81 is the hook the vendored code already probes for
+ * exactly this, but its producers were never ported and it always misses.  So
+ * the producer lives here: the caller publishes a row once and the entries
+ * find it.
+ *
+ * Correctness rests on one rule: a hit requires the SAME pointer and the same
+ * K.  A buffer written again without republishing would be served stale, so
+ * the graph publishes immediately after each normalisation and every other
+ * activation simply misses and quantises itself, which is merely slower. */
+static struct {
+    const float *src;
+    int          K;
+    char        *buf;
+    size_t       bytes;
+} g_q81_cache;
+
+extern "C" void ds4_mmq_q81_invalidate(void) {
+    g_q81_cache.src = nullptr;
+    g_q81_cache.K = 0;
+}
+
+extern "C" int ds4_mmq_q81_publish(const float *X_f32, int K, cudaStream_t stream) {
+    if (!X_f32 || K <= 0 || (K % 256) != 0) {
+        ds4_mmq_q81_invalidate();
+        return 0;
+    }
+    const int64_t padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    const size_t need = (size_t)padded * sizeof(block_q8_1) / QK8_1;
+    if (g_q81_cache.bytes < need) {
+        if (g_q81_cache.buf) {
+            if (cudaDeviceSynchronize() != cudaSuccess) return 0;
+            cudaFree(g_q81_cache.buf);
+            g_q81_cache.buf = nullptr;
+            g_q81_cache.bytes = 0;
+        }
+        if (cudaMalloc((void **)&g_q81_cache.buf, need) != cudaSuccess) {
+            g_q81_cache.buf = nullptr;
+            ds4_mmq_q81_invalidate();
+            return 0;
+        }
+        g_q81_cache.bytes = need;
+    }
+    quantize_row_q8_1_cuda(
+        X_f32, /*ids=*/nullptr, (void *)g_q81_cache.buf,
+        GGML_TYPE_Q8_0, /*ne00=*/K,
+        /*s11=*/(int64_t)K, /*s12=*/(int64_t)K, /*s13=*/(int64_t)K,
+        /*ne0=*/padded, /*ne1=*/1, /*ne2=*/1, /*ne3=*/1,
+        stream);
+    if (cudaGetLastError() != cudaSuccess) {
+        ds4_mmq_q81_invalidate();
+        return 0;
+    }
+    g_q81_cache.src = X_f32;
+    g_q81_cache.K = K;
+    return 1;
+}
+
+static const char *ds4_mmq_q81_lookup(const float *X_f32, int K, int N) {
+    if (N != 1 || !g_q81_cache.buf) return nullptr;
+    if (g_q81_cache.src != X_f32 || g_q81_cache.K != K) return nullptr;
+    return g_q81_cache.buf;
+}
 static char *ds4_mmq_folded_q81(const float *X_f32, int64_t K, int n_tokens,
                                 int64_t ne10_padded) {
     if (n_tokens != 1 || ne10_padded != K) return nullptr;
@@ -3119,21 +3188,31 @@ int ds4_mmq_dense_vec_impl(
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const size_t  nbytes_q8_1 = (size_t)N * ne10_padded *
                                 sizeof(block_q8_1) / QK8_1;
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_q8_1);
+    // A row published by the caller is already in q8_1: in decode the same
+    // normalised activation feeds several projections, and quantising it once
+    // per matmul was most of the launches.  A miss simply quantises here.
+    cudaError_t err = cudaSuccess;
+    const char *shared = ds4_mmq_q81_lookup(X_f32, K, N);
+    ggml_cuda_pool_alloc<char> src1_q8_1;
+    const char *q81 = shared;
+    if (!q81) {
+        src1_q8_1.alloc(ctx->pool(), nbytes_q8_1);
 
-    // Dense src1 layout: K innermost, N next; ne11=N, ne12=1, ne13=1.
-    quantize_row_q8_1_cuda(
-        X_f32, /*ids=*/nullptr, (void *)src1_q8_1.get(),
-        type, /*ne00=*/K,
-        /*s11=*/(int64_t)K, /*s12=*/(int64_t)K * N, /*s13=*/(int64_t)K * N,
-        /*ne0=*/ne10_padded, /*ne1=*/N, /*ne2=*/1, /*ne3=*/1,
-        stream);
+        // Dense src1 layout: K innermost, N next; ne11=N, ne12=1, ne13=1.
+        quantize_row_q8_1_cuda(
+            X_f32, /*ids=*/nullptr, (void *)src1_q8_1.get(),
+            type, /*ne00=*/K,
+            /*s11=*/(int64_t)K, /*s12=*/(int64_t)K * N, /*s13=*/(int64_t)K * N,
+            /*ne0=*/ne10_padded, /*ne1=*/N, /*ne2=*/1, /*ne3=*/1,
+            stream);
 
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: quantize_row_q8_1_cuda failed: %s\n",
-                tag, cudaGetErrorString(err));
-        return -2;
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "%s: quantize_row_q8_1_cuda failed: %s\n",
+                    tag, cudaGetErrorString(err));
+            return -2;
+        }
+        q81 = src1_q8_1.get();
     }
 
     // Dense (no ids): per upstream dispatch (mmvq.cu:1121-1127),
@@ -3154,7 +3233,7 @@ int ds4_mmq_dense_vec_impl(
 
     mul_mat_vec_q_switch_type(
         /*vx=*/W, /*type_x=*/type,
-        /*vy=*/(const void *)src1_q8_1.get(),
+        /*vy=*/(const void *)q81,
         /*ids=*/nullptr, /*fusion=*/fusion,
         /*dst=*/out_f32,
         /*ncols_x=*/K, /*nrows_x=*/M, /*ncols_dst=*/N,

@@ -901,6 +901,12 @@ int ds4_mmq_q4_K_moe_pair_raw_vec(
 //
 // Returns 0 on success, non-zero on validation or launch failure.
 
+// Publishes one activation row in q8_1 so the dense_vec entries can skip
+// quantising it.  A hit needs the same pointer and the same K; anything else
+// misses and quantises itself.  Invalidate when the row is about to change.
+int ds4_mmq_q81_publish(const float *X_f32, int K, cudaStream_t stream);
+void ds4_mmq_q81_invalidate(void);
+
 int ds4_mmq_q8_0_dense_vec(
     const void  * W_q8_0,
     const float * X_f32,

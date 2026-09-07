@@ -30512,6 +30512,25 @@ __global__ static void qwen35_silu_mul_kernel(
     mid[i] = (g / (1.0f + expf(-g))) * up[i];
 }
 
+/* Publishes one activation row in q8_1 so the matmuls that follow can skip
+ * quantising it.  Only worth calling when a single row feeds several
+ * projections, which is what decode does and prefill does not: with more than
+ * one token there is nothing to share and this is a no-op. */
+extern "C" int ds4_gpu_publish_activation_q81(
+        const ds4_gpu_tensor *x,
+        uint32_t              n_tokens,
+        uint32_t              dim) {
+    if (!x || n_tokens != 1u || dim == 0u) {
+        ds4_mmq_q81_invalidate();
+        return 0;
+    }
+    if (!glm53_cuda_tensor_has(x, dim, sizeof(float))) {
+        ds4_mmq_q81_invalidate();
+        return 0;
+    }
+    return ds4_mmq_q81_publish((const float *)x->ptr, (int)dim,
+                               cuda_decode_stream());
+}
 extern "C" int ds4_gpu_qwen35_silu_mul_tensor(
         ds4_gpu_tensor       *mid,
         const ds4_gpu_tensor *gate,

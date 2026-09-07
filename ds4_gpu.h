@@ -3322,6 +3322,11 @@ int ds4_gpu_qwen35_attention_gqa_tensor(
         bool                  cache_f16);
 
 /* Small pieces the qwen35 graph needs. */
+/* Publishes an activation row in q8_1 for the matmuls that follow.  Only
+ * meaningful for a single token; with more it invalidates and returns 0. */
+int ds4_gpu_publish_activation_q81(
+        const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t dim);
+
 int ds4_gpu_qwen35_silu_mul_tensor(
         ds4_gpu_tensor *mid, const ds4_gpu_tensor *gate,
         const ds4_gpu_tensor *up, uint64_t n);
