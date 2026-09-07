@@ -29990,111 +29990,119 @@ __global__ static void qwen35_gdn_norm_kernel(
     k[tid] = kv * rsqrtf(k_total + 1.0e-6f);
 }
 
-/* The recurrence itself: one block per value head, walking the tokens in
- * order.  Decode is this with n_tokens == 1, which is why there is no separate
- * decode kernel and no second copy of the delta rule to keep in step. */
+/* The recurrence, tiled over value rows.
+ *
+ * The rows of the state are independent under the delta rule: row j needs only
+ * its own column of S, plus the shared k, q and the scalar v[j].  So a block
+ * can own four rows rather than a whole head, which turns 48 blocks into
+ * 48 * 32 = 1536 and gives every SM something to do.  This is the shape the KDA
+ * prefill above already uses; the first version of this kernel did not, and ran
+ * one block per head on a card with 56 of them.
+ *
+ * The other gain is bigger than the occupancy: each warp keeps its four state
+ * values IN REGISTERS across the whole token loop, and touches memory once at
+ * the start and once at the end.  The previous version re-read and re-wrote the
+ * state for every token.
+ *
+ * The output is left un-normalised here.  RMSNorm needs the sum of squares over
+ * all 128 rows of the head, which now live in 32 different blocks, so it moves
+ * to the small kernel below. */
 __global__ static void qwen35_gdn_recur_kernel(
-        float       *out,
+        float       *raw_out,
         float       *state,
         const float *mixed,
         const float *raw_alpha,
         const float *raw_beta,
-        const float *output_gate,
         const float *ssm_a,
         const float *dt_bias,
-        const float *output_norm,
         uint32_t     n_k_heads,
         uint32_t     n_v_heads,
         uint32_t     qkv_dim,
-        uint32_t     n_tokens,
-        float        norm_eps) {
+        uint32_t     n_tokens) {
     const uint32_t h = blockIdx.x;
-    const uint32_t tid = threadIdx.x;
-    const uint32_t lane = tid & 31u;
-    const uint32_t warp = tid >> 5u;
-    if (h >= n_v_heads || tid >= QWEN35_CUDA_GDN_DIM) return;
-
-    /* 16-byte aligned because the recurrence below reads them as float4.
-     * The language only promises 4-byte alignment for float, and a compiler
-     * free to place these differently would produce misaligned-address
-     * faults rather than wrong numbers. */
-    __shared__ __align__(16) float sq[QWEN35_CUDA_GDN_DIM];
-    __shared__ __align__(16) float sk[QWEN35_CUDA_GDN_DIM];
-    __shared__ __align__(16) float sv[QWEN35_CUDA_GDN_DIM];
-    __shared__ __align__(16) float so[QWEN35_CUDA_GDN_DIM];
-    __shared__ float reduce_o[4];
-    __shared__ float shared_decay;
-    __shared__ float shared_beta;
+    const uint32_t value = blockIdx.y * 4u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (h >= n_v_heads || value >= QWEN35_CUDA_GDN_DIM) return;
 
     const uint32_t kh = h % n_k_heads;      /* interleaved, not blocked */
     const uint32_t qk_dim = n_k_heads * QWEN35_CUDA_GDN_DIM;
     const uint32_t v_dim = n_v_heads * QWEN35_CUDA_GDN_DIM;
+    const uint32_t k0 = lane * 4u;
     const float a_head = ssm_a[h];
     const float dt_head = dt_bias[h];
-    float *state_head = state +
-        (uint64_t)h * QWEN35_CUDA_GDN_DIM * QWEN35_CUDA_GDN_DIM;
+
+    float4 *state_ptr = (float4 *)(state +
+        ((uint64_t)h * QWEN35_CUDA_GDN_DIM + value) * QWEN35_CUDA_GDN_DIM + k0);
+    float4 s = *state_ptr;
 
     for (uint32_t t = 0; t < n_tokens; t++) {
         const float *row = mixed + (uint64_t)t * qkv_dim;
-        sq[tid] = row[(uint64_t)kh * QWEN35_CUDA_GDN_DIM + tid];
-        sk[tid] = row[qk_dim + (uint64_t)kh * QWEN35_CUDA_GDN_DIM + tid];
-        sv[tid] = row[2u * qk_dim + (uint64_t)h * QWEN35_CUDA_GDN_DIM + tid];
-        if (tid == 0u) {
-            const uint64_t head_idx = (uint64_t)t * n_v_heads + h;
-            shared_decay = expf(a_head *
-                qwen35_cuda_softplus(raw_alpha[head_idx] + dt_head));
-            shared_beta = qwen35_cuda_sigmoid(raw_beta[head_idx]);
+        const float4 q4 = *(const float4 *)(row + (uint64_t)kh * QWEN35_CUDA_GDN_DIM + k0);
+        const float4 k4 = *(const float4 *)(row + qk_dim +
+                                            (uint64_t)kh * QWEN35_CUDA_GDN_DIM + k0);
+        const uint64_t head_idx = (uint64_t)t * n_v_heads + h;
+        const float decay = expf(a_head *
+            qwen35_cuda_softplus(raw_alpha[head_idx] + dt_head));
+        const float beta = qwen35_cuda_sigmoid(raw_beta[head_idx]);
+
+        s.x *= decay;
+        s.y *= decay;
+        s.z *= decay;
+        s.w *= decay;
+        const float sk_dot = __shfl_sync(
+            0xffffffffu, warp_sum_f32(dot4_f32(s, k4)), 0);
+        const float v_row = row[2u * qk_dim +
+                                (uint64_t)h * QWEN35_CUDA_GDN_DIM + value];
+        const float delta_v = (v_row - sk_dot) * beta;
+        s.x = fmaf(k4.x, delta_v, s.x);
+        s.y = fmaf(k4.y, delta_v, s.y);
+        s.z = fmaf(k4.z, delta_v, s.z);
+        s.w = fmaf(k4.w, delta_v, s.w);
+        const float sq_dot = __shfl_sync(
+            0xffffffffu, warp_sum_f32(dot4_f32(s, q4)), 0);
+        if (lane == 0u) {
+            raw_out[(uint64_t)t * v_dim +
+                    (uint64_t)h * QWEN35_CUDA_GDN_DIM + value] = sq_dot;
         }
-        __syncthreads();
-
-        const uint32_t k0 = lane * 4u;
-        const float4 q4 = *(const float4 *)(sq + k0);
-        const float4 k4 = *(const float4 *)(sk + k0);
-        const float decay = shared_decay;
-        const float beta = shared_beta;
-
-        for (uint32_t value = warp; value < QWEN35_CUDA_GDN_DIM; value += 4u) {
-            float4 *hptr = (float4 *)(state_head +
-                (uint64_t)value * QWEN35_CUDA_GDN_DIM + k0);
-            float4 s = *hptr;
-            s.x *= decay;
-            s.y *= decay;
-            s.z *= decay;
-            s.w *= decay;
-            const float sk_dot = __shfl_sync(
-                0xffffffffu, warp_sum_f32(dot4_f32(s, k4)), 0);
-            const float delta_v = (sv[value] - sk_dot) * beta;
-            s.x = fmaf(k4.x, delta_v, s.x);
-            s.y = fmaf(k4.y, delta_v, s.y);
-            s.z = fmaf(k4.z, delta_v, s.z);
-            s.w = fmaf(k4.w, delta_v, s.w);
-            *hptr = s;
-            const float sq_dot = __shfl_sync(
-                0xffffffffu, warp_sum_f32(dot4_f32(s, q4)), 0);
-            if (lane == 0u) so[value] = sq_dot;
-        }
-        __syncthreads();
-
-        float o_sumsq = warp_sum_f32(so[tid] * so[tid]);
-        if (lane == 0u) reduce_o[warp] = o_sumsq;
-        __syncthreads();
-        float o_total = lane < 4u ? reduce_o[lane] : 0.0f;
-        o_total = __shfl_sync(0xffffffffu, warp_sum_f32(o_total), 0);
-        const float o_scale =
-            rsqrtf(o_total / (float)QWEN35_CUDA_GDN_DIM + norm_eps);
-
-        const uint64_t out_idx =
-            (uint64_t)t * v_dim + (uint64_t)h * QWEN35_CUDA_GDN_DIM + tid;
-        /* SiLU, not sigmoid.  llama.cpp qwen35.cpp::build_norm_gated does
-         * ggml_silu on the gate; the KDA kernel this was modelled on uses
-         * sigmoid, and copying it put the wrong activation here.  The test
-         * had inherited the same mistake from the same place, so the two
-         * agreed and the error was invisible until a reviewer read the
-         * source instead of this code. */
-        out[out_idx] = so[tid] * o_scale * output_norm[tid] *
-                       qwen35_cuda_silu(output_gate[out_idx]);
-        __syncthreads();
     }
+    *state_ptr = s;
+}
+
+/* Per-head RMSNorm with the SiLU output gate, on the un-normalised rows the
+ * recurrence produced.  One block per (token, head): the reduction it needs
+ * spans the whole head, which is exactly what the tiled recurrence cannot do. */
+__global__ static void qwen35_gdn_norm_out_kernel(
+        float       *out,
+        const float *raw_out,
+        const float *output_gate,
+        const float *output_norm,
+        uint32_t     n_v_heads,
+        uint32_t     n_tokens,
+        float        norm_eps) {
+    const uint32_t t = blockIdx.x;
+    const uint32_t h = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    if (t >= n_tokens || h >= n_v_heads || tid >= QWEN35_CUDA_GDN_DIM) return;
+
+    __shared__ float reduce_o[4];
+    const uint32_t v_dim = n_v_heads * QWEN35_CUDA_GDN_DIM;
+    const uint64_t base = (uint64_t)t * v_dim + (uint64_t)h * QWEN35_CUDA_GDN_DIM;
+
+    const float x = raw_out[base + tid];
+    float sumsq = warp_sum_f32(x * x);
+    if (lane == 0u) reduce_o[warp] = sumsq;
+    __syncthreads();
+    float total = lane < 4u ? reduce_o[lane] : 0.0f;
+    total = __shfl_sync(0xffffffffu, warp_sum_f32(total), 0);
+
+    /* SiLU, not sigmoid: llama.cpp qwen35.cpp::build_norm_gated applies
+     * ggml_silu to the gate.  The neighbouring KDA kernel uses sigmoid here,
+     * and copying it is how this once went in wrong. */
+    out[base + tid] = x *
+        rsqrtf(total / (float)QWEN35_CUDA_GDN_DIM + norm_eps) *
+        output_norm[tid] * qwen35_cuda_silu(output_gate[base + tid]);
 }
 
 /* Shared entry point: decode is the n_tokens == 1 case of prefill, so both
@@ -30160,8 +30168,12 @@ static int qwen35_gdn_run(
         output_norm_offset, QWEN35_CUDA_GDN_DIM, tier, "qwen35 GDN output norm");
     if (!conv_w || !ssm_a || !dt_bias || !output_norm) return 0;
 
-    uint64_t scratch_bytes = 0;
-    if (!glm53_cuda_mul_u64(qkv_elements, sizeof(float), &scratch_bytes)) {
+    /* One allocation for two buffers: the mixed projection, and the rows the
+     * recurrence produces before they are normalised. */
+    uint64_t scratch_elements = 0, scratch_bytes = 0;
+    if (qkv_elements > UINT64_MAX - out_elements ||
+        ((scratch_elements = qkv_elements + out_elements), 0) ||
+        !glm53_cuda_mul_u64(scratch_elements, sizeof(float), &scratch_bytes)) {
         fprintf(stderr, "ds4: qwen35 GDN %s scratch size overflow\n", what);
         return 0;
     }
@@ -30172,6 +30184,7 @@ static int qwen35_gdn_run(
     float *mixed = (float *)cuda_tmp_alloc_on(tier, scratch_bytes,
         "qwen35 GDN mixed projection");
     if (!mixed) return 0;
+    float *raw_out = mixed + qkv_elements;
 
     cudaStream_t stream = cuda_decode_stream();
     const uint32_t mix_blocks = (uint32_t)((qkv_dim + 255ull) / 256ull);
@@ -30193,12 +30206,21 @@ static int qwen35_gdn_run(
             mixed, n_k_heads, (uint32_t)qkv_dim, n_tokens);
     if (!cuda_ok(cudaGetLastError(), "qwen35 GDN norm launch")) return 0;
 
-    qwen35_gdn_recur_kernel<<<n_v_heads, QWEN35_CUDA_GDN_DIM, 0, stream>>>(
-        (float *)out->ptr, (float *)recurrent_state->ptr, mixed,
-        (const float *)raw_alpha->ptr, (const float *)raw_beta->ptr,
-        (const float *)output_gate->ptr, ssm_a, dt_bias, output_norm,
-        n_k_heads, n_v_heads, (uint32_t)qkv_dim, n_tokens, norm_eps);
-    return cuda_ok(cudaGetLastError(), "qwen35 GDN recurrence launch");
+    /* 32 blocks per head, four value rows each: 1536 blocks instead of 48 on a
+     * card with 56 SMs.  The rows are independent under the delta rule, so the
+     * only thing that cannot be split this way is the RMSNorm, which follows. */
+    qwen35_gdn_recur_kernel<<<dim3(n_v_heads, 32u, 1u),
+        QWEN35_CUDA_GDN_DIM, 0, stream>>>(
+            raw_out, (float *)recurrent_state->ptr, mixed,
+            (const float *)raw_alpha->ptr, (const float *)raw_beta->ptr,
+            ssm_a, dt_bias, n_k_heads, n_v_heads, (uint32_t)qkv_dim, n_tokens);
+    if (!cuda_ok(cudaGetLastError(), "qwen35 GDN recurrence launch")) return 0;
+
+    qwen35_gdn_norm_out_kernel<<<dim3(n_tokens, n_v_heads, 1u),
+        QWEN35_CUDA_GDN_DIM, 0, stream>>>(
+            (float *)out->ptr, raw_out, (const float *)output_gate->ptr,
+            output_norm, n_v_heads, n_tokens, norm_eps);
+    return cuda_ok(cudaGetLastError(), "qwen35 GDN output norm launch");
 }
 
 extern "C" int ds4_gpu_qwen35_gdn_decode(
