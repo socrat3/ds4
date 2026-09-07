@@ -35305,6 +35305,16 @@ static int cuda_matmul_mmq_dense_quant(
             (float *)out->ptr, (int)out_dim, 1, (int)in_dim, cuda_decode_stream()); break;
         default: break;
         }
+        /* DS4_QWEN35_TRACE counts what actually happens here: a path that is
+         * wired but never taken looks exactly like one that is taken and slow. */
+        if (getenv("DS4_QWEN35_TRACE")) {
+            static unsigned long hits, misses;
+            if (vrc == 0) hits++; else misses++;
+            if (((hits + misses) % 2000ul) == 0ul) {
+                fprintf(stderr, "ds4: qwen35: mmvq %lu taken, %lu fell back\n",
+                        hits, misses);
+            }
+        }
         if (vrc == 0) {
             return cuda_ok(cudaGetLastError(), "CUDA dense MMVQ");
         }
