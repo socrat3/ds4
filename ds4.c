@@ -47072,7 +47072,10 @@ static bool glm_graph_seed_streaming_expert_cache_from_full_layer(
         }
         if (frequency[best] == 0) break;
         experts[n] = (int32_t)best;
-        priority[n++] = frequency[best];
+        /* The recency bonus ranks the preload, not observed decode uses.
+         * Keep it bounded so demand-loaded experts can replace the seed. */
+        priority[n] = metal_graph_streaming_builtin_hotness(target - n, target);
+        n++;
         frequency[best] = 0;
     }
     if (ok && n != 0) {
