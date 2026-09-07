@@ -40433,6 +40433,12 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
         {"<｜end▁of▁sentence｜>",   vocab->eos_id},
         {"[gMASK]",                vocab->bos_id},
         {"<sop>",                  vocab->sop_id},
+        /* ChatML, which is what Qwen speaks.  Without these two the rendered
+         * prompt reached the tokenizer as ordinary text and came out as a
+         * different token stream than the one the multi-turn encoder builds:
+         * both valid sequences, neither the same. */
+        {"<|im_start|>",           vocab->im_start_id},
+        {"<|im_end|>",             vocab->im_end_id},
         {"<|system|>",             vocab->system_id},
         {"<｜User｜>",              vocab->user_id},
         {"<｜Assistant｜>",         vocab->assistant_id},
@@ -65539,6 +65545,13 @@ bool ds4_engine_is_glm_dsa(ds4_engine *e) {
     return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
 }
 
+/* True for the qwen35 family, which the server needs in order to render
+ * ChatML instead of the DeepSeek or GLM markers. */
+bool ds4_engine_is_qwen35(ds4_engine *e) {
+    (void)e;
+    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35;
+}
+
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
@@ -65880,6 +65893,25 @@ static bool qwen35_graph_init(ds4_qwen35_graph *g, uint32_t ctx_cap) {
     return true;
 }
 
+/* Clears the recurrent and convolution state of every GDN layer.  A sequence
+ * must start from zero, and a session is reused across requests: without this
+ * the second question would answer with the first one's state still inside,
+ * which produces fluent and wrong text rather than an error. */
+static bool qwen35_graph_reset_state(ds4_qwen35_graph *g) {
+    if (!g) return false;
+    const uint64_t conv_elements =
+        (uint64_t)(DS4_N_KDA_CONV - 1u) * g->qkv_dim;
+    const uint64_t state_elements =
+        (uint64_t)g->v_dim * DS4_N_KDA_HEAD_DIM;
+    for (uint32_t il = 0; il < g->n_exec; il++) {
+        if (!g->conv_state[il]) continue;
+        if (!ds4_gpu_tensor_fill_f32(g->conv_state[il], 0.0f, conv_elements) ||
+            !ds4_gpu_tensor_fill_f32(g->recur_state[il], 0.0f, state_elements)) {
+            return false;
+        }
+    }
+    return true;
+}
 /* One quantised matmul of a single row. Wrapped only to keep the forward pass
  * below readable: the argument list is the same every time except for three
  * things, and spelling it out fourteen times would hide the shape of the
@@ -67803,6 +67835,10 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                      prompt->len, s->qwen35_graph.ctx_cap);
             return 1;
         }
+        if (!qwen35_graph_reset_state(&s->qwen35_graph)) {
+            snprintf(err, errlen, "qwen35: could not clear the recurrent state");
+            return 1;
+        }
         s->checkpoint.len = 0;
         for (int i = 0; i < prompt->len; i++) {
             if (!qwen35_graph_forward_token(&s->qwen35_graph, &s->engine->model,
@@ -67904,6 +67940,19 @@ int ds4_session_sync_multimodal(
         size_t image_count,
         char *err,
         size_t errlen) {
+#ifndef DS4_NO_GPU
+    /* qwen35 has no vision path.  Without this the call would fall through
+     * into the DeepSeek graph with tensors this model does not have, which is
+     * a crash rather than an error: the server reaches here for every request
+     * that carries image spans, and reached it once already. */
+    if (ds4_session_is_qwen35(s)) {
+        if (image_count > 0) {
+            snprintf(err, errlen, "qwen35: this build has no vision support");
+            return 1;
+        }
+        return ds4_session_sync(s, prompt, err, errlen);
+    }
+#endif
     if (!s || !prompt || (image_count != 0 && !images)) {
         snprintf(err, errlen, "invalid multimodal prompt");
         return 1;

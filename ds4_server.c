@@ -671,6 +671,7 @@ typedef enum {
 typedef enum {
     SERVER_MODEL_SYNTAX_DEEPSEEK,
     SERVER_MODEL_SYNTAX_GLM,
+    SERVER_MODEL_SYNTAX_QWEN,
 } server_model_syntax;
 
 static void random_tool_id(char *dst, size_t dstlen, api_style api) {
@@ -1129,6 +1130,7 @@ static bool model_alias_enables_thinking(const char *model) {
 }
 
 static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
+    if (ds4_engine_is_qwen35(engine)) return SERVER_MODEL_SYNTAX_QWEN;
     return ds4_engine_is_glm_dsa(engine) ?
            SERVER_MODEL_SYNTAX_GLM : SERVER_MODEL_SYNTAX_DEEPSEEK;
 }
@@ -3065,6 +3067,69 @@ static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
     return buf_take(&out);
 }
 
+/* ChatML, the format Qwen was trained on: every turn is
+ *   <|im_start|>ROLE\ncontent<|im_end|>\n
+ * and the assistant turn opens with a think block.  With thinking off the
+ * block is opened and closed empty, newlines included, which is what the
+ * model saw in training; a bare pair with no newlines is a different prompt.
+ *
+ * Tool schemas are ignored rather than half-rendered.  The GGUF chat template
+ * does describe a tool format and this does not implement it: a request
+ * carrying tools gets a prompt without them, which is wrong but visibly so,
+ * where a guessed format would be wrong and plausible. */
+static const char *qwen35_server_effort_text(ds4_think_mode mode) {
+    if (!ds4_think_mode_enabled(mode)) return NULL;
+    return "Reasoning effort is set to xhigh. Please think carefully through the task, "
+           "validate key assumptions, consider plausible alternatives, and prioritize "
+           "correctness, consistency, and clarity in the final answer.";
+}
+
+static char *render_qwen35_chat_prompt_text(const chat_msgs *msgs,
+                                            const char *tool_schemas,
+                                            const tool_schema_orders *tool_orders,
+                                            ds4_think_mode think_mode) {
+    (void)tool_schemas;
+    (void)tool_orders;
+    const bool think = ds4_think_mode_enabled(think_mode);
+    const char *effort = qwen35_server_effort_text(think_mode);
+    buf out = {0};
+
+    bool have_system = false;
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        if (role_is_system(msgs->v[i].role)) { have_system = true; break; }
+    }
+    if (effort || have_system) {
+        buf_puts(&out, "<|im_start|>system\n");
+        if (effort) {
+            buf_puts(&out, effort);
+            if (have_system) buf_puts(&out, "\n\n");
+        }
+        for (int i = 0; msgs && i < msgs->len; i++) {
+            const chat_msg *m = &msgs->v[i];
+            if (!role_is_system(m->role)) continue;
+            buf_puts(&out, m->content ? m->content : "");
+        }
+        buf_puts(&out, "<|im_end|>\n");
+    }
+
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (role_is_system(m->role)) continue;
+        buf_puts(&out, "<|im_start|>");
+        /* Same test the other renderers in this file use: the role is a plain
+         * string and only "assistant" is treated as one. */
+        buf_puts(&out, (m->role && !strcmp(m->role, "assistant"))
+                           ? "assistant" : "user");
+        buf_puts(&out, "\n");
+        buf_puts(&out, m->content ? m->content : "");
+        buf_puts(&out, "<|im_end|>\n");
+    }
+
+    buf_puts(&out, "<|im_start|>assistant\n");
+    buf_puts(&out, think ? "<think>\n"
+                        : "<think>\n\n</think>\n\n");
+    return out.ptr;
+}
 static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
                                                 const chat_msgs *msgs,
                                                 const char *tool_schemas,
@@ -3073,6 +3138,10 @@ static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
     if (syntax == SERVER_MODEL_SYNTAX_GLM) {
         return render_glm_chat_prompt_text(msgs, tool_schemas,
                                            tool_orders, think_mode);
+    }
+    if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
+        return render_qwen35_chat_prompt_text(msgs, tool_schemas,
+                                              tool_orders, think_mode);
     }
     return render_deepseek_chat_prompt_text(msgs, tool_schemas,
                                             tool_orders, think_mode);
