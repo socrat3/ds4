@@ -55056,6 +55056,7 @@ typedef struct ds4_dspark_spec_stats {
 
 typedef struct {
     uint32_t ctx_cap;
+    uint32_t chunk_cap;         /* tokens the activations are sized for */
     uint32_t n_exec;            /* layers actually run: total minus the MTP block */
     uint32_t qkv_dim;
     uint32_t v_dim;             /* GDN value width  = n_kda_head * head_dim */
@@ -55079,6 +55080,7 @@ typedef struct {
     ds4_gpu_tensor *ffn_gate;
     ds4_gpu_tensor *ffn_up;
     ds4_gpu_tensor *ffn_mid;
+    ds4_gpu_tensor *last_row;   /* the one row that reaches the output head */
     ds4_gpu_tensor *logits;
 
     /* Indexed by layer, null where the layer is of the other kind. */
@@ -65796,6 +65798,7 @@ static void qwen35_graph_free(ds4_qwen35_graph *g) {
     ds4_gpu_tensor_free(g->ffn_gate);
     ds4_gpu_tensor_free(g->ffn_up);
     ds4_gpu_tensor_free(g->ffn_mid);
+    ds4_gpu_tensor_free(g->last_row);
     ds4_gpu_tensor_free(g->logits);
     memset(g, 0, sizeof(*g));
 }
@@ -65816,6 +65819,20 @@ static bool qwen35_graph_init(ds4_qwen35_graph *g, uint32_t ctx_cap) {
     memset(g, 0, sizeof(*g));
     if (ctx_cap == 0u || DS4_N_LAYER <= DS4_N_NEXTN_PREDICT) return false;
     g->ctx_cap = ctx_cap;
+    /* Activations are sized for a chunk of tokens, not for the whole
+     * context: at ~470 KiB per token the full context would be gigabytes.
+     * 256 keeps it near 120 MiB and is already most of the batching win,
+     * since the cost being amortised is reading the weights once per chunk.
+     * DS4_QWEN35_CHUNK overrides it for measurement. */
+    g->chunk_cap = 256u;
+    {
+        const char *env = getenv("DS4_QWEN35_CHUNK");
+        if (env && env[0]) {
+            const long v = strtol(env, NULL, 10);
+            if (v > 0 && v <= 4096) g->chunk_cap = (uint32_t)v;
+        }
+    }
+    if (g->chunk_cap > ctx_cap) g->chunk_cap = ctx_cap;
     g->n_exec = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
     g->v_dim = DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM;
     g->qkv_dim = 2u * DS4_N_KDA_KV_HEAD * DS4_N_KDA_HEAD_DIM + g->v_dim;
@@ -65823,24 +65840,26 @@ static bool qwen35_graph_init(ds4_qwen35_graph *g, uint32_t ctx_cap) {
     g->kv_dim = DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
 
     const uint64_t f = sizeof(float);
+    const uint64_t c = g->chunk_cap;
     bool ok =
-        qwen35_graph_alloc(&g->tokens, sizeof(int32_t), "token id") &&
-        qwen35_graph_alloc(&g->cur, (uint64_t)DS4_N_EMBD * f, "residual") &&
-        qwen35_graph_alloc(&g->tmp, (uint64_t)DS4_N_EMBD * f, "layer output") &&
-        qwen35_graph_alloc(&g->norm, (uint64_t)DS4_N_EMBD * f, "normalised input") &&
-        qwen35_graph_alloc(&g->qkv, (uint64_t)g->qkv_dim * f, "GDN projection") &&
-        qwen35_graph_alloc(&g->z, (uint64_t)g->v_dim * f, "GDN gate") &&
-        qwen35_graph_alloc(&g->alpha, (uint64_t)DS4_N_KDA_HEAD * f, "GDN alpha") &&
-        qwen35_graph_alloc(&g->beta, (uint64_t)DS4_N_KDA_HEAD * f, "GDN beta") &&
-        qwen35_graph_alloc(&g->gdn_out, (uint64_t)g->v_dim * f, "GDN output") &&
-        qwen35_graph_alloc(&g->qg, (uint64_t)g->q_dim * 2u * f, "query and gate") &&
-        qwen35_graph_alloc(&g->q, (uint64_t)g->q_dim * f, "query") &&
-        qwen35_graph_alloc(&g->k, (uint64_t)g->kv_dim * f, "key") &&
-        qwen35_graph_alloc(&g->v, (uint64_t)g->kv_dim * f, "value") &&
-        qwen35_graph_alloc(&g->heads, (uint64_t)g->q_dim * f, "attention heads") &&
-        qwen35_graph_alloc(&g->ffn_gate, (uint64_t)DS4_N_FF_DENSE * f, "FFN gate") &&
-        qwen35_graph_alloc(&g->ffn_up, (uint64_t)DS4_N_FF_DENSE * f, "FFN up") &&
-        qwen35_graph_alloc(&g->ffn_mid, (uint64_t)DS4_N_FF_DENSE * f, "FFN mid") &&
+        qwen35_graph_alloc(&g->tokens, c * sizeof(int32_t), "token ids") &&
+        qwen35_graph_alloc(&g->cur, c * (uint64_t)DS4_N_EMBD * f, "residual") &&
+        qwen35_graph_alloc(&g->tmp, c * (uint64_t)DS4_N_EMBD * f, "layer output") &&
+        qwen35_graph_alloc(&g->norm, c * (uint64_t)DS4_N_EMBD * f, "normalised input") &&
+        qwen35_graph_alloc(&g->qkv, c * (uint64_t)g->qkv_dim * f, "GDN projection") &&
+        qwen35_graph_alloc(&g->z, c * (uint64_t)g->v_dim * f, "GDN gate") &&
+        qwen35_graph_alloc(&g->alpha, c * (uint64_t)DS4_N_KDA_HEAD * f, "GDN alpha") &&
+        qwen35_graph_alloc(&g->beta, c * (uint64_t)DS4_N_KDA_HEAD * f, "GDN beta") &&
+        qwen35_graph_alloc(&g->gdn_out, c * (uint64_t)g->v_dim * f, "GDN output") &&
+        qwen35_graph_alloc(&g->qg, c * (uint64_t)g->q_dim * 2u * f, "query and gate") &&
+        qwen35_graph_alloc(&g->q, c * (uint64_t)g->q_dim * f, "query") &&
+        qwen35_graph_alloc(&g->k, c * (uint64_t)g->kv_dim * f, "key") &&
+        qwen35_graph_alloc(&g->v, c * (uint64_t)g->kv_dim * f, "value") &&
+        qwen35_graph_alloc(&g->heads, c * (uint64_t)g->q_dim * f, "attention heads") &&
+        qwen35_graph_alloc(&g->ffn_gate, c * (uint64_t)DS4_N_FF_DENSE * f, "FFN gate") &&
+        qwen35_graph_alloc(&g->ffn_up, c * (uint64_t)DS4_N_FF_DENSE * f, "FFN up") &&
+        qwen35_graph_alloc(&g->ffn_mid, c * (uint64_t)DS4_N_FF_DENSE * f, "FFN mid") &&
+        qwen35_graph_alloc(&g->last_row, (uint64_t)DS4_N_EMBD * f, "final row") &&
         qwen35_graph_alloc(&g->logits, (uint64_t)DS4_N_VOCAB * f, "logits");
     if (!ok) {
         qwen35_graph_free(g);
@@ -65921,54 +65940,73 @@ static bool qwen35_mm(ds4_gpu_tensor *out,
                       const ds4_tensor *w,
                       const ds4_gpu_tensor *x,
                       uint64_t in_dim,
-                      uint64_t out_dim) {
+                      uint64_t out_dim,
+                      uint64_t n_tok) {
     if (!w) return false;
     return ds4_gpu_matmul_quant_tensor(out, model->map, model->size,
                                        w->abs_offset, w->type,
-                                       in_dim, out_dim, x, 1u) != 0;
+                                       in_dim, out_dim, x, n_tok) != 0;
 }
 
-static bool qwen35_graph_forward_token(
+/* Runs `n` tokens through the whole model in one pass, writing the logits of
+ * the LAST one.  Decode is n == 1 and takes the same path, so there is one
+ * forward pass and not two to keep in step.
+ *
+ * The activations are sized for a chunk of tokens rather than for one, which is
+ * where prefill gets its speed: the same weight rows are read once for the
+ * whole chunk instead of once per token.  The one thing not done per token is
+ * the output head: 248320 logits times a chunk would be hundreds of megabytes
+ * for rows nobody reads, so the last row is copied out and only that one goes
+ * through the vocabulary projection. */
+static bool qwen35_graph_forward_tokens(
         ds4_qwen35_graph  *g,
         const ds4_model   *model,
         const ds4_weights *weights,
-        int                token,
-        uint32_t           pos,
+        const int         *tokens,
+        uint32_t           n,
+        uint32_t           pos0,
         float             *logits_out) {
-    if (!g || !model || !weights || !logits_out || pos >= g->ctx_cap) {
+    if (!g || !model || !weights || !tokens || !logits_out ||
+        n == 0u || n > g->chunk_cap || pos0 > g->ctx_cap - n) {
         return false;
     }
-    if (token < 0 || (uint32_t)token >= (uint32_t)DS4_N_VOCAB) {
-        fprintf(stderr, "ds4: qwen35: token %d is outside the vocabulary\n", token);
+    for (uint32_t i = 0; i < n; i++) {
+        if (tokens[i] < 0 || (uint32_t)tokens[i] >= (uint32_t)DS4_N_VOCAB) {
+            fprintf(stderr, "ds4: qwen35: token %d is outside the vocabulary\n",
+                    tokens[i]);
+            return false;
+        }
+    }
+    if (!ds4_gpu_tensor_write(g->tokens, 0, tokens,
+                              (uint64_t)n * sizeof(int32_t))) {
         return false;
     }
-    const int32_t id = (int32_t)token;
-    if (!ds4_gpu_tensor_write(g->tokens, 0, &id, sizeof(id))) return false;
     if (!ds4_gpu_embed_tokens_quant_tensor(g->cur, g->tokens, model->map,
                                            model->size,
                                            weights->token_embd->abs_offset,
                                            weights->token_embd->type,
-                                           DS4_N_VOCAB, 1u, DS4_N_EMBD)) {
+                                           DS4_N_VOCAB, n, DS4_N_EMBD)) {
         return false;
     }
 
+    const uint64_t rows = (uint64_t)n * DS4_N_EMBD;
     for (uint32_t il = 0; il < g->n_exec; il++) {
         const ds4_layer_weights *l = &weights->layer[il];
         bool ok = ds4_gpu_rms_norm_weight_rows_tensor(
             g->norm, g->cur, model->map, model->size,
-            l->attn_norm->abs_offset, DS4_N_EMBD, 1u, DS4_RMS_EPS) != 0;
+            l->attn_norm->abs_offset, DS4_N_EMBD, n, DS4_RMS_EPS) != 0;
 
         if (ok && ds4_qwen35_layer_is_gdn(il)) {
             ok = qwen35_mm(g->qkv, model, l->qwen_ssm_qkv, g->norm,
-                           DS4_N_EMBD, g->qkv_dim) &&
+                           DS4_N_EMBD, g->qkv_dim, n) &&
                  qwen35_mm(g->z, model, l->qwen_ssm_gate, g->norm,
-                           DS4_N_EMBD, g->v_dim) &&
+                           DS4_N_EMBD, g->v_dim, n) &&
                  qwen35_mm(g->alpha, model, l->qwen_ssm_alpha, g->norm,
-                           DS4_N_EMBD, DS4_N_KDA_HEAD) &&
+                           DS4_N_EMBD, DS4_N_KDA_HEAD, n) &&
                  qwen35_mm(g->beta, model, l->kda_beta, g->norm,
-                           DS4_N_EMBD, DS4_N_KDA_HEAD);
+                           DS4_N_EMBD, DS4_N_KDA_HEAD, n);
             if (ok) {
-                ok = ds4_gpu_qwen35_gdn_decode(
+                ok = ds4_gpu_qwen35_gdn_prefill(
                     g->gdn_out, g->conv_state[il], g->recur_state[il],
                     g->qkv, g->alpha, g->beta, g->z,
                     model->map, model->size,
@@ -65978,81 +66016,90 @@ static bool qwen35_graph_forward_token(
                     l->kda_o_norm->abs_offset,
                     DS4_N_KDA_KV_HEAD, DS4_N_KDA_HEAD,
                     DS4_N_KDA_HEAD_DIM, DS4_N_KDA_CONV,
-                    1u, DS4_RMS_EPS) != 0;
+                    n, DS4_RMS_EPS) != 0;
             }
             if (ok) ok = qwen35_mm(g->tmp, model, l->kda_output, g->gdn_out,
-                                   g->v_dim, DS4_N_EMBD);
+                                   g->v_dim, DS4_N_EMBD, n);
         } else if (ok) {
             const float rope_base = layer_rope_freq_base(il);
             const float rope_scale = layer_rope_freq_scale(il);
             ok = qwen35_mm(g->qg, model, l->qwen_attn_q, g->norm,
-                           DS4_N_EMBD, (uint64_t)g->q_dim * 2u) &&
-                 ds4_gpu_qwen35_extract_q_tensor(g->q, g->qg, 1u,
+                           DS4_N_EMBD, (uint64_t)g->q_dim * 2u, n) &&
+                 ds4_gpu_qwen35_extract_q_tensor(g->q, g->qg, n,
                                                  DS4_N_HEAD, DS4_N_HEAD_DIM) != 0 &&
                  ds4_gpu_qwen35_head_rms_norm_tensor(
                      g->q, model->map, model->size,
                      l->qwen_attn_q_norm->abs_offset,
-                     1u, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0 &&
+                     n, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0 &&
                  qwen35_mm(g->k, model, l->qwen_attn_k, g->norm,
-                           DS4_N_EMBD, g->kv_dim) &&
+                           DS4_N_EMBD, g->kv_dim, n) &&
                  ds4_gpu_qwen35_head_rms_norm_tensor(
                      g->k, model->map, model->size,
                      l->qwen_attn_k_norm->abs_offset,
-                     1u, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0 &&
+                     n, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0 &&
                  qwen35_mm(g->v, model, l->qwen_attn_v, g->norm,
-                           DS4_N_EMBD, g->kv_dim);
+                           DS4_N_EMBD, g->kv_dim, n);
             /* Text-only input, so the multimodal rope sections all carry the
              * same position and this reduces to the ordinary rotation. */
             if (ok) ok = ds4_gpu_rope_tail_tensor(
-                g->q, 1u, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos,
+                g->q, n, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos0,
                 0, false, rope_base, rope_scale, 0.0f, 1.0f,
                 DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
             if (ok) ok = ds4_gpu_rope_tail_tensor(
-                g->k, 1u, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, pos,
+                g->k, n, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, pos0,
                 0, false, rope_base, rope_scale, 0.0f, 1.0f,
                 DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
             if (ok) ok = ds4_gpu_qwen35_store_kv_tensor(
                 g->k_cache[il], g->v_cache[il], g->k, g->v,
-                g->ctx_cap, pos, 1u, DS4_N_HEAD_KV, DS4_N_HEAD_DIM) != 0;
+                g->ctx_cap, pos0, n, DS4_N_HEAD_KV, DS4_N_HEAD_DIM) != 0;
             if (ok) ok = ds4_gpu_qwen35_attention_gqa_tensor(
                 g->heads, g->q, g->k_cache[il], g->v_cache[il],
-                pos, 1u, pos + 1u, g->ctx_cap,
+                pos0, n, pos0 + n, g->ctx_cap,
                 DS4_N_HEAD, DS4_N_HEAD_KV,
                 DS4_N_HEAD_DIM, DS4_N_HEAD_DIM, true) != 0;
             if (ok) ok = ds4_gpu_qwen35_attn_gate_tensor(
-                g->heads, g->qg, 1u, DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
+                g->heads, g->qg, n, DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
             if (ok) ok = qwen35_mm(g->tmp, model, l->attn_output, g->heads,
-                                   g->q_dim, DS4_N_EMBD);
+                                   g->q_dim, DS4_N_EMBD, n);
         }
-        if (ok) ok = ds4_gpu_add_tensor(g->cur, g->cur, g->tmp, DS4_N_EMBD) != 0;
+        if (ok) ok = ds4_gpu_add_tensor(g->cur, g->cur, g->tmp,
+                                        (uint32_t)rows) != 0;
 
         if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(
             g->norm, g->cur, model->map, model->size,
-            l->ffn_norm->abs_offset, DS4_N_EMBD, 1u, DS4_RMS_EPS) != 0;
+            l->ffn_norm->abs_offset, DS4_N_EMBD, n, DS4_RMS_EPS) != 0;
         if (ok) ok = qwen35_mm(g->ffn_gate, model, l->ffn_gate, g->norm,
-                               DS4_N_EMBD, DS4_N_FF_DENSE) &&
+                               DS4_N_EMBD, DS4_N_FF_DENSE, n) &&
                      qwen35_mm(g->ffn_up, model, l->ffn_up, g->norm,
-                               DS4_N_EMBD, DS4_N_FF_DENSE) &&
-                     ds4_gpu_qwen35_silu_mul_tensor(g->ffn_mid, g->ffn_gate,
-                                                    g->ffn_up,
-                                                    DS4_N_FF_DENSE) != 0 &&
+                               DS4_N_EMBD, DS4_N_FF_DENSE, n) &&
+                     ds4_gpu_qwen35_silu_mul_tensor(
+                         g->ffn_mid, g->ffn_gate, g->ffn_up,
+                         (uint64_t)n * DS4_N_FF_DENSE) != 0 &&
                      qwen35_mm(g->tmp, model, l->ffn_down, g->ffn_mid,
-                               DS4_N_FF_DENSE, DS4_N_EMBD);
-        if (ok) ok = ds4_gpu_add_tensor(g->cur, g->cur, g->tmp, DS4_N_EMBD) != 0;
+                               DS4_N_FF_DENSE, DS4_N_EMBD, n);
+        if (ok) ok = ds4_gpu_add_tensor(g->cur, g->cur, g->tmp,
+                                        (uint32_t)rows) != 0;
 
         if (!ok) {
-            fprintf(stderr, "ds4: qwen35: layer %u failed at position %u\n", il, pos);
+            fprintf(stderr, "ds4: qwen35: layer %u failed at position %u (%u tokens)\n",
+                    il, pos0, n);
             return false;
         }
     }
 
+    /* Only the last row reaches the vocabulary projection. */
+    const uint64_t row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    if (!ds4_gpu_tensor_copy(g->last_row, 0, g->cur,
+                             (uint64_t)(n - 1u) * row_bytes, row_bytes)) {
+        return false;
+    }
     if (!ds4_gpu_rms_norm_weight_rows_tensor(
-            g->norm, g->cur, model->map, model->size,
+            g->norm, g->last_row, model->map, model->size,
             weights->output_norm->abs_offset, DS4_N_EMBD, 1u, DS4_RMS_EPS)) {
         return false;
     }
     if (!qwen35_mm(g->logits, model, weights->output, g->norm,
-                   DS4_N_EMBD, DS4_N_VOCAB)) {
+                   DS4_N_EMBD, DS4_N_VOCAB, 1u)) {
         return false;
     }
     if (!ds4_gpu_tensor_read(g->logits, 0, logits_out,
@@ -66071,10 +66118,22 @@ static bool qwen35_graph_forward_token(
             else if (logits_out[i] > top) { top = logits_out[i]; best = (int)i; }
         }
         fprintf(stderr,
-                "ds4: qwen35: pos %u in %d -> token %d (logit %.4f), %u NaN of %u\n",
-                pos, token, best, (double)top, nans, (uint32_t)DS4_N_VOCAB);
+                "ds4: qwen35: pos %u+%u in %d -> token %d (logit %.4f), %u NaN of %u\n",
+                pos0, n, tokens[n - 1u], best, (double)top, nans,
+                (uint32_t)DS4_N_VOCAB);
     }
     return true;
+}
+
+static bool qwen35_graph_forward_token(
+        ds4_qwen35_graph  *g,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        int                token,
+        uint32_t           pos,
+        float             *logits_out) {
+    return qwen35_graph_forward_tokens(g, model, weights, &token, 1u, pos,
+                                       logits_out);
 }
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
@@ -67840,10 +67899,18 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             return 1;
         }
         s->checkpoint.len = 0;
-        for (int i = 0; i < prompt->len; i++) {
-            if (!qwen35_graph_forward_token(&s->qwen35_graph, &s->engine->model,
-                                           &s->engine->weights, prompt->v[i],
-                                           (uint32_t)i, s->logits)) {
+        /* In chunks, not one token at a time: the weights are then read once
+         * per chunk instead of once per token, which is the whole cost of
+         * prefill on a model this size.  Only the last chunk's last row is
+         * used, but every chunk still has to run: each one advances the
+         * recurrent state and fills the attention cache. */
+        const uint32_t chunk = s->qwen35_graph.chunk_cap;
+        for (int i = 0; i < prompt->len; i += (int)chunk) {
+            const uint32_t n = (uint32_t)((prompt->len - i) < (int)chunk
+                                          ? (prompt->len - i) : (int)chunk);
+            if (!qwen35_graph_forward_tokens(&s->qwen35_graph, &s->engine->model,
+                                            &s->engine->weights, prompt->v + i, n,
+                                            (uint32_t)i, s->logits)) {
                 snprintf(err, errlen, "qwen35: prefill failed at token %d of %d",
                          i, prompt->len);
                 return 1;
