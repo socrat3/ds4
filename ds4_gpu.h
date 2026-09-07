@@ -3254,6 +3254,51 @@ int ds4_gpu_glm53_kda_prefill(
         float                 gate_lower_bound,
         float                 norm_eps);
 
+/* Qwen3.5 Gated DeltaNet. Same delta rule and head width as the KDA above,
+ * but the decay is one scalar per value head instead of one per channel, the
+ * value heads share query and key heads interleaved (head h reads
+ * h % n_k_heads), and q|k|v arrive concatenated in one projection with a
+ * single convolution weight. Recurrent and convolution state stay FP32.
+ * Decode is the n_tokens == 1 case of prefill and runs the same code. */
+int ds4_gpu_qwen35_gdn_decode(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        const ds4_gpu_tensor *qkv,
+        const ds4_gpu_tensor *raw_alpha,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *output_gate,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              conv_offset,
+        uint64_t              ssm_a_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              output_norm_offset,
+        uint32_t              n_k_heads,
+        uint32_t              n_v_heads,
+        uint32_t              n_rows,
+        float                 norm_eps);
+
+int ds4_gpu_qwen35_gdn_prefill(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        const ds4_gpu_tensor *qkv,
+        const ds4_gpu_tensor *raw_alpha,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *output_gate,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              conv_offset,
+        uint64_t              ssm_a_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              output_norm_offset,
+        uint32_t              n_k_heads,
+        uint32_t              n_v_heads,
+        uint32_t              n_tokens,
+        float                 norm_eps);
+
+
 /* Decode-island CUDA graph capture (CUDA backend; Metal/ROCm/CPU stub it
  * out and stay eager).  Design ported from the Entrpi/ds4 batched-serving
  * fork's per-layer decode graph capture.  The key identifies a captured
