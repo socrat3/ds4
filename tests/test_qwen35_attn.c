@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "ds4.h"
 #include "ds4_gpu.h"
@@ -54,8 +55,10 @@ enum {
     GROUP = N_HEAD / N_HEAD_KV,
     QK_DIM = 256,
     VALUE_DIM = 256,
-    MAX_TOKENS = 8,
-    CACHE_CAP = 160,      /* holds the longest case with room to spare */
+    /* Il prefill piastrella otto query per blocco: per provare piu' di una
+     * piastrella, e una piastrella incompleta, servono decine di token. */
+    MAX_TOKENS = 40,
+    CACHE_CAP = 256,      /* holds the longest case with room to spare */
 };
 
 /* Half precision, written out rather than pulled from a CUDA header so the
@@ -212,7 +215,82 @@ static void caso(uint32_t pos0, uint32_t tokens, const char *nome) {
  *
  * Il valore si passa dall'ambiente perche' il kernel lo legge per lancio: il
  * guardiano esegue il binario una volta per ogni valore. */
+/* Riempie un tensore con un valore costante, a pezzi, senza allocare sull'host
+ * quanto il tensore intero. */
+static void riempi(ds4_gpu_tensor *t, uint64_t byte, uint32_t motivo) {
+    enum { PEZZO = 1u << 20 };
+    uint32_t *host = (uint32_t *)malloc(PEZZO);
+    if (!host) { fprintf(stderr, "FAIL: memoria host\n"); exit(1); }
+    for (size_t i = 0; i < PEZZO / sizeof(uint32_t); i++) host[i] = motivo;
+    for (uint64_t off = 0; off < byte; off += PEZZO) {
+        const uint64_t n = (byte - off) < PEZZO ? (byte - off) : PEZZO;
+        require_ok(ds4_gpu_tensor_write(t, off, host, n), "riempimento");
+    }
+    free(host);
+}
+
+/* Il kernel da solo, sulla forma del prefill.  Restituisce i millisecondi per
+ * lancio. */
+static double cronometra(uint32_t n_tokens, int giri) {
+    const uint64_t q_byte  = (uint64_t)n_tokens * N_HEAD * QK_DIM * sizeof(float);
+    const uint64_t o_byte  = (uint64_t)n_tokens * N_HEAD * VALUE_DIM * sizeof(float);
+    const uint64_t k_byte  = (uint64_t)n_tokens * N_HEAD_KV * QK_DIM * sizeof(uint16_t);
+    const uint64_t v_byte  = (uint64_t)n_tokens * N_HEAD_KV * VALUE_DIM * sizeof(uint16_t);
+
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(q_byte);
+    ds4_gpu_tensor *o = ds4_gpu_tensor_alloc(o_byte);
+    ds4_gpu_tensor *k = ds4_gpu_tensor_alloc(k_byte);
+    ds4_gpu_tensor *v = ds4_gpu_tensor_alloc(v_byte);
+    require_ok(q && o && k && v, "allocazione per il cronometro");
+
+    /* 0.25f in fp32 e 0.25 in fp16 (0x3400), duplicato nella parola. */
+    riempi(q, q_byte, 0x3e800000u);
+    riempi(k, k_byte, 0x34003400u);
+    riempi(v, v_byte, 0x34003400u);
+    require_ok(ds4_gpu_synchronize(), "sync prima del cronometro");
+
+    require_ok(ds4_gpu_qwen35_attention_gqa_tensor(
+        o, q, k, v, 0, n_tokens, n_tokens, n_tokens,
+        N_HEAD, N_HEAD_KV, QK_DIM, VALUE_DIM, true), "scaldata");
+    require_ok(ds4_gpu_synchronize(), "sync dopo la scaldata");
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int i = 0; i < giri; i++) {
+        require_ok(ds4_gpu_qwen35_attention_gqa_tensor(
+            o, q, k, v, 0, n_tokens, n_tokens, n_tokens,
+            N_HEAD, N_HEAD_KV, QK_DIM, VALUE_DIM, true), "lancio");
+    }
+    require_ok(ds4_gpu_synchronize(), "sync finale");
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    ds4_gpu_tensor_free(v);
+    ds4_gpu_tensor_free(k);
+    ds4_gpu_tensor_free(o);
+    ds4_gpu_tensor_free(q);
+
+    const double sec = (double)(t1.tv_sec - t0.tv_sec) +
+                       1e-9 * (double)(t1.tv_nsec - t0.tv_nsec);
+    return 1000.0 * sec / (double)giri;
+}
+
+static int modo_cronometro(void) {
+    require_ok(ds4_gpu_init(), "GPU init");
+    puts("kernel di attenzione da solo, forma del prefill (24 teste, 4 KV, 256):");
+    puts("  token   ms/lancio   x16 layer");
+    const uint32_t lunghezze[] = {512u, 1202u, 2342u, 4052u};
+    for (size_t i = 0; i < sizeof(lunghezze) / sizeof(lunghezze[0]); i++) {
+        const uint32_t n = lunghezze[i];
+        const double ms = cronometra(n, n > 2000u ? 3 : 8);
+        printf("  %5u   %9.2f   %8.3f s\n", n, ms, 16.0 * ms / 1000.0);
+        fflush(stdout);
+    }
+    ds4_gpu_cleanup();
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "--tempo")) return modo_cronometro();
     if (argc > 1) {
         setenv("DS4_CUDA_ATTN_SPLIT_N", argv[1], 1);
         printf("split-K forzato a %s partizioni\n", argv[1]);
@@ -280,6 +358,14 @@ int main(int argc, char **argv) {
     caso(0, 5, "prefill dal principio");
     caso(11, 5, "prefill con prefisso");
     caso(95, 8, "prefill lungo");
+    /* Da qui in poi si entra nel kernel piastrellato (otto query per blocco).
+     * Le tre forme coprono: piastrelle piene, ultima piastrella INCOMPLETA (37 =
+     * 4x8+5, dove tre warp non hanno query e devono comunque caricare la fetta
+     * comune senza scrivere nulla), e un prefisso lungo che fa girare piu' volte
+     * il ciclo sulle fette di K/V. */
+    caso(0, 32, "piastrelle piene dal principio");
+    caso(7, 37, "piastrelle con coda incompleta");
+    caso(120, 40, "piastrelle con prefisso lungo");
 
     if (failures) {
         fprintf(stderr, "%d confronto/i falliti\n", failures);

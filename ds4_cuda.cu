@@ -30560,7 +30560,10 @@ __global__ static void qwen35_attention_gqa_kernel(
  * -- e ciascuno tiene la propria softmax scorrevole nei registri.  Il prodotto
  * scalare si riduce con `__shfl_down_sync` dentro il warp, quindi nel ciclo non
  * c'e' piu' nessuna barriera: mentre un warp aspetta la memoria, gli altri
- * sette calcolano.  Le letture sono a 16 byte per thread invece di 2, e il
+ * sette calcolano.  Le letture sono a 16 byte per thread invece di 2 -- ma solo
+ * da quando lo sono DAVVERO: scritta insieme al kernel, questa frase era falsa,
+ * il SASS mostrava otto `LDG.E.U16` in fila per riga, ed e' stata resa vera
+ * dalla `uint4` di `qwen35_carica8`.  Il
  * layout della cache non cambia: `[riga][kv_head][dim]` ha gia' `dim`
  * contiguo, quindi 256 half sono 512 byte allineati e la `float4` e' legale
  * cosi' com'e'.  `qwen35_store_kv_kernel` non si tocca.
@@ -30586,8 +30589,34 @@ __global__ static void qwen35_attention_gqa_kernel(
 /* Il tetto sul numero di fette: misurato, non scelto.  A 4065 token 12 e' il
  * massimo della curva e 16 e' gia' in discesa (30,8 contro 29,6 t/s). */
 #define QWEN35_ATTN_SPLIT_MAX 12u
-
+/* Otto valori contigui in una lettura sola.  Per la cache in fp16 sono 16 byte
+ * esatti (`uint4`); per quella in fp32 sono due letture da 16.  E' la stessa
+ * quantita' di dati di prima -- cambia che arrivano in una istruzione invece
+ * che in otto messe in fila dal compilatore. */
 template <typename CT>
+__device__ __forceinline__ void qwen35_carica8(const CT *p, float *v);
+
+template <>
+__device__ __forceinline__ void qwen35_carica8<__half>(const __half *p, float *v) {
+    const uint4 grezzo = *(const uint4 *)p;
+    const __half2 *h = (const __half2 *)&grezzo;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const float2 f = __half22float2(h[i]);
+        v[2 * i] = f.x;
+        v[2 * i + 1] = f.y;
+    }
+}
+
+template <>
+__device__ __forceinline__ void qwen35_carica8<float>(const float *p, float *v) {
+    const float4 a = *(const float4 *)p;
+    const float4 b = *(const float4 *)(p + 4);
+    v[0] = a.x; v[1] = a.y; v[2] = a.z; v[3] = a.w;
+    v[4] = b.x; v[5] = b.y; v[6] = b.z; v[7] = b.w;
+}
+
+template <typename CT, bool VETT>
 __global__ static void qwen35_attention_gqa_warp_kernel(
         float       *heads,
         const float *q,
@@ -30622,6 +30651,29 @@ __global__ static void qwen35_attention_gqa_warp_kernel(
      * non e' gratis: lo diventa solo grazie ai cicli a estremo fisso qui sotto.
      * Scritto senza, il commento era falso e l'array stava in local memory. */
     const uint32_t per_lane = value_dim >> 5u;
+    /* Con le letture vettoriali la corsia possiede otto valori CONTIGUI a
+     * partire da `lane * 8`; senza, otto valori a passo 32.  L'indice del
+     * primo e il passo bastano a tenere una sola scrittura finale. */
+    const uint32_t primo = VETT ? lane * 8u : lane;
+    const uint32_t passo = VETT ? 1u : 32u;
+    /* Gli elementi per corsia della query li conta `qk_dim`, non `value_dim`:
+     * sono uguali in questo modello (256 e 256) e un nome solo avrebbe
+     * funzionato per caso. */
+    const uint32_t per_lane_q = qk_dim >> 5u;
+
+    /* La query non cambia da una riga all'altra: veniva riletta a ogni riga
+     * (otto `LDG.E` per riga nel SASS), qui si carica una volta sola. */
+    float qreg[QWEN35_ATTN_MAX_VD / 32u];
+    if (VETT) {
+        qwen35_carica8<float>(qh + primo, qreg);
+    } else {
+#pragma unroll
+        for (uint32_t i = 0; i < QWEN35_ATTN_MAX_VD / 32u; i++) {
+            if (i >= per_lane_q) break;
+            qreg[i] = qh[primo + i * passo];
+        }
+    }
+
     float acc[QWEN35_ATTN_MAX_VD / 32u];
     /* Tutti e tre i cicli su `acc` girano fino al massimo DICHIARATO e escono
      * su `per_lane`, invece di girare fino a `per_lane` e basta.  Non e' una
@@ -30656,14 +30708,19 @@ __global__ static void qwen35_attention_gqa_warp_kernel(
     for (uint32_t row = inizio + warp; row < fine; row += n_warp) {
         const CT *krow = key_cache + ((uint64_t)row * n_head_kv + kv_head) * qk_dim;
         float dot = 0.0f;
-        /* Srotolamento parziale: `qk_dim` non ha un massimo dichiarato (la
-         * dispatch chiede solo che sia multiplo di 32), quindi non si puo'
-         * fissare l'estremo.  Otto letture indipendenti in volo invece di una
-         * alla volta bastano pero' a rompere la catena di viaggi in DRAM in
-         * fila, che era il costo dominante per riga. */
-#pragma unroll 8
-        for (uint32_t d = lane; d < qk_dim; d += 32u) {
-            dot = fmaf(qh[d], (float)krow[d], dot);
+        if (VETT) {
+            float kk[QWEN35_ATTN_MAX_VD / 32u];
+            qwen35_carica8<CT>(krow + primo, kk);
+#pragma unroll
+            for (uint32_t i = 0; i < QWEN35_ATTN_MAX_VD / 32u; i++) {
+                dot = fmaf(qreg[i], kk[i], dot);
+            }
+        } else {
+#pragma unroll
+            for (uint32_t i = 0; i < QWEN35_ATTN_MAX_VD / 32u; i++) {
+                if (i >= per_lane_q) break;
+                dot = fmaf(qreg[i], (float)krow[primo + i * passo], dot);
+            }
         }
         for (uint32_t s = 16u; s > 0u; s >>= 1u) {
             dot += __shfl_down_sync(0xffffffffu, dot, s);
@@ -30675,10 +30732,19 @@ __global__ static void qwen35_attention_gqa_warp_kernel(
         const float peso = __expf(score - next_m);
 
         const CT *vrow = value_cache + ((uint64_t)row * n_head_kv + kv_head) * value_dim;
+        if (VETT) {
+            float vv[QWEN35_ATTN_MAX_VD / 32u];
+            qwen35_carica8<CT>(vrow + primo, vv);
 #pragma unroll
-        for (uint32_t i = 0; i < QWEN35_ATTN_MAX_VD / 32u; i++) {
-            if (i >= per_lane) break;
-            acc[i] = acc[i] * vecchio + peso * (float)vrow[lane + i * 32u];
+            for (uint32_t i = 0; i < QWEN35_ATTN_MAX_VD / 32u; i++) {
+                acc[i] = fmaf(peso, vv[i], acc[i] * vecchio);
+            }
+        } else {
+#pragma unroll
+            for (uint32_t i = 0; i < QWEN35_ATTN_MAX_VD / 32u; i++) {
+                if (i >= per_lane) break;
+                acc[i] = fmaf(peso, (float)vrow[primo + i * passo], acc[i] * vecchio);
+            }
         }
         l = l * vecchio + peso;
         m = next_m;
@@ -30692,7 +30758,7 @@ __global__ static void qwen35_attention_gqa_warp_kernel(
 #pragma unroll
     for (uint32_t i = 0; i < QWEN35_ATTN_MAX_VD / 32u; i++) {
         if (i >= per_lane) break;
-        o_sh[(size_t)warp * value_dim + lane + i * 32u] = acc[i];
+        o_sh[(size_t)warp * value_dim + primo + i * passo] = acc[i];
     }
     if (lane == 0u) {
         m_sh[warp] = m;
@@ -30991,7 +31057,12 @@ extern "C" int ds4_gpu_qwen35_attention_gqa_tensor(
     }
     const bool per_warp = !solo_riferimento &&
         (qk_dim % 32u) == 0u && (value_dim % 32u) == 0u &&
-        value_dim <= QWEN35_ATTN_MAX_VD;
+        value_dim <= QWEN35_ATTN_MAX_VD && qk_dim <= QWEN35_ATTN_MAX_VD;
+    /* La lettura vettoriale prende otto valori CONTIGUI per corsia, quindi
+     * chiede esattamente otto elementi per corsia: `dim == 32 * 8`.  Le altre
+     * forme restano sul percorso a passo 32, che e' lo stesso kernel con un
+     * parametro di template diverso -- nessuna scelta a runtime nel ciclo. */
+    const bool vett = (qk_dim == 256u) && (value_dim == 256u);
     if (per_warp) {
         const uint32_t th = 32u * QWEN35_ATTN_WARPS;
         const size_t sh = ((size_t)QWEN35_ATTN_WARPS * value_dim +
@@ -31001,19 +31072,20 @@ extern "C" int ds4_gpu_qwen35_attention_gqa_tensor(
                                                   cache_len, value_dim, &partials);
         dim3 g = grid;
         if (n_part > 1u) g.z = n_part;
+#define QWEN35_LANCIA_WARP(TIPO, V)                                           \
+        qwen35_attention_gqa_warp_kernel<TIPO, V><<<g, th, sh, stream>>>(      \
+            (float *)heads->ptr, (const float *)q->ptr,                       \
+            (const TIPO *)key_cache->ptr, (const TIPO *)value_cache->ptr,     \
+            pos0, n_tokens, cache_len, n_head, n_head_kv, qk_dim, value_dim,  \
+            n_part, partials)
         if (cache_f16) {
-            qwen35_attention_gqa_warp_kernel<__half><<<g, th, sh, stream>>>(
-                (float *)heads->ptr, (const float *)q->ptr,
-                (const __half *)key_cache->ptr, (const __half *)value_cache->ptr,
-                pos0, n_tokens, cache_len, n_head, n_head_kv, qk_dim, value_dim,
-                n_part, partials);
+            if (vett) QWEN35_LANCIA_WARP(__half, true);
+            else      QWEN35_LANCIA_WARP(__half, false);
         } else {
-            qwen35_attention_gqa_warp_kernel<float><<<g, th, sh, stream>>>(
-                (float *)heads->ptr, (const float *)q->ptr,
-                (const float *)key_cache->ptr, (const float *)value_cache->ptr,
-                pos0, n_tokens, cache_len, n_head, n_head_kv, qk_dim, value_dim,
-                n_part, partials);
+            if (vett) QWEN35_LANCIA_WARP(float, true);
+            else      QWEN35_LANCIA_WARP(float, false);
         }
+#undef QWEN35_LANCIA_WARP
         if (n_part > 1u) {
             if (!cuda_ok(cudaGetLastError(), "qwen35 GQA attention (warp) launch"))
                 return 0;
