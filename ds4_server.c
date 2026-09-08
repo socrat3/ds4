@@ -3023,14 +3023,30 @@ static void append_trimmed_text(buf *out, const char *text) {
     buf_append(out, (const char *)start, (size_t)(end - start));
 }
 
-static void append_glm_assistant_message_prefix(buf *out,
-                                                const chat_msg *m,
-                                                bool preserve_reasoning) {
+/* Il blocco di pensiero che precede il contenuto di un turno assistant PASSATO.
+ *
+ * I due modelli lo vogliono diverso, e la differenza e' nei loro template:
+ *  - GLM scrive `<think>...</think>` attaccato, e per i turni prima dell'ultima
+ *    domanda butta il pensiero lasciando il blocco vuoto;
+ *  - Qwen3.8 scrive `<think>\n...\n</think>\n\n` e per default lo CONSERVA
+ *    (`preserve_thinking is undefined or ... is true` nel suo chat_template).
+ * Una funzione sola con la sintassi come parametro, non due: e' come questo file
+ * tratta gia' gli altri casi «stesso lavoro, template diverso». */
+static void append_assistant_message_prefix_for_syntax(
+        buf *out, server_model_syntax syntax,
+        const chat_msg *m, bool preserve_reasoning) {
     const char *content = m && m->content ? m->content : "";
     if (text_starts_with_think_tag(content)) return;
+    const char *reasoning = m && m->reasoning ? m->reasoning : "";
+    if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
+        buf_puts(out, "<think>\n");
+        if (preserve_reasoning) append_trimmed_text(out, reasoning);
+        buf_puts(out, "\n</think>\n\n");
+        return;
+    }
     if (preserve_reasoning) {
         buf_puts(out, "<think>");
-        buf_puts(out, m && m->reasoning ? m->reasoning : "");
+        buf_puts(out, reasoning);
         buf_puts(out, "</think>");
     } else {
         buf_puts(out, "<think></think>");
@@ -3093,8 +3109,9 @@ static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
             observation_open = false;
             (void)pending_assistant;
             buf_puts(&out, "<|assistant|>");
-            append_glm_assistant_message_prefix(
-                &out, m, think && (tool_context || i > last_user_idx));
+            append_assistant_message_prefix_for_syntax(
+                &out, SERVER_MODEL_SYNTAX_GLM, m,
+                think && (tool_context || i > last_user_idx));
             append_trimmed_text(&out, m->content);
             append_tool_calls_text_for_syntax(&out, SERVER_MODEL_SYNTAX_GLM,
                                               &m->calls, tool_orders);
@@ -3161,9 +3178,16 @@ static char *render_qwen35_chat_prompt_text(const chat_msgs *msgs,
         buf_puts(&out, "<|im_start|>");
         /* Same test the other renderers in this file use: the role is a plain
          * string and only "assistant" is treated as one. */
-        buf_puts(&out, (m->role && !strcmp(m->role, "assistant"))
-                           ? "assistant" : "user");
+        const bool e_assistente = m->role && !strcmp(m->role, "assistant");
+        buf_puts(&out, e_assistente ? "assistant" : "user");
         buf_puts(&out, "\n");
+        /* Il turno assistant passato porta il suo blocco di pensiero: e' cio'
+         * che il chat_template del modello fa per default, e ometterlo mandava
+         * fuori distribuzione ogni conversazione a piu' di un turno. */
+        if (e_assistente) {
+            append_assistant_message_prefix_for_syntax(
+                &out, SERVER_MODEL_SYNTAX_QWEN, m, true);
+        }
         buf_puts(&out, m->content ? m->content : "");
         buf_puts(&out, "<|im_end|>\n");
     }
@@ -3371,7 +3395,8 @@ static char *render_glm_live_tool_tail(const chat_msgs *msgs, int start,
         } else if (!strcmp(m->role, "assistant")) {
             observation_open = false;
             buf_puts(&out, "<|assistant|>");
-            append_glm_assistant_message_prefix(&out, m, think);
+            append_assistant_message_prefix_for_syntax(
+                &out, SERVER_MODEL_SYNTAX_GLM, m, think);
             append_trimmed_text(&out, m->content);
             append_tool_calls_text_for_syntax(&out, SERVER_MODEL_SYNTAX_GLM,
                                               &m->calls, tool_orders);
@@ -5237,20 +5262,20 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
-    chat_msgs msgs = {0};
-    chat_msg sys = {0};
-    sys.role = xstrdup("system");
-    sys.content = xstrdup("You are a helpful assistant");
-    chat_msgs_push(&msgs, sys);
-    chat_msg user_msg = {0};
-    user_msg.role = xstrdup("user");
-    user_msg.content = prompt;
+    /* Il prompt si tokenizza COSI' COM'E'.  Prima veniva avvolto in una
+     * conversazione -- messaggio di sistema «You are a helpful assistant» piu'
+     * turno utente -- e passato per il template del modello: chi chiedeva il
+     * completamento di un testo riceveva la risposta di un assistente, e pagava
+     * i token dell'impalcatura che non aveva chiesto.  `docs/SERVER.md` elenca
+     * questo endpoint come «Text completions», quindi era l'implementazione a
+     * contraddire il proprio contratto, non il contratto a essere ambiguo.
+     *
+     * `ds4_tokenize_text` e' la funzione che il motore ha gia' per questo
+     * (`ds4.h`); `ds4_tokenize_rendered_chat` resta nelle due strade di chat,
+     * dove un template c'e' davvero. */
+    r->prompt_text = prompt;
     prompt = NULL;
-    chat_msgs_push(&msgs, user_msg);
-    r->prompt_text = render_chat_prompt_text_for_syntax(
-        r->model_syntax, &msgs, NULL, NULL, r->think_mode);
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
-    chat_msgs_free(&msgs);
+    ds4_tokenize_text(e, r->prompt_text, &r->prompt);
     free(prompt);
     return true;
 bad:
@@ -5293,25 +5318,91 @@ static bool send_all(int fd, const void *p, size_t n) {
     return true;
 }
 
-static void json_escape(buf *b, const char *s) {
-    buf_putc(b, '"');
-    for (; *s; s++) {
-        unsigned char c = (unsigned char)*s;
+/* L'escape, e la convalida della sequenza UTF-8.
+ *
+ * Prima ogni byte >= 0x20 veniva copiato verbatim.  Un tokenizzatore byte-level
+ * puo' pero' produrre MEZZA sequenza -- una generazione troncata da `max_tokens`
+ * a meta' carattere, o un token che da solo non e' un carattere -- e quella
+ * meta' finiva dentro la stringa JSON.  RFC 8259 vuole UTF-8: il corpo diventava
+ * non decodificabile, e il guasto si vedeva solo a valle, nel client, come byte
+ * sostituiti.  Qui la sequenza rotta diventa U+FFFD, che e' esattamente cio' che
+ * il client avrebbe messo -- ma prodotto da chi sa dove finisce il carattere.
+ *
+ * `utf8_stream_safe_len` piu' sopra tiene indietro la CODA incompleta di un
+ * pezzo di streaming, in attesa del token che la completa; non copre il caso in
+ * cui il completamento non arriva mai, che e' questo.  Le due cose sono
+ * complementari.
+ *
+ * La logica stava scritta due volte, identica, in `json_escape` e in
+ * `json_escape_fragment_n`: ora sta qui e basta. */
+static void json_escape_bytes(buf *b, const char *s, size_t n) {
+    for (size_t i = 0; i < n; ) {
+        unsigned char c = (unsigned char)s[i];
         if (c == '"' || c == '\\') {
             buf_putc(b, '\\');
             buf_putc(b, (char)c);
+            i++;
         } else if (c == '\n') {
             buf_puts(b, "\\n");
+            i++;
         } else if (c == '\r') {
             buf_puts(b, "\\r");
+            i++;
         } else if (c == '\t') {
             buf_puts(b, "\\t");
+            i++;
         } else if (c < 0x20) {
             buf_printf(b, "\\u%04x", (unsigned)c);
-        } else {
+            i++;
+        } else if (c < 0x80) {
             buf_putc(b, (char)c);
+            i++;
+        } else {
+            /* `utf8_expected_len` torna 1 per ogni byte guida non valido
+             * (0x80-0xC1, 0xF5-0xFF), quindi `need > 1` li scarta gia'. */
+            const int need = utf8_expected_len(c);
+            size_t avanza = 1;                     /* byte consumati dal guasto */
+            bool ok = false;
+            if (need > 1) {
+                /* Il secondo byte decide anche le codifiche troppo lunghe e i
+                 * surrogati: sequenze dall'aria sana ma illecite.  Se sbaglia,
+                 * la sottoparte massima e' il solo byte guida e il seguente va
+                 * riesaminato da capo -- percio' `avanza` resta 1. */
+                bool secondo_ok = i + 1 < n &&
+                                  (((unsigned char)s[i + 1] & 0xc0) == 0x80);
+                if (secondo_ok) {
+                    const unsigned char d = (unsigned char)s[i + 1];
+                    if (need == 3 && ((c == 0xe0 && d < 0xa0) ||
+                                      (c == 0xed && d > 0x9f))) secondo_ok = false;
+                    if (need == 4 && ((c == 0xf0 && d < 0x90) ||
+                                      (c == 0xf4 && d > 0x8f))) secondo_ok = false;
+                }
+                if (secondo_ok) {
+                    /* Quanti byte di continuazione ci sono davvero.  Se non
+                     * bastano, il carattere e' TRONCATO: un solo sostituto per
+                     * tutta la sottoparte, perche' il carattere perso e' uno --
+                     * uno per byte farebbe credere che fossero due o tre. */
+                    int k = 1;
+                    while (k < need && i + (size_t)k < n &&
+                           (((unsigned char)s[i + k] & 0xc0) == 0x80)) k++;
+                    ok = (k == need);
+                    avanza = (size_t)k;
+                }
+            }
+            if (!ok) {
+                buf_puts(b, "\xef\xbf\xbd");        /* U+FFFD */
+                i += avanza;
+            } else {
+                for (int k = 0; k < need; k++) buf_putc(b, s[i + k]);
+                i += (size_t)need;
+            }
         }
     }
+}
+
+static void json_escape(buf *b, const char *s) {
+    buf_putc(b, '"');
+    json_escape_bytes(b, s ? s : "", s ? strlen(s) : 0);
     buf_putc(b, '"');
 }
 
@@ -5322,23 +5413,7 @@ static void json_escape_n(buf *b, const char *s, size_t n) {
 }
 
 static void json_escape_fragment_n(buf *b, const char *s, size_t n) {
-    for (size_t i = 0; i < n; i++) {
-        unsigned char c = (unsigned char)s[i];
-        if (c == '"' || c == '\\') {
-            buf_putc(b, '\\');
-            buf_putc(b, (char)c);
-        } else if (c == '\n') {
-            buf_puts(b, "\\n");
-        } else if (c == '\r') {
-            buf_puts(b, "\\r");
-        } else if (c == '\t') {
-            buf_puts(b, "\\t");
-        } else if (c < 0x20) {
-            buf_printf(b, "\\u%04x", (unsigned)c);
-        } else {
-            buf_putc(b, (char)c);
-        }
-    }
+    json_escape_bytes(b, s ? s : "", s ? n : 0);
 }
 
 #define DS4_DSML "｜DSML｜"
@@ -16138,6 +16213,38 @@ static void test_streaming_holds_partial_utf8(void) {
     TEST_ASSERT(utf8_stream_safe_len(partial, 0, strlen(partial), false) == 2);
     TEST_ASSERT(utf8_stream_safe_len(complete, 0, strlen(complete), false) == strlen(complete));
 
+    /* Cio' che `utf8_stream_safe_len` tiene indietro puo' non arrivare mai: una
+     * generazione troncata a meta' carattere finisce comunque in una risposta.
+     * Da li' in poi tocca all'escape non mettere byte illeciti nel JSON. */
+    {
+        buf jb = {0};
+        json_escape(&jb, partial);                 /* "A " + mezza sequenza */
+        TEST_ASSERT(jb.ptr != NULL);
+        TEST_ASSERT(!strcmp(jb.ptr, "\"A \xef\xbf\xbd\""));
+        buf_free(&jb);
+
+        buf jc = {0};
+        json_escape(&jc, complete);                /* intatto, non si tocca */
+        TEST_ASSERT(jc.ptr != NULL && strstr(jc.ptr, flag_done) != NULL);
+        buf_free(&jc);
+
+        /* Un byte di continuazione senza guida, e una guida senza seguito. */
+        const char orfano[] = {'x', (char)0x9a, 'y', 0};
+        buf jo = {0};
+        json_escape(&jo, orfano);
+        TEST_ASSERT(jo.ptr != NULL);
+        TEST_ASSERT(!strcmp(jo.ptr, "\"x\xef\xbf\xbdy\""));
+        buf_free(&jo);
+
+        /* Un surrogato codificato in UTF-8: sequenza dall'aria sana, illecita. */
+        const char surrogato[] = {(char)0xed, (char)0xa0, (char)0x80, 0};
+        buf js = {0};
+        json_escape(&js, surrogato);
+        TEST_ASSERT(js.ptr != NULL);
+        TEST_ASSERT(!strcmp(js.ptr, "\"\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd\""));
+        buf_free(&js);
+    }
+
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     if (sv[0] < 0 || sv[1] < 0) return;
@@ -16693,6 +16800,55 @@ static void test_parse_short_dsml_and_canonical_suffix(void) {
     free(reasoning);
     tool_calls_free(&calls);
     request_free(&r);
+}
+
+/* Il turno assistant PASSATO porta il suo blocco di pensiero.
+ *
+ * Non e' una preferenza: `tokenizer.chat_template` dentro il GGUF di Qwen3.8
+ * rende quel turno come `<|im_start|>assistant\n<think>\n` + reasoning|trim +
+ * `\n</think>\n\n` + contenuto, e ci arriva per il ramo di DEFAULT
+ * (`preserve_thinking is undefined or ... is true`).  Prima ds4 rendeva l'altro
+ * ramo, quello che il template prende solo su richiesta esplicita, e ogni
+ * conversazione oltre il primo turno finiva fuori distribuzione.
+ *
+ * Il test guarda anche il trim del pensiero, che il template fa con `|trim`. */
+static void test_qwen35_history_keeps_think_block(void) {
+    chat_msgs msgs = {0};
+    chat_msg u1 = {0};
+    u1.role = xstrdup("user");
+    u1.content = xstrdup("prima domanda");
+    chat_msgs_push(&msgs, u1);
+    chat_msg a1 = {0};
+    a1.role = xstrdup("assistant");
+    a1.content = xstrdup("prima risposta");
+    a1.reasoning = xstrdup("  ci penso  ");
+    chat_msgs_push(&msgs, a1);
+    chat_msg u2 = {0};
+    u2.role = xstrdup("user");
+    u2.content = xstrdup("seconda domanda");
+    chat_msgs_push(&msgs, u2);
+
+    char *reso = render_qwen35_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(reso != NULL);
+    TEST_ASSERT(strstr(reso,
+        "<|im_start|>assistant\n<think>\nci penso\n</think>\n\nprima risposta<|im_end|>") != NULL);
+    /* Il turno dell'utente non prende nessun blocco. */
+    TEST_ASSERT(strstr(reso, "<|im_start|>user\nseconda domanda<|im_end|>") != NULL);
+    /* E la risposta da generare apre il pensiero, senza chiuderlo. */
+    TEST_ASSERT(strstr(reso, "<|im_start|>assistant\n<think>\n") != NULL);
+    free(reso);
+
+    /* Senza pensiero nel messaggio il blocco resta, vuoto: e' cio' che fa il
+     * template con `reasoning_content` assente. */
+    free(msgs.v[1].reasoning);
+    msgs.v[1].reasoning = NULL;
+    reso = render_qwen35_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_NONE);
+    TEST_ASSERT(reso != NULL);
+    TEST_ASSERT(strstr(reso,
+        "<|im_start|>assistant\n<think>\n\n</think>\n\nprima risposta<|im_end|>") != NULL);
+    free(reso);
+
+    chat_msgs_free(&msgs);
 }
 
 static void test_parse_glm_tool_call_message(void) {
@@ -20044,6 +20200,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_stream_handles_multiple_calls();
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
+    test_qwen35_history_keeps_think_block();
     test_parse_glm_tool_call_message();
     test_dsml_parser_recovers_loose_nested_parameters();
     test_dsml_repair_produces_parseable_calls();
