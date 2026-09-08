@@ -194,7 +194,29 @@ static void caso(uint32_t pos0, uint32_t tokens, const char *nome) {
            nome, pos0, tokens, cache_len);
 }
 
-int main(void) {
+/* Le stesse forme, ma con il numero di fette dello split forzato da chi lancia.
+ *
+ * Serve perche' la formula di produzione ne sceglie uno solo (qui 4), e le
+ * fette CORTE -- una o due righe l'una -- sono il caso in cui i massimi
+ * scorrevoli dei blocchi divergono di piu' e la rimessa in scala della
+ * combinazione porta tutto il peso.  Forzando 8 e 16 su nove righe visibili si
+ * arriva a fette da una riga.
+ *
+ * La fetta VUOTA invece NON e' raggiungibile, ed e' voluto: il chiamante stringe
+ * il numero di fette alle righe visibili e la partizione distribuisce il resto
+ * (`base = visible/n; resto = visible%n`), quindi ogni fetta ha almeno una riga.
+ * E' la forma di antirez (`attention_decode_score_split_scores_kernel`), scelta
+ * al posto del `ceil` del fork proprio per far sparire quel caso invece di
+ * guardarlo. Se un giorno il tetto saltasse, questo test non se ne accorgerebbe:
+ * se ne accorge il messaggio del backend, che dice quante fette ha davvero dato.
+ *
+ * Il valore si passa dall'ambiente perche' il kernel lo legge per lancio: il
+ * guardiano esegue il binario una volta per ogni valore. */
+int main(int argc, char **argv) {
+    if (argc > 1) {
+        setenv("DS4_CUDA_ATTN_SPLIT_N", argv[1], 1);
+        printf("split-K forzato a %s partizioni\n", argv[1]);
+    }
     for (uint32_t t = 0; t < MAX_TOKENS; t++) {
         for (uint32_t h = 0; h < N_HEAD; h++) {
             for (uint32_t d = 0; d < QK_DIM; d++) {
@@ -244,6 +266,17 @@ int main(void) {
     caso(99, 1, "decode, 100 righe visibili");
     caso(127, 1, "decode, 128 righe");
     /* Prefill: several tokens at once, causal mask growing row by row. */
+    /* DUE token: l'unica forma multi-token che apre lo split, e l'unica che la
+     * produzione raggiunge -- il ciclo di prefill manda l'ultimo pezzo con
+     * `n = len - i`, e con resto 2 le righe di griglia sono 48, sotto i 56 SM.
+     * Finche' questa forma non c'era, l'indice `((token*n_head + head)*n_part +
+     * part)` non veniva eseguito da NESSUN test: le tre forme di prefill qui
+     * sotto hanno 120 e 192 righe, chiudono il cancello e non splittano mai. */
+    caso(95, 2, "due token, split aperto");
+    /* Due token con la cache corta: il token piu' corto vede UNA riga, quindi il
+     * tetto deve riportare le fette a 1.  E' il tetto che rende impossibile la
+     * fetta vuota; se saltasse, qui si vedrebbe. */
+    caso(0, 2, "due token, tetto sulle righe");
     caso(0, 5, "prefill dal principio");
     caso(11, 5, "prefill con prefisso");
     caso(95, 8, "prefill lungo");

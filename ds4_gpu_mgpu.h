@@ -93,6 +93,10 @@ typedef struct {
     size_t budget_bytes;
     size_t used_bytes;
     void  *boundary_event;     /* cudaEvent_t under CUDA */
+    int    sm_count;           /* multiprocessori: decide lo split dell'attenzione */
+    int    sm_max_threads;     /* thread in volo per SM: quanti blocchi ci stanno */
+    void  *attn_split_partials;      /* {m, l, acc[]} per fetta, di QUESTO device */
+    size_t attn_split_partials_bytes;
 } ds4_gpu_ctx;
 
 extern ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];

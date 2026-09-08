@@ -4121,8 +4121,40 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
         if (cudaGetDeviceProperties(&prop, c->device_id) == cudaSuccess) {
             if (i == 0) g_device_is_spark =
                 prop.integrated && prop.major == 12 && prop.minor == 1;
+            c->sm_count = prop.multiProcessorCount;
+            c->sm_max_threads = prop.maxThreadsPerMultiProcessor;
             fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d) dev=%d\n",
                     prop.name, prop.major, prop.minor, c->device_id);
+        }
+        /* Scratch dei parziali dello split dell'attenzione qwen35, di QUESTO
+         * device e allocato ora invece che alla prima chiamata.
+         *
+         * NON per la cattura: i layer di attenzione qwen35 girano eager --
+         * `ds4.c::qwen35_graph_forward_tokens` cattura solo i GDN, perche' gli
+         * altri «rotate by position and would bake it into the capture».  Avevo
+         * scritto il contrario, ed era falso.  La ragione vera e' piu' piatta:
+         * questa strada e' percorsa sedici volte per token senza replay che
+         * ammortizzi, e una `cudaMalloc` con la sua sincronizzazione non ha
+         * niente da fare li' in mezzo.  La forma resta quella del fork
+         * `entrpi/decode-perf-tuning` (70c3870).
+         *
+         * Il fork pero' tiene UN puntatore globale, e in un albero multi-GPU
+         * sarebbe memoria del device sbagliato: qui sta in `ds4_gpu_ctx`, preso
+         * mentre `cudaSetDevice(c->device_id)` di questo giro e' attivo.  4 MiB
+         * coprono con larghezza la forma servita (al piu' 2 righe x 24 teste x
+         * 8 fette x 258 float = 396 KiB).  Se fallisce, lo split resta spento e
+         * il kernel a griglia piena e' il ripiego. */
+        {
+            void *p = NULL;
+            const size_t bytes = (size_t)1024u * 1024u * sizeof(float);
+            if (cudaMalloc(&p, bytes) == cudaSuccess) {
+                c->attn_split_partials = p;
+                c->attn_split_partials_bytes = bytes;
+            } else {
+                (void)cudaGetLastError();
+                c->attn_split_partials = NULL;
+                c->attn_split_partials_bytes = 0;
+            }
         }
         /* Per-device stream. */
         cudaStream_t s = NULL;
@@ -4307,6 +4339,12 @@ extern "C" void ds4_gpu_cleanup(void) {
         (void)cudaSetDevice(c->device_id);
         attention_decode_score_split_graph_destroy_one(i);
         routed_moe_decode_graph_destroy_one(i);
+        if (c->attn_split_partials) {
+            (void)cudaFree(c->attn_split_partials);
+            c->attn_split_partials = NULL;
+            c->attn_split_partials_bytes = 0;
+        }
+        c->sm_count = 0;
         if (c->boundary_event) {
             (void)cudaEventDestroy((cudaEvent_t)c->boundary_event);
             c->boundary_event = NULL;
@@ -30545,6 +30583,9 @@ __global__ static void qwen35_attention_gqa_kernel(
  * ------------------------------------------------------------------------- */
 #define QWEN35_ATTN_WARPS 8u
 #define QWEN35_ATTN_MAX_VD 256u
+/* Il tetto sul numero di fette: misurato, non scelto.  A 4065 token 12 e' il
+ * massimo della curva e 16 e' gia' in discesa (30,8 contro 29,6 t/s). */
+#define QWEN35_ATTN_SPLIT_MAX 12u
 
 template <typename CT>
 __global__ static void qwen35_attention_gqa_warp_kernel(
@@ -30558,9 +30599,12 @@ __global__ static void qwen35_attention_gqa_warp_kernel(
         uint32_t     n_head,
         uint32_t     n_head_kv,
         uint32_t     qk_dim,
-        uint32_t     value_dim) {
+        uint32_t     value_dim,
+        uint32_t     n_part,
+        float       *partials) {
     const uint32_t token = blockIdx.x;
     const uint32_t head  = blockIdx.y;
+    const uint32_t part  = blockIdx.z;
     if (token >= n_tokens || head >= n_head) return;
 
     const uint32_t lane = threadIdx.x & 31u;
@@ -30582,7 +30626,20 @@ __global__ static void qwen35_attention_gqa_warp_kernel(
     float m = -FLT_MAX;
     float l = 0.0f;
 
-    for (uint32_t row = warp; row < visible; row += n_warp) {
+    /* Con n_part > 1 il blocco prende solo la sua fetta di righe.  La partizione
+     * e' quella di antirez (`attention_decode_score_split_scores_kernel`): resto
+     * DISTRIBUITO, non `ceil`.  Le fette restano contigue -- le letture di un
+     * blocco stanno vicine -- ma differiscono al massimo di una riga, e poiche'
+     * il chiamante garantisce `n_part <= visible`, `base` e' almeno 1: **nessuna
+     * fetta e' mai vuota**.  Il fork usava `ceil`, che la fetta vuota la crea e
+     * poi la guarda; tre revisori indipendenti hanno detto che qui vince la
+     * forma di antirez, e hanno ragione: e' meno codice e un caso in meno. */
+    const uint32_t base = visible / n_part;
+    const uint32_t resto = visible % n_part;
+    const uint32_t inizio = part * base + (part < resto ? part : resto);
+    const uint32_t fine = inizio + base + (part < resto ? 1u : 0u);
+
+    for (uint32_t row = inizio + warp; row < fine; row += n_warp) {
         const CT *krow = key_cache + ((uint64_t)row * n_head_kv + kv_head) * qk_dim;
         float dot = 0.0f;
         for (uint32_t d = lane; d < qk_dim; d += 32u) {
@@ -30625,7 +30682,29 @@ __global__ static void qwen35_attention_gqa_warp_kernel(
             if (l_sh[w] > 0.0f && m_sh[w] > M) M = m_sh[w];
         }
         if (M == -FLT_MAX) {
-            heads[((uint64_t)token * n_head + head) * value_dim + threadIdx.x] = 0.0f;
+            /* Nessun warp ha visto righe.  Con `n_part <= visible` e la
+             * partizione a resto distribuito questo puo' accadere solo con
+             * `visible == 0`, e allora `n_part` e' 1.
+             *
+             * Il ramo `n_part > 1` e' percio' irraggiungibile -- ma l'invariante
+             * che lo rende tale vive nell'HOST, in un'altra funzione, e questo
+             * kernel non lo verifica.  Se un chiamante lo violasse e qui si
+             * uscisse senza scrivere lo slot, la combinazione leggerebbe il
+             * parziale STANTIO del layer precedente: uscita plausibile e
+             * sbagliata, che e' la forma di guasto peggiore.  Queste tre righe
+             * la rendono definita.  Costano un ramo mai preso. */
+            if (n_part > 1u) {
+                float *slot = partials +
+                    (uint64_t)(((uint64_t)token * n_head + head) * n_part + part) *
+                    (value_dim + 2u);
+                slot[2u + threadIdx.x] = 0.0f;
+                if (threadIdx.x == 0u) {
+                    slot[0] = -FLT_MAX;
+                    slot[1] = 0.0f;
+                }
+            } else {
+                heads[((uint64_t)token * n_head + head) * value_dim + threadIdx.x] = 0.0f;
+            }
             return;
         }
         float L = 0.0f, out = 0.0f;
@@ -30635,9 +30714,197 @@ __global__ static void qwen35_attention_gqa_warp_kernel(
             L   += l_sh[w] * f;
             out += o_sh[(size_t)w * value_dim + threadIdx.x] * f;
         }
-        heads[((uint64_t)token * n_head + head) * value_dim + threadIdx.x] =
-            out / fmaxf(L, 1.0e-20f);
+        if (n_part == 1u) {
+            heads[((uint64_t)token * n_head + head) * value_dim + threadIdx.x] =
+                out / fmaxf(L, 1.0e-20f);
+        } else {
+            /* NON normalizzato: la divisione spetta alla combinazione, che
+             * deve prima rimettere in scala i parziali sul massimo comune.
+             *
+             * Il tracciato non e' nostro ne' del fork: e' quello di antirez in
+             * `origin/main::attention_decode_splitkv_kernel`, che ha gia' la
+             * griglia `(t, h, j)` e l'indice `((t*n_head + h)*S + j) * (dim+2)`
+             * con `[0]=m, [1]=l, [2..]=acc`.  Avevo scritto che la dimensione
+             * per token era una mia deviazione dal fork: falso, c'era gia'. */
+            float *slot = partials +
+                (uint64_t)(((uint64_t)token * n_head + head) * n_part + part) *
+                (value_dim + 2u);
+            slot[2u + threadIdx.x] = out;
+            if (threadIdx.x == 0u) {
+                slot[0] = M;
+                slot[1] = L;
+            }
+        }
     }
+}
+
+/* La combinazione delle partizioni.  Somma su `part` in ordine fisso, quindi il
+ * risultato e' bit-identico FRA CORSE -- un atomic non lo sarebbe, ed e' per
+ * questo che la combinazione e' un secondo kernel.
+ *
+ * Fra PREFILL e DECODE no, e va detto: sono due raggruppamenti di somme diversi
+ * (il prefill non splitta), quindi `tests/test_qwen35_prefill_decode.c` regge
+ * per la sua tolleranza, non perche' i due percorsi diano lo stesso bit.  Lo
+ * stesso vale fra schede con un numero di SM diverso, che scelgono un numero di
+ * fette diverso: antirez lo scrive esplicitamente per il suo split-KV («NOT
+ * guaranteed bit-identical in FP32»), e il fork lo chiama «one-time
+ * deterministic shift». */
+__global__ static void qwen35_attention_gqa_combine_kernel(
+        float       *heads,
+        const float *partials,
+        uint32_t     n_tokens,
+        uint32_t     n_head,
+        uint32_t     value_dim,
+        uint32_t     n_part) {
+    const uint32_t token = blockIdx.x;
+    const uint32_t head  = blockIdx.y;
+    const uint32_t d     = threadIdx.x;
+    if (token >= n_tokens || head >= n_head || d >= value_dim) return;
+
+    const uint32_t passo = value_dim + 2u;
+    const float *base = partials +
+        (uint64_t)(((uint64_t)token * n_head + head) * n_part) * passo;
+
+    /* Ogni fetta ha almeno una riga (`n_part <= visible`), quindi ogni parziale
+     * contribuisce.  Il salto su `l <= 0` e' la meta' che sta qui della difesa
+     * scritta nel kernel: insieme rendono definita l'uscita se quell'invariante
+     * -- che vive nell'host -- venisse mai violato, invece di far leggere un
+     * parziale rimasto dal layer precedente. */
+    float M = -FLT_MAX;
+    for (uint32_t p = 0; p < n_part; p++) {
+        const float m = base[(uint64_t)p * passo];
+        if (base[(uint64_t)p * passo + 1u] > 0.0f && m > M) M = m;
+    }
+    if (M == -FLT_MAX) {
+        heads[((uint64_t)token * n_head + head) * value_dim + d] = 0.0f;
+        return;
+    }
+    float L = 0.0f, out = 0.0f;
+    for (uint32_t p = 0; p < n_part; p++) {
+        const float l = base[(uint64_t)p * passo + 1u];
+        if (l <= 0.0f) continue;
+        const float f = __expf(base[(uint64_t)p * passo] - M);
+        L   += l * f;
+        out += base[(uint64_t)p * passo + 2u + d] * f;
+    }
+    heads[((uint64_t)token * n_head + head) * value_dim + d] =
+        out / fmaxf(L, 1.0e-20f);
+}
+
+/* Il contesto del device su cui stiamo lanciando.  Non basta `g_gpu[0]`: dopo
+ * l'inizializzazione multi-GPU il device corrente non e' garantito essere il
+ * primo, e uno scratch preso dal device sbagliato sarebbe memoria di un'altra
+ * scheda -- letta attraverso il PCIe se il peer e' attivo, un fault se non lo
+ * e'.  Il fork ha un solo puntatore globale e questo difetto ce l'ha. */
+static ds4_gpu_ctx *qwen35_attn_ctx(void) {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    for (int i = 0; i < g_n_gpus; i++) {
+        if (g_gpu[i].device_id == dev) return &g_gpu[i];
+    }
+    return NULL;
+}
+
+/* Quante fette dare a ogni riga della griglia: la formula del fork
+ * `entrpi/decode-perf-tuning` (70c3870), non una mia.
+ *
+ * Il problema e' quello che lui descrive per il decode DeepSeek: la griglia per
+ * testa non riempie la macchina.  Da noi in decode e' `(1, 24)` -- ventiquattro
+ * blocchi su cinquantasei SM, trentadue processori fermi.
+ *
+ *     blocchi_voluti = SM * (thread_per_SM / thread_per_blocco)
+ *     n_split = ceil(blocchi_voluti / righe), poi stretto in [2, 12]
+ *
+ * Il fork punta invece a `SM + SM/3`, circa 1,33 onde, perche' la sua misura
+ * dice che «una sola onda non copre la latenza della KV, ma da due in su il
+ * costo della combinazione mangia il guadagno».  Sulla nostra scheda la sua
+ * formula da' 4 fette, e la MISURA dice che sbaglia: a 4065 token di contesto,
+ * decode t/s dal cronometro del server,
+ *
+ *     spento 16,8 | 2: 22,4 | 3: 25,2 | 4: 26,9 | 6: 28,8 | 8: 29,7
+ *                 | 10: 30,4 | 12: 30,8 | 16: 29,6
+ *
+ * L'ottimo e' 12, che sono 288 blocchi su 56 SM: 5,1 onde, non 1,33.  Il suo
+ * crinale vale per un kernel gia' vicino alla banda; il nostro non lo e' --
+ * a 4065 token l'attenzione costava ~30 ms per token contro 0,53 ms di puro
+ * traffico KV, cioe' era ferma ad aspettare, non a leggere.
+ *
+ * La grandezza che conta non e' quindi l'onda ma lo SLOT DI WARP: 12 x 24 = 288
+ * blocchi da 8 warp su 56 SM fanno ~41 warp per SM, e l'Ada ne tiene 48.  A 16
+ * fette ne servirebbero 55, si sfora, e la misura infatti scende.  Il bersaglio
+ * qui sopra e' scritto cosi': riempire gli slot, con il tetto di 12 che e' il
+ * punto misurato su QUESTA scheda.  Su un'altra si rimisura con la leva, non si
+ * eredita -- e' l'errore che ho appena fatto con la formula del fork.
+ *
+ * Tre tetti, in ordine:
+ *  - il CANCELLO, suo: si divide solo se le righe della griglia sono meno degli
+ *    SM.  In prefill `n_tokens * n_head` e' nelle migliaia, quindi si chiude da
+ *    solo e quel percorso resta identico byte per byte -- nessun caso speciale.
+ *  - le RIGHE VISIBILI: `n_split <= visible`.  E' il tetto di antirez («never
+ *    exceed n_score: no empty chunks»), ed e' cio' che rende la fetta vuota
+ *    impossibile nel kernel, insieme alla partizione a resto distribuito.  Si
+ *    prende il token piu' corto del lotto, che e' il caso peggiore.
+ *  - la MEMORIA dello scratch di questo device.
+ *
+ * Leve, anche queste sue: `DS4_CUDA_NO_ATTN_SPLIT` spegne, `DS4_CUDA_ATTN_SPLIT_N`
+ * fissa il numero di fette (1..16) per le misure.  Nemmeno la leva puo' violare
+ * il tetto sulle righe: e' un invariante del kernel, non una preferenza. */
+static uint32_t qwen35_attn_split(uint32_t n_tokens, uint32_t n_head,
+                                  uint32_t pos0, uint32_t cache_len,
+                                  uint32_t value_dim, float **partials) {
+    /* Le due leve si leggono UNA volta: questa funzione sta su una strada eager
+     * percorsa sedici volte per token, e `solo_riferimento` nella dispatch era
+     * gia' cachato cosi'. */
+    static int spento = -1;
+    static int forzato = -2;
+    if (spento < 0) spento = getenv("DS4_CUDA_NO_ATTN_SPLIT") != NULL;
+    if (forzato == -2) {
+        const char *ov = getenv("DS4_CUDA_ATTN_SPLIT_N");
+        const int v = ov ? atoi(ov) : 0;
+        forzato = (v >= 1 && v <= 16) ? v : -1;
+    }
+
+    *partials = NULL;
+    if (spento) return 1u;
+
+    ds4_gpu_ctx *ctx = qwen35_attn_ctx();
+    if (!ctx || ctx->sm_count <= 0 || !ctx->attn_split_partials) return 1u;
+
+    const uint64_t righe = (uint64_t)n_tokens * n_head;
+    if (righe >= (uint64_t)ctx->sm_count) return 1u;     /* griglia gia' piena */
+
+    const uint32_t per_blocco = 32u * QWEN35_ATTN_WARPS;
+    const uint32_t blocchi_per_sm =
+        ctx->sm_max_threads > 0 ? (uint32_t)ctx->sm_max_threads / per_blocco : 1u;
+    const uint64_t voluti = (uint64_t)ctx->sm_count *
+                            (blocchi_per_sm > 0u ? blocchi_per_sm : 1u);
+    uint32_t n_split = (uint32_t)((voluti + righe - 1u) / righe);
+    if (n_split < 2u) n_split = 2u;
+    if (n_split > QWEN35_ATTN_SPLIT_MAX) n_split = QWEN35_ATTN_SPLIT_MAX;
+    if (forzato > 0) n_split = (uint32_t)forzato;
+
+    const uint32_t visibili = (pos0 + 1u) < cache_len ? (pos0 + 1u) : cache_len;
+    if (n_split > visibili) n_split = visibili;
+    if (n_split <= 1u) return 1u;
+
+    const uint64_t serve = righe * n_split * (value_dim + 2u) * sizeof(float);
+    if (serve > (uint64_t)ctx->attn_split_partials_bytes) return 1u;
+
+    /* Detta una volta per valore, come le altre decisioni una-tantum del
+     * backend: un test che passa non distingue lo split acceso dallo split mai
+     * entrato -- con n_split=1 passerebbe ugualmente. */
+    static int detto;
+    if (!detto) {
+        detto = 1;
+        fprintf(stderr, "ds4: qwen35 attention split: %u fette su %u SM "
+                        "(%u righe di griglia)\n",
+                n_split, (unsigned)ctx->sm_count, (unsigned)righe);
+    }
+    *partials = (float *)ctx->attn_split_partials;
+    return n_split;
 }
 
 extern "C" int ds4_gpu_qwen35_attention_gqa_tensor(
@@ -30705,16 +30972,31 @@ extern "C" int ds4_gpu_qwen35_attention_gqa_tensor(
         const uint32_t th = 32u * QWEN35_ATTN_WARPS;
         const size_t sh = ((size_t)QWEN35_ATTN_WARPS * value_dim +
                            2u * QWEN35_ATTN_WARPS) * sizeof(float);
+        float *partials = NULL;
+        const uint32_t n_part = qwen35_attn_split(n_tokens, n_head, pos0,
+                                                  cache_len, value_dim, &partials);
+        dim3 g = grid;
+        if (n_part > 1u) g.z = n_part;
         if (cache_f16) {
-            qwen35_attention_gqa_warp_kernel<__half><<<grid, th, sh, stream>>>(
+            qwen35_attention_gqa_warp_kernel<__half><<<g, th, sh, stream>>>(
                 (float *)heads->ptr, (const float *)q->ptr,
                 (const __half *)key_cache->ptr, (const __half *)value_cache->ptr,
-                pos0, n_tokens, cache_len, n_head, n_head_kv, qk_dim, value_dim);
+                pos0, n_tokens, cache_len, n_head, n_head_kv, qk_dim, value_dim,
+                n_part, partials);
         } else {
-            qwen35_attention_gqa_warp_kernel<float><<<grid, th, sh, stream>>>(
+            qwen35_attention_gqa_warp_kernel<float><<<g, th, sh, stream>>>(
                 (float *)heads->ptr, (const float *)q->ptr,
                 (const float *)key_cache->ptr, (const float *)value_cache->ptr,
-                pos0, n_tokens, cache_len, n_head, n_head_kv, qk_dim, value_dim);
+                pos0, n_tokens, cache_len, n_head, n_head_kv, qk_dim, value_dim,
+                n_part, partials);
+        }
+        if (n_part > 1u) {
+            if (!cuda_ok(cudaGetLastError(), "qwen35 GQA attention (warp) launch"))
+                return 0;
+            qwen35_attention_gqa_combine_kernel<<<grid, value_dim, 0, stream>>>(
+                (float *)heads->ptr, partials,
+                n_tokens, n_head, value_dim, n_part);
+            return cuda_ok(cudaGetLastError(), "qwen35 GQA attention combine launch");
         }
         return cuda_ok(cudaGetLastError(), "qwen35 GQA attention (warp) launch");
     }
