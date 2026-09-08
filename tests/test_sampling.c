@@ -67,6 +67,18 @@ static int reference_sample(const float *logits, uint32_t n_vocab,
     if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
     if (min_p < 0.0f) min_p = 0.0f;
 
+    /* Stessa riparametrizzazione del codice: questo riferimento confronta i
+     * rapporti di probabilita' SCALDATI, quindi per esprimere il contratto
+     * «min_p taglia sui logit grezzi» deve chiedere min_p^(1/T).  Senza questa
+     * riga il riferimento continuerebbe a incarnare la convenzione vecchia, e
+     * un giorno qualcuno giudicherebbe una divergenza vera contro un metro
+     * fermo all'errore -- che e' precisamente come questo difetto e' rimasto
+     * invisibile finora. */
+    if (min_p > 0.0f && min_p < 1.0f && temperature != 1.0f) {
+        const float grezzo = powf(min_p, 1.0f / temperature);
+        min_p = isfinite(grezzo) ? grezzo : 0.0f;
+    }
+
     if (top_k > 0) {
         if (top_k > 1024) top_k = 1024;
         if ((uint32_t)top_k > n_vocab) top_k = (int)n_vocab;

@@ -41447,6 +41447,33 @@ static int sample_top_p_min_p(
     if (temperature <= 0.0f) return sample_argmax(logits, n_vocab);
     if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
     if (min_p < 0.0f) min_p = 0.0f;
+
+    /* min_p decide QUALI token sono ammissibili; la temperatura decide con
+     * quanta casualita' si sceglie fra quelli.  Sono due leve distinte, e qui
+     * erano incollate: ogni ramo qui sotto confronta min_p con un rapporto di
+     * probabilita' GIA' scaldato, `p_i/p_max = exp((v_i - v_max)/T)`, quindi il
+     * filtro accettava `v_i - v_max >= T*ln(min_p)` invece di `>= ln(min_p)`.
+     * Abbassare la temperatura stringeva anche il filtro, di nascosto: a T=0,6
+     * un min_p di 0,05 valeva 0,166, tre volte piu' severo.  A T=1 le due forme
+     * coincidono, ed e' per questo che il difetto non si era mai visto.
+     *
+     * Il contratto e' quello di llama.cpp, dove la catena e' TOP_K, TYPICAL_P,
+     * TOP_P, MIN_P e la temperatura ULTIMA: min_p taglia sui logit grezzi
+     * (`src/llama-sampler.cpp`, `min_logit = data[0].logit + logf(p)`).
+     * Nessuna delle due convenzioni e' matematicamente sbagliata, ma questi
+     * parametri vengono confrontati con quel motore e presentati come
+     * equivalenti: qui l'equivalenza dev'essere vera.
+     *
+     * La correzione sta in un punto solo, e non in cinque filtri, perche' e'
+     * una riparametrizzazione esatta: chiedere `p_i/p_max >= min_p^(1/T)` a un
+     * rapporto scaldato e' identico a chiedere `v_i - v_max >= ln(min_p)` ai
+     * logit grezzi.  A T=1 e' l'identita', quindi il comportamento storico a
+     * temperatura 1 non cambia di un bit. */
+    if (min_p > 0.0f && min_p < 1.0f && temperature != 1.0f) {
+        const float grezzo = powf(min_p, 1.0f / temperature);
+        min_p = isfinite(grezzo) ? grezzo : 0.0f;
+    }
+
     if (top_k <= 0) {
         const bool owned_scratch = prob_scratch == NULL;
         if (owned_scratch) {
