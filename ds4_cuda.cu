@@ -30617,11 +30617,25 @@ __global__ static void qwen35_attention_gqa_warp_kernel(
     const uint32_t visible = min(cache_len, pos0 + token + 1u);
     const float    scale   = rsqrtf((float)qk_dim);
 
-    /* Ogni corsia tiene `per_lane` uscite: con value_dim 256 sono otto float
-     * in registri, e nessun accumulatore passa dalla shared nel ciclo. */
+    /* Ogni corsia tiene `per_lane` uscite: con value_dim 256 sono otto float,
+     * e nessun accumulatore passa dalla shared nel ciclo.  «In registri» pero'
+     * non e' gratis: lo diventa solo grazie ai cicli a estremo fisso qui sotto.
+     * Scritto senza, il commento era falso e l'array stava in local memory. */
     const uint32_t per_lane = value_dim >> 5u;
     float acc[QWEN35_ATTN_MAX_VD / 32u];
-    for (uint32_t i = 0; i < per_lane; i++) acc[i] = 0.0f;
+    /* Tutti e tre i cicli su `acc` girano fino al massimo DICHIARATO e escono
+     * su `per_lane`, invece di girare fino a `per_lane` e basta.  Non e' una
+     * finezza: `per_lane` e' un valore di runtime, e un array indicizzato da un
+     * ciclo non srotolato non puo' stare nei registri -- finiva in local memory
+     * (`-Xptxas -v` diceva «32 bytes stack frame», che sono esattamente questi
+     * otto float).  L'uscita e' uniforme in tutto il blocco, quindi non diverge.
+     * Se anche UNO solo dei tre tornasse a estremo variabile, l'array tornerebbe
+     * in memoria per tutti. */
+#pragma unroll
+    for (uint32_t i = 0; i < QWEN35_ATTN_MAX_VD / 32u; i++) {
+        if (i >= per_lane) break;
+        acc[i] = 0.0f;
+    }
 
     float m = -FLT_MAX;
     float l = 0.0f;
@@ -30642,6 +30656,12 @@ __global__ static void qwen35_attention_gqa_warp_kernel(
     for (uint32_t row = inizio + warp; row < fine; row += n_warp) {
         const CT *krow = key_cache + ((uint64_t)row * n_head_kv + kv_head) * qk_dim;
         float dot = 0.0f;
+        /* Srotolamento parziale: `qk_dim` non ha un massimo dichiarato (la
+         * dispatch chiede solo che sia multiplo di 32), quindi non si puo'
+         * fissare l'estremo.  Otto letture indipendenti in volo invece di una
+         * alla volta bastano pero' a rompere la catena di viaggi in DRAM in
+         * fila, che era il costo dominante per riga. */
+#pragma unroll 8
         for (uint32_t d = lane; d < qk_dim; d += 32u) {
             dot = fmaf(qh[d], (float)krow[d], dot);
         }
@@ -30655,7 +30675,9 @@ __global__ static void qwen35_attention_gqa_warp_kernel(
         const float peso = __expf(score - next_m);
 
         const CT *vrow = value_cache + ((uint64_t)row * n_head_kv + kv_head) * value_dim;
-        for (uint32_t i = 0; i < per_lane; i++) {
+#pragma unroll
+        for (uint32_t i = 0; i < QWEN35_ATTN_MAX_VD / 32u; i++) {
+            if (i >= per_lane) break;
             acc[i] = acc[i] * vecchio + peso * (float)vrow[lane + i * 32u];
         }
         l = l * vecchio + peso;
@@ -30667,7 +30689,9 @@ __global__ static void qwen35_attention_gqa_warp_kernel(
     float *o_sh = condiviso;                                   /* n_warp * value_dim */
     float *m_sh = condiviso + (size_t)n_warp * value_dim;      /* n_warp */
     float *l_sh = m_sh + n_warp;                               /* n_warp */
-    for (uint32_t i = 0; i < per_lane; i++) {
+#pragma unroll
+    for (uint32_t i = 0; i < QWEN35_ATTN_MAX_VD / 32u; i++) {
+        if (i >= per_lane) break;
         o_sh[(size_t)warp * value_dim + lane + i * 32u] = acc[i];
     }
     if (lane == 0u) {
