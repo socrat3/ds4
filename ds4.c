@@ -16809,6 +16809,15 @@ DS4_GPU_GRAPH_CLASS_P_ACCESSOR(directional_steering_dirs)
 /* ds4_gpu_set_current_device is declared in ds4_gpu_mgpu.h — single-tier
  * (g_n_gpus <= 1) callers no-op. Returns 0 on success. */
 
+/* Gli stub per la build senza GPU devono stare FUORI dalla regione
+ * `#ifndef DS4_NO_GPU` aperta a riga 16263 e chiusa a 39072: annidati la'
+ * dentro erano irraggiungibili PROPRIO quando servono, e la build CPU
+ * (`make ds4_cpu_test_hooks.o`, e con essa `tests/test_sampling`) non
+ * compilava piu' da quando il grafo qwen35 ha cominciato a usare
+ * `ds4_decode_graph_key`. Un bersaglio di test che non si costruisce e' un
+ * guardiano che ha smesso di sorvegliare senza dirlo. */
+#endif  /* !DS4_NO_GPU: la regione solo-GPU si chiude qui e riapre sotto */
+
 #ifdef DS4_NO_GPU
 /* CPU-only builds do not include ds4_gpu.h: mirror the decode-graph key
  * type and stub the capture API (always eager). */
@@ -16827,13 +16836,13 @@ static inline int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) { 
 static inline int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) { (void)key; return -1; }
 static inline void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key) { (void)key; }
 static inline void ds4_gpu_decode_graphs_invalidate(void) {}
-static inline int ds4_gpu_set_current_device(int tier) { (void)tier; return 0; }
-static inline int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
+int ds4_gpu_set_current_device(int tier) { (void)tier; return 0; }
+int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
                                             const ds4_gpu_tensor *src,
                                             uint64_t bytes) {
     (void)dst; (void)src; (void)bytes; return 1;
 }
-static inline int ds4_gpu_tensor_copy_xdev3(ds4_gpu_tensor       *dst0,
+int ds4_gpu_tensor_copy_xdev3(ds4_gpu_tensor       *dst0,
                                              const ds4_gpu_tensor *src0,
                                              uint64_t              bytes0,
                                              ds4_gpu_tensor       *dst1,
@@ -16847,12 +16856,12 @@ static inline int ds4_gpu_tensor_copy_xdev3(ds4_gpu_tensor       *dst0,
     (void)dst2; (void)src2; (void)bytes2;
     return 1;
 }
-static inline int ds4_gpu_tensor_copy_xdev_ordered(ds4_gpu_tensor *dst,
+int ds4_gpu_tensor_copy_xdev_ordered(ds4_gpu_tensor *dst,
                                                     const ds4_gpu_tensor *src,
                                                     uint64_t bytes) {
     (void)dst; (void)src; (void)bytes; return 1;
 }
-static inline int ds4_gpu_tensor_wait_xdev(const ds4_gpu_tensor *src, int dst_tier) {
+int ds4_gpu_tensor_wait_xdev(const ds4_gpu_tensor *src, int dst_tier) {
     (void)src; (void)dst_tier; return 1;
 }
 static inline int ds4_gpu_moe_handoff_pack_tensor(
@@ -16909,6 +16918,8 @@ static inline int ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
     return 0;
 }
 #endif
+
+#ifndef DS4_NO_GPU  /* riapre la regione solo-GPU chiusa sopra per gli stub */
 
 /* Returns true on success. Single-tier: no-op success. Multi-tier:
  * sets the CUDA device, then if tier differs from current active_tier,

@@ -354,8 +354,106 @@ static void check_speculative_distribution(void) {
            (double)counts[2] / trials);
 }
 
+/* ---------------------------------------------------------------------------
+ * La FRONTIERA di min_p: quali token sopravvivono, esattamente.
+ *
+ * Il resto di questo file confronta il campionatore con un riferimento che gli
+ * assomiglia -- `reference_sample_logits` calcola `expf((v - max) / T)` e poi
+ * applica min_p, cioe' la stessa convenzione del codice.  Un riferimento che
+ * condivide la convenzione non puo' vederla sbagliata: il test concorda col
+ * difetto invece di trovarlo.
+ *
+ * Questo blocco fissa il CONTRATTO e non l'implementazione.  In llama.cpp la
+ * catena e' TOP_K -> TYPICAL_P -> TOP_P -> MIN_P -> TEMPERATURE, con la
+ * temperatura ULTIMA, quindi min_p taglia sui logit grezzi:
+ *
+ *     sopravvive  <=>  v >= vmax + ln(min_p)
+ *
+ * ds4 taglia invece sulla distribuzione gia' scaldata:
+ *
+ *     sopravvive  <=>  v >= vmax + T * ln(min_p)
+ *
+ * Le due coincidono SOLO a T = 1.  A T = 0,6 con min_p 0,05 il taglio di ds4
+ * cade a -1,80 invece che a -3,00: e' il min_p 0,166 di llama.cpp, tre volte
+ * piu' severo.  Non e' un errore aritmetico -- entrambe le convenzioni si
+ * possono difendere -- ma e' una incompatibilita' semantica con il motore con
+ * cui questi parametri vengono confrontati, e rende la temperatura una leva che
+ * cambia di nascosto anche la severita' del filtro.
+ *
+ * I logit qui sono scelti perche' cadano a cavallo della frontiera: con la
+ * convenzione giusta sopravvivono cinque token, con quella scaldata sette.
+ * ------------------------------------------------------------------------- */
+static void check_min_p_frontier(void) {
+    /* Distanze dal massimo scelte a mano attorno alle due soglie:
+     * ln(0.05) = -2.9957 (contratto) e 0.6*ln(0.05) = -1.7974 (attuale). */
+    static const float delta[] = {
+        0.0f,      /* il massimo: sempre dentro          */
+        -1.0f,     /* dentro in entrambe le convenzioni  */
+        -1.7f,     /* dentro in entrambe, appena         */
+        -1.9f,     /* FUORI se scaldata, dentro se giusta */
+        -2.5f,     /* FUORI se scaldata, dentro se giusta */
+        -3.2f,     /* fuori in entrambe                  */
+        -6.0f,     /* fuori in entrambe                  */
+    };
+    const uint32_t n = (uint32_t)(sizeof(delta) / sizeof(delta[0]));
+    float logits[7];
+    const float base = 4.25f;
+    for (uint32_t i = 0; i < n; i++) logits[i] = base + delta[i];
+
+    const float min_p = 0.05f;
+    const float T = 0.6f;
+    const float soglia_contratto = logf(min_p);          /* -2.9957 */
+
+    /* Quanti dovrebbero sopravvivere secondo il contratto. */
+    uint32_t attesi = 0;
+    for (uint32_t i = 0; i < n; i++) if (delta[i] >= soglia_contratto) attesi++;
+
+    /* Si contano quelli che il campionatore puo' davvero restituire: con questi
+     * sette logit e una soglia netta, un token o e' raggiungibile o non lo e'. */
+    float scratch_locale[7];
+    unsigned char visto[7] = {0};
+    uint64_t rng = 0x9e3779b97f4a7c15ULL;
+    for (int giro = 0; giro < 20000; giro++) {
+        const int tok = ds4_test_sample_logits(logits, n, T, 0, 1.0f, min_p, &rng, scratch_locale);
+        if (tok >= 0 && tok < (int)n) visto[tok] = 1;
+    }
+    uint32_t raggiunti = 0;
+    for (uint32_t i = 0; i < n; i++) if (visto[i]) raggiunti++;
+
+    if (raggiunti != attesi) {
+                fprintf(stderr,
+                        "FAIL: frontiera di min_p a T=%.2f: raggiungibili %u, attesi %u. "
+                        "Il contratto e' `v >= vmax + ln(min_p)` (temperatura ULTIMA, "
+                        "come llama.cpp); il codice taglia a `vmax + T*ln(min_p)`, "
+                        "cioe' un min_p effettivo di %.3f invece di %.3f (per ottenere %.3f andrebbe mandato %.4f).\n",
+                (double)T, raggiunti, attesi,
+                (double)powf(min_p, T), (double)min_p,
+                (double)min_p, (double)powf(min_p, 1.0f / T));
+        failures++;
+        return;
+    }
+    printf("frontiera di min_p a T=%.2f: %u token raggiungibili, come da contratto\n",
+           (double)T, raggiunti);
+
+    /* A T = 1 le due convenzioni coincidono: qui il codice deve gia' passare,
+     * ed e' il controllo che dice se il test misura la temperatura o altro. */
+    uint32_t attesi_t1 = 0;
+    for (uint32_t i = 0; i < n; i++) if (delta[i] >= soglia_contratto) attesi_t1++;
+    memset(visto, 0, sizeof(visto));
+    rng = 0x9e3779b97f4a7c15ULL;
+    for (int giro = 0; giro < 20000; giro++) {
+        const int tok = ds4_test_sample_logits(logits, n, 1.0f, 0, 1.0f, min_p, &rng, scratch_locale);
+        if (tok >= 0 && tok < (int)n) visto[tok] = 1;
+    }
+    uint32_t raggiunti_t1 = 0;
+    for (uint32_t i = 0; i < n; i++) if (visto[i]) raggiunti_t1++;
+    CHECK(raggiunti_t1 == attesi_t1,
+          "a T=1 le due convenzioni coincidono e il campionatore deve gia' rispettarle");
+}
+
 int main(void) {
-    check_speculative_distribution();
+    check_speculative_distribution();
+    check_min_p_frontier();
     const uint32_t semantic_n = 4096;
     float *logits = malloc((size_t)semantic_n * sizeof(*logits));
     float *scratch = malloc((size_t)semantic_n * sizeof(*scratch));
