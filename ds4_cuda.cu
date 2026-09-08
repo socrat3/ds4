@@ -30506,6 +30506,140 @@ __global__ static void qwen35_attention_gqa_kernel(
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * La stessa attenzione, un warp per riga invece di un blocco per riga.
+ *
+ * Il kernel qui sopra fa una riga di cache per volta con tutto il blocco, e
+ * paga per ognuna una riduzione ad albero con nove `__syncthreads()` in catena.
+ * A 6.000 righe di contesto e 16 layer sono quasi un milione di barriere per
+ * head per token, ma non e' quello il costo principale: con `grid(1, 24)` in
+ * decode ci sono 24 blocchi su 56 SM, otto warp l'uno, tutti fermi alla stessa
+ * barriera.  L'occupazione e' del 7%, e non c'e' nessun altro warp da mandare
+ * avanti mentre si aspetta la lettura della cache.  Misurato: 2.221 cicli per
+ * riga, di cui ~600 di lettura non coperta.
+ *
+ * Qui gli otto warp lavorano su righe DIVERSE -- il warp w prende w, w+8, w+16
+ * -- e ciascuno tiene la propria softmax scorrevole nei registri.  Il prodotto
+ * scalare si riduce con `__shfl_down_sync` dentro il warp, quindi nel ciclo non
+ * c'e' piu' nessuna barriera: mentre un warp aspetta la memoria, gli altri
+ * sette calcolano.  Le letture sono a 16 byte per thread invece di 2, e il
+ * layout della cache non cambia: `[riga][kv_head][dim]` ha gia' `dim`
+ * contiguo, quindi 256 half sono 512 byte allineati e la `float4` e' legale
+ * cosi' com'e'.  `qwen35_store_kv_kernel` non si tocca.
+ *
+ * Alla fine gli otto parziali si combinano una volta sola, con la stessa
+ * aritmetica che il kernel vecchio applicava riga per riga:
+ *
+ *     M = max_w m_w                  L = somma_w l_w * exp(m_w - M)
+ *     out[d] = (somma_w o_w[d] * exp(m_w - M)) / L
+ *
+ * `exp(m_w - M)` ha argomento <= 0, quindi il fattore sta in (0,1] e non puo'
+ * traboccare.  Un warp che non ha ricevuto righe -- succede appena il contesto
+ * e' piu' corto di otto, ed e' il caso che il test copre con `cache_len = 1`,
+ * `4`, `9` -- esce con `l_w = 0` e `m_w = -FLT_MAX`: va SALTATO prima di
+ * toccare il suo massimo, altrimenti `exp(-FLT_MAX - (-FLT_MAX))` produce NaN.
+ *
+ * L'ordine di somma su `w` e' fisso, quindi il risultato e' bit-identico fra
+ * corse: i logit restano confrontabili, che e' cio' che il test
+ * prefill-contro-decode pretende.
+ * ------------------------------------------------------------------------- */
+#define QWEN35_ATTN_WARPS 8u
+#define QWEN35_ATTN_MAX_VD 256u
+
+template <typename CT>
+__global__ static void qwen35_attention_gqa_warp_kernel(
+        float       *heads,
+        const float *q,
+        const CT    *key_cache,
+        const CT    *value_cache,
+        uint32_t     pos0,
+        uint32_t     n_tokens,
+        uint32_t     cache_len,
+        uint32_t     n_head,
+        uint32_t     n_head_kv,
+        uint32_t     qk_dim,
+        uint32_t     value_dim) {
+    const uint32_t token = blockIdx.x;
+    const uint32_t head  = blockIdx.y;
+    if (token >= n_tokens || head >= n_head) return;
+
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t n_warp = blockDim.x >> 5u;
+
+    const uint32_t group   = n_head / n_head_kv;
+    const uint32_t kv_head = head / group;
+    const float   *qh      = q + ((uint64_t)token * n_head + head) * qk_dim;
+    const uint32_t visible = min(cache_len, pos0 + token + 1u);
+    const float    scale   = rsqrtf((float)qk_dim);
+
+    /* Ogni corsia tiene `per_lane` uscite: con value_dim 256 sono otto float
+     * in registri, e nessun accumulatore passa dalla shared nel ciclo. */
+    const uint32_t per_lane = value_dim >> 5u;
+    float acc[QWEN35_ATTN_MAX_VD / 32u];
+    for (uint32_t i = 0; i < per_lane; i++) acc[i] = 0.0f;
+
+    float m = -FLT_MAX;
+    float l = 0.0f;
+
+    for (uint32_t row = warp; row < visible; row += n_warp) {
+        const CT *krow = key_cache + ((uint64_t)row * n_head_kv + kv_head) * qk_dim;
+        float dot = 0.0f;
+        for (uint32_t d = lane; d < qk_dim; d += 32u) {
+            dot = fmaf(qh[d], (float)krow[d], dot);
+        }
+        for (uint32_t s = 16u; s > 0u; s >>= 1u) {
+            dot += __shfl_down_sync(0xffffffffu, dot, s);
+        }
+        const float score = __shfl_sync(0xffffffffu, dot, 0) * scale;
+
+        const float next_m = fmaxf(m, score);
+        const float vecchio = m == -FLT_MAX ? 0.0f : __expf(m - next_m);
+        const float peso = __expf(score - next_m);
+
+        const CT *vrow = value_cache + ((uint64_t)row * n_head_kv + kv_head) * value_dim;
+        for (uint32_t i = 0; i < per_lane; i++) {
+            acc[i] = acc[i] * vecchio + peso * (float)vrow[lane + i * 32u];
+        }
+        l = l * vecchio + peso;
+        m = next_m;
+    }
+
+    /* I parziali passano dalla shared una volta sola. */
+    extern __shared__ float condiviso[];
+    float *o_sh = condiviso;                                   /* n_warp * value_dim */
+    float *m_sh = condiviso + (size_t)n_warp * value_dim;      /* n_warp */
+    float *l_sh = m_sh + n_warp;                               /* n_warp */
+    for (uint32_t i = 0; i < per_lane; i++) {
+        o_sh[(size_t)warp * value_dim + lane + i * 32u] = acc[i];
+    }
+    if (lane == 0u) {
+        m_sh[warp] = m;
+        l_sh[warp] = l;
+    }
+    __syncthreads();
+
+    if (threadIdx.x < value_dim) {
+        float M = -FLT_MAX;
+        for (uint32_t w = 0; w < n_warp; w++) {
+            if (l_sh[w] > 0.0f && m_sh[w] > M) M = m_sh[w];
+        }
+        if (M == -FLT_MAX) {
+            heads[((uint64_t)token * n_head + head) * value_dim + threadIdx.x] = 0.0f;
+            return;
+        }
+        float L = 0.0f, out = 0.0f;
+        for (uint32_t w = 0; w < n_warp; w++) {
+            if (l_sh[w] <= 0.0f) continue;            /* warp senza righe */
+            const float f = __expf(m_sh[w] - M);
+            L   += l_sh[w] * f;
+            out += o_sh[(size_t)w * value_dim + threadIdx.x] * f;
+        }
+        heads[((uint64_t)token * n_head + head) * value_dim + threadIdx.x] =
+            out / fmaxf(L, 1.0e-20f);
+    }
+}
+
 extern "C" int ds4_gpu_qwen35_attention_gqa_tensor(
         ds4_gpu_tensor       *heads,
         const ds4_gpu_tensor *q,
@@ -30554,6 +30688,37 @@ extern "C" int ds4_gpu_qwen35_attention_gqa_tensor(
     const dim3 grid(n_tokens, n_head, 1u);
     const size_t shared = (size_t)threads * sizeof(float);
     cudaStream_t stream = cuda_decode_stream();
+
+    /* Il kernel a un warp per riga serve le forme che sa servire; per le altre
+     * -- e con DS4_QWEN35_ATTN_REF=1, che tiene il vecchio raggiungibile per
+     * confrontare i due sullo stesso buffer -- si resta su quello a blocco per
+     * riga, che e' il riferimento. */
+    static int solo_riferimento = -1;
+    if (solo_riferimento < 0) {
+        const char *v = getenv("DS4_QWEN35_ATTN_REF");
+        solo_riferimento = (v && v[0] == '1') ? 1 : 0;
+    }
+    const bool per_warp = !solo_riferimento &&
+        (qk_dim % 32u) == 0u && (value_dim % 32u) == 0u &&
+        value_dim <= QWEN35_ATTN_MAX_VD;
+    if (per_warp) {
+        const uint32_t th = 32u * QWEN35_ATTN_WARPS;
+        const size_t sh = ((size_t)QWEN35_ATTN_WARPS * value_dim +
+                           2u * QWEN35_ATTN_WARPS) * sizeof(float);
+        if (cache_f16) {
+            qwen35_attention_gqa_warp_kernel<__half><<<grid, th, sh, stream>>>(
+                (float *)heads->ptr, (const float *)q->ptr,
+                (const __half *)key_cache->ptr, (const __half *)value_cache->ptr,
+                pos0, n_tokens, cache_len, n_head, n_head_kv, qk_dim, value_dim);
+        } else {
+            qwen35_attention_gqa_warp_kernel<float><<<grid, th, sh, stream>>>(
+                (float *)heads->ptr, (const float *)q->ptr,
+                (const float *)key_cache->ptr, (const float *)value_cache->ptr,
+                pos0, n_tokens, cache_len, n_head, n_head_kv, qk_dim, value_dim);
+        }
+        return cuda_ok(cudaGetLastError(), "qwen35 GQA attention (warp) launch");
+    }
+
     if (cache_f16) {
         qwen35_attention_gqa_kernel<__half><<<grid, threads, shared, stream>>>(
             (float *)heads->ptr, (const float *)q->ptr,

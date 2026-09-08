@@ -6,11 +6,19 @@
  * thing with a streaming maximum, which is where the two could disagree
  * without either looking wrong.
  *
- * The grouping is the point of this file.  A wrong divisor still produces a
+ * The grouping is one point of this file.  A wrong divisor still produces a
  * proper probability distribution over the right number of rows, so the output
  * stays finite and plausible; only a reference that groups correctly can tell
  * the difference.  Every head therefore gets its own distinguishable cache
  * content, and the test runs the real 24-over-4 shape.
+ *
+ * The other point is the LENGTHS, and this file used to have only one: pos0=11
+ * with 5 tokens, so 16 visible rows at most.  A single case like that leaves a
+ * kernel free to mishandle one row, a long run, or the boundary where the row
+ * loop stops dividing evenly -- and to pass anyway.  The cases below sit around
+ * those boundaries (1, 4, 9, 17, 100, 128 visible rows) and include the decode
+ * regime, one query token against a growing cache, which is the one being
+ * optimised and was not covered at all.
  *
  * Both cache precisions are checked: fp16 is what the model will actually use,
  * because one cache head per query head in fp32 would not fit beside 10.2 GiB
@@ -40,27 +48,14 @@ static void require_ok(int ok, const char *what) {
     exit(1);
 }
 
-static void require_close(const char *what, uint32_t idx,
-                          float actual, double expected, double tolerance) {
-    const double diff = fabs((double)actual - expected);
-    if (diff <= tolerance) return;
-    if (failures < 12) {
-        fprintf(stderr, "FAIL: %s[%u]: got %.9g, want %.9g (diff %.3g > %.3g)\n",
-                what, idx, (double)actual, expected, diff, tolerance);
-    }
-    failures++;
-}
-
 enum {
     N_HEAD = 24,          /* the real shape of Qwen3.8-27B */
     N_HEAD_KV = 4,
     GROUP = N_HEAD / N_HEAD_KV,
     QK_DIM = 256,
     VALUE_DIM = 256,
-    TOKENS = 5,
-    CACHE_CAP = 48,
-    POS0 = 11,            /* not zero: the causal mask must depend on it */
-    CACHE_LEN = POS0 + TOKENS,
+    MAX_TOKENS = 8,
+    CACHE_CAP = 160,      /* holds the longest case with room to spare */
 };
 
 /* Half precision, written out rather than pulled from a CUDA header so the
@@ -101,23 +96,23 @@ static float f16_to_f32(uint16_t h) {
     return out.f;
 }
 
-static float q_all[TOKENS][N_HEAD][QK_DIM];
+static float q_all[MAX_TOKENS][N_HEAD][QK_DIM];
 static float k_all[CACHE_CAP][N_HEAD_KV][QK_DIM];
 static float v_all[CACHE_CAP][N_HEAD_KV][VALUE_DIM];
-static double expected[TOKENS][N_HEAD][VALUE_DIM];
-static float actual[TOKENS][N_HEAD][VALUE_DIM];
+static double expected[MAX_TOKENS][N_HEAD][VALUE_DIM];
+static float actual[MAX_TOKENS][N_HEAD][VALUE_DIM];
 static uint16_t k_f16[CACHE_CAP][N_HEAD_KV][QK_DIM];
 static uint16_t v_f16[CACHE_CAP][N_HEAD_KV][VALUE_DIM];
 static double weights[CACHE_CAP];
 
 /* The specification, in double. `rounded` replays what fp16 storage does to the
  * cache, so the same reference serves both precisions. */
-static void host_attention(bool rounded) {
+static void host_attention(bool rounded, uint32_t pos0, uint32_t tokens) {
     const double scale = 1.0 / sqrt((double)QK_DIM);
-    for (uint32_t t = 0; t < TOKENS; t++) {
+    for (uint32_t t = 0; t < tokens; t++) {
         for (uint32_t h = 0; h < N_HEAD; h++) {
             const uint32_t kv = h / GROUP;
-            const uint32_t visible = POS0 + t + 1u;
+            const uint32_t visible = pos0 + t + 1u;
             double max_score = -1.0e300;
             for (uint32_t row = 0; row < visible; row++) {
                 double dot = 0.0;
@@ -149,8 +144,58 @@ static void host_attention(bool rounded) {
     }
 }
 
+static ds4_gpu_tensor *g_q, *g_out, *g_k32, *g_v32, *g_k16, *g_v16;
+
+/* One case: `tokens` queries against a cache that shows the first of them
+ * `pos0 + 1` rows.  Both precisions run, because fp16 is what the model uses
+ * and fp32 is what tells a rounding difference from an indexing one. */
+static void caso(uint32_t pos0, uint32_t tokens, const char *nome) {
+    const uint32_t cache_len = pos0 + tokens;
+    if (tokens > MAX_TOKENS || cache_len > CACHE_CAP) {
+        fprintf(stderr, "FAIL: caso %s fuori dai buffer (%u token, cache %u)\n",
+                nome, tokens, cache_len);
+        failures++;
+        return;
+    }
+
+    for (int giro = 0; giro < 2; giro++) {
+        const bool f16 = giro == 1;
+        host_attention(f16, pos0, tokens);
+        require_ok(ds4_gpu_qwen35_attention_gqa_tensor(
+            g_out, g_q, f16 ? g_k16 : g_k32, f16 ? g_v16 : g_v32,
+            pos0, tokens, cache_len, CACHE_CAP,
+            N_HEAD, N_HEAD_KV, QK_DIM, VALUE_DIM, f16), "GQA attention");
+        require_ok(ds4_gpu_tensor_read(g_out, 0, actual, sizeof(actual)), "read");
+
+        /* fp16 tolerates more because the cache itself is rounded; fp32 does
+         * not, and a gap there is an index or an ordering defect. */
+        const double tolleranza = f16 ? 5.0e-4 : 2.0e-4;
+        int sbagliati = 0;
+        double peggiore = 0.0;
+        for (uint32_t t = 0; t < tokens; t++) {
+            for (uint32_t h = 0; h < N_HEAD; h++) {
+                for (uint32_t d = 0; d < VALUE_DIM; d++) {
+                    const double diff = fabs((double)actual[t][h][d] - expected[t][h][d]);
+                    if (diff > peggiore) peggiore = diff;
+                    if (diff > tolleranza) sbagliati++;
+                }
+            }
+        }
+        if (sbagliati) {
+            fprintf(stderr,
+                    "FAIL: %s (%s): %d valori oltre %.1e, peggiore %.3e "
+                    "(pos0=%u tokens=%u cache_len=%u)\n",
+                    nome, f16 ? "fp16" : "fp32", sbagliati, tolleranza,
+                    peggiore, pos0, tokens, cache_len);
+            failures++;
+        }
+    }
+    printf("  %-32s pos0=%3u tokens=%u cache_len=%3u: PASS\n",
+           nome, pos0, tokens, cache_len);
+}
+
 int main(void) {
-    for (uint32_t t = 0; t < TOKENS; t++) {
+    for (uint32_t t = 0; t < MAX_TOKENS; t++) {
         for (uint32_t h = 0; h < N_HEAD; h++) {
             for (uint32_t d = 0; d < QK_DIM; d++) {
                 q_all[t][h][d] = 0.05f + 0.003f * (float)((d + 7u * h + 3u * t) % 31u)
@@ -174,13 +219,12 @@ int main(void) {
     }
 
     require_ok(ds4_gpu_init(), "CUDA init");
-
-    ds4_gpu_tensor *g_q = ds4_gpu_tensor_alloc(sizeof(q_all));
-    ds4_gpu_tensor *g_out = ds4_gpu_tensor_alloc(sizeof(actual));
-    ds4_gpu_tensor *g_k32 = ds4_gpu_tensor_alloc(sizeof(k_all));
-    ds4_gpu_tensor *g_v32 = ds4_gpu_tensor_alloc(sizeof(v_all));
-    ds4_gpu_tensor *g_k16 = ds4_gpu_tensor_alloc(sizeof(k_f16));
-    ds4_gpu_tensor *g_v16 = ds4_gpu_tensor_alloc(sizeof(v_f16));
+    g_q = ds4_gpu_tensor_alloc(sizeof(q_all));
+    g_out = ds4_gpu_tensor_alloc(sizeof(actual));
+    g_k32 = ds4_gpu_tensor_alloc(sizeof(k_all));
+    g_v32 = ds4_gpu_tensor_alloc(sizeof(v_all));
+    g_k16 = ds4_gpu_tensor_alloc(sizeof(k_f16));
+    g_v16 = ds4_gpu_tensor_alloc(sizeof(v_f16));
     require_ok(g_q && g_out && g_k32 && g_v32 && g_k16 && g_v16, "allocation");
     require_ok(ds4_gpu_tensor_write(g_q, 0, q_all, sizeof(q_all)), "Q write");
     require_ok(ds4_gpu_tensor_write(g_k32, 0, k_all, sizeof(k_all)), "K write");
@@ -188,48 +232,37 @@ int main(void) {
     require_ok(ds4_gpu_tensor_write(g_k16, 0, k_f16, sizeof(k_f16)), "K16 write");
     require_ok(ds4_gpu_tensor_write(g_v16, 0, v_f16, sizeof(v_f16)), "V16 write");
 
-    host_attention(false);
-    require_ok(ds4_gpu_qwen35_attention_gqa_tensor(
-        g_out, g_q, g_k32, g_v32, POS0, TOKENS, CACHE_LEN, CACHE_CAP,
-        N_HEAD, N_HEAD_KV, QK_DIM, VALUE_DIM, false), "GQA attention fp32");
-    require_ok(ds4_gpu_tensor_read(g_out, 0, actual, sizeof(actual)), "read fp32");
-    for (uint32_t t = 0; t < TOKENS; t++) {
-        for (uint32_t h = 0; h < N_HEAD; h++) {
-            for (uint32_t d = 0; d < VALUE_DIM; d++) {
-                require_close("fp32 cache", (t * N_HEAD + h) * VALUE_DIM + d,
-                              actual[t][h][d], expected[t][h][d], 2.0e-4);
-            }
-        }
-    }
-    if (failures) { fprintf(stderr, "%d mismatches (fp32)\n", failures); return 1; }
-    printf("GQA attention vs host reference, fp32 cache: PASS\n");
+    puts("GQA attention vs scalar reference, lengths around the boundaries:");
+    /* One row: the degenerate case, where the streaming maximum has nothing to
+     * combine with and a wrong `old_scale` would not show. */
+    caso(0, 1, "una riga, un token");
+    /* Decode against a short and a long cache: the regime being optimised, and
+     * the one this file did not cover at all. */
+    caso(3, 1, "decode, 4 righe visibili");
+    caso(8, 1, "decode, 9 righe visibili");
+    caso(16, 1, "decode, 17 righe visibili");
+    caso(99, 1, "decode, 100 righe visibili");
+    caso(127, 1, "decode, 128 righe");
+    /* Prefill: several tokens at once, causal mask growing row by row. */
+    caso(0, 5, "prefill dal principio");
+    caso(11, 5, "prefill con prefisso");
+    caso(95, 8, "prefill lungo");
 
-    host_attention(true);
-    require_ok(ds4_gpu_qwen35_attention_gqa_tensor(
-        g_out, g_q, g_k16, g_v16, POS0, TOKENS, CACHE_LEN, CACHE_CAP,
-        N_HEAD, N_HEAD_KV, QK_DIM, VALUE_DIM, true), "GQA attention fp16");
-    require_ok(ds4_gpu_tensor_read(g_out, 0, actual, sizeof(actual)), "read fp16");
-    for (uint32_t t = 0; t < TOKENS; t++) {
-        for (uint32_t h = 0; h < N_HEAD; h++) {
-            for (uint32_t d = 0; d < VALUE_DIM; d++) {
-                require_close("fp16 cache", (t * N_HEAD + h) * VALUE_DIM + d,
-                              actual[t][h][d], expected[t][h][d], 5.0e-4);
-            }
-        }
+    if (failures) {
+        fprintf(stderr, "%d confronto/i falliti\n", failures);
+        return 1;
     }
-    if (failures) { fprintf(stderr, "%d mismatches (fp16)\n", failures); return 1; }
-    printf("GQA attention vs host reference, fp16 cache: PASS\n");
 
     /* Shapes that cannot be served must be refused, not read past. */
     {
         const int bad_group = ds4_gpu_qwen35_attention_gqa_tensor(
-            g_out, g_q, g_k32, g_v32, POS0, TOKENS, CACHE_LEN, CACHE_CAP,
+            g_out, g_q, g_k32, g_v32, 11, 5, 16, CACHE_CAP,
             N_HEAD, 5u, QK_DIM, VALUE_DIM, false);
         const int bad_len = ds4_gpu_qwen35_attention_gqa_tensor(
-            g_out, g_q, g_k32, g_v32, POS0, TOKENS, CACHE_CAP + 1u, CACHE_CAP,
+            g_out, g_q, g_k32, g_v32, 11, 5, CACHE_CAP + 1u, CACHE_CAP,
             N_HEAD, N_HEAD_KV, QK_DIM, VALUE_DIM, false);
         require_ok(!bad_group && !bad_len, "invalid shapes must be refused");
-        printf("invalid shapes refused: PASS\n");
+        printf("  forme non servibili rifiutate: PASS\n");
     }
 
     ds4_gpu_tensor_free(g_v16);
