@@ -3137,11 +3137,11 @@ static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
  * does describe a tool format and this does not implement it: a request
  * carrying tools gets a prompt without them, which is wrong but visibly so,
  * where a guessed format would be wrong and plausible. */
+/* Una copia della stessa istruzione viveva qui e un'altra in ds4.c; la console
+ * non ne aveva nessuna.  Ora la stringa sta in un posto solo e la leggono tutti
+ * e tre, che e' anche il modo di accorgersi se un giorno cambia. */
 static const char *qwen35_server_effort_text(ds4_think_mode mode) {
-    if (!ds4_think_mode_enabled(mode)) return NULL;
-    return "Reasoning effort is set to xhigh. Please think carefully through the task, "
-           "validate key assumptions, consider plausible alternatives, and prioritize "
-           "correctness, consistency, and clarity in the final answer.";
+    return ds4_qwen35_reasoning_effort_text(mode);
 }
 
 static char *render_qwen35_chat_prompt_text(const chat_msgs *msgs,

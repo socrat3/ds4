@@ -542,6 +542,12 @@ static void build_chat_prompt(ds4_engine *engine,
     if (ds4_engine_is_glm_dsa(engine)) {
         const char *effort = ds4_glm_reasoning_effort_text(think_mode);
         if (effort) ds4_chat_append_message(engine, out, "system", effort);
+    } else if (ds4_engine_is_qwen35(engine)) {
+        /* Stessa omissione del costruttore del REPL, in una strada meno battuta:
+         * questa serve `-p` CON `--prefix`, mentre senza prefisso si passa per
+         * `ds4_encode_chat_prompt`, che l'istruzione la mette gia'. */
+        const char *effort = ds4_qwen35_reasoning_effort_text(think_mode);
+        if (effort) ds4_chat_append_message(engine, out, "system", effort);
     } else if (think_mode == DS4_THINK_MAX) {
         ds4_chat_append_max_effort_prefix(engine, out);
     }
@@ -1437,6 +1443,13 @@ static void repl_chat_build_think_prefix(ds4_engine *engine,
                                          ds4_tokens *prefix) {
     if (ds4_engine_is_glm_dsa(engine)) {
         const char *effort = repl_glm_reasoning_effort_text(mode);
+        if (effort) ds4_chat_append_message(engine, prefix, "system", effort);
+    } else if (ds4_engine_is_qwen35(engine)) {
+        /* Il chat_template di Qwen3.8 mette SEMPRE questa istruzione quando il
+         * pensiero e' attivo, e la mettono gia' sia `ds4 -p` sia il server.
+         * Senza, il modello riapre `<think>` dentro il pensiero e ripete: e' il
+         * prompt a essere fuori distribuzione, non il campionamento. */
+        const char *effort = ds4_qwen35_reasoning_effort_text(mode);
         if (effort) ds4_chat_append_message(engine, prefix, "system", effort);
     } else if (mode == DS4_THINK_MAX) {
         ds4_chat_append_max_effort_prefix(engine, prefix);

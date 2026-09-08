@@ -40326,6 +40326,14 @@ static const char *qwen35_reasoning_effort_text(ds4_think_mode mode) {
     return NULL;
 }
 
+/* Esposta perche' la stessa istruzione la devono mettere TRE strade: la domanda
+ * singola (`encode_chat_prompt_qwen35`), il server e la console interattiva.
+ * Finche' era privata, il server se l'era ricopiata e la console non ce l'aveva
+ * affatto -- e senza di essa il modello riapre `<think>` dentro il pensiero. */
+const char *ds4_qwen35_reasoning_effort_text(ds4_think_mode mode) {
+    return qwen35_reasoning_effort_text(mode);
+}
+
 static void qwen35_chat_open(const ds4_vocab *vocab, const char *role, token_vec *out) {
     token_vec_push(out, vocab->im_start_id);
     bpe_tokenize_text(vocab, role, out);

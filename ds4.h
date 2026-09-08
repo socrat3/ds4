@@ -309,6 +309,11 @@ bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);
 const char *ds4_think_max_prefix(void);
 const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode);
+/* Il gemello per qwen35.  Serve perche' la stessa istruzione la devono
+ * mettere TRE strade -- la domanda singola, il server e la console -- e
+ * finche' la stringa era privata di ds4.c il server se l'era ricopiata e la
+ * console non ce l'aveva affatto. */
+const char *ds4_qwen35_reasoning_effort_text(ds4_think_mode mode);
 uint32_t ds4_think_max_min_context(void);
 ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size);
 /* Uses the active model shape selected by ds4_engine_open(); call after opening
