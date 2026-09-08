@@ -58,7 +58,10 @@ enum {
     /* Il prefill piastrella otto query per blocco: per provare piu' di una
      * piastrella, e una piastrella incompleta, servono decine di token. */
     MAX_TOKENS = 40,
-    CACHE_CAP = 256,      /* holds the longest case with room to spare */
+    /* Migliaia di righe, non centinaia: e' il regime in cui il motore lavora
+     * davvero, e fino a ieri il caso piu' lungo ne aveva 160.  Serve anche a
+     * far girare lo split su un numero di fette realistico. */
+    CACHE_CAP = 2560,
 };
 
 /* Half precision, written out rather than pulled from a CUDA header so the
@@ -365,7 +368,11 @@ int main(int argc, char **argv) {
      * il ciclo sulle fette di K/V. */
     caso(0, 32, "piastrelle piene dal principio");
     caso(7, 37, "piastrelle con coda incompleta");
-    caso(120, 40, "piastrelle con prefisso lungo");
+    caso(120, 40, "prefisso lungo");
+    /* Contesto lungo: qui lo split apre davvero le sue dodici fette, e la
+     * partizione a resto distribuito lavora su 2508 righe invece che su 128.
+     * Nessun caso ci arrivava. */
+    caso(2500, 8, "contesto lungo, split a pieno regime");
 
     if (failures) {
         fprintf(stderr, "%d confronto/i falliti\n", failures);
