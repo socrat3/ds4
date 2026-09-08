@@ -3172,6 +3172,29 @@ static char *render_qwen35_chat_prompt_text(const chat_msgs *msgs,
         buf_puts(&out, "<|im_end|>\n");
     }
 
+    /* Un turno assistant in ULTIMA posizione non e' un turno concluso: e' un
+     * PREFILL, e il modello deve CONTINUARLO.  E' la convenzione di OpenAI, di
+     * Anthropic e di llama.cpp, ed e' il modo in cui un client semina la lingua
+     * o la forma della risposta.
+     *
+     * Chiuderlo e aprirne un altro fa leggere al modello «ragionamento gia'
+     * finito, adesso ne ricomincio uno»: misurato su questo motore con il
+     * prefill italiano che dsoc4 manda, il pensiero passa da 1763 a 3620
+     * caratteri e la risposta non arriva affatto (`finish=length`, zero
+     * caratteri, contro 159 e `stop` senza prefill).
+     *
+     * Il difetto c'era gia', ma era invisibile: il renderer ignorava del tutto
+     * `reasoning_content` nei turni passati, quindi il prefill spariva e basta.
+     * Averlo reso visibile -- allineando lo storico al chat_template del
+     * modello -- lo ha trasformato da inerte a dannoso. */
+    int ultimo_utile = -1;
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        if (!role_is_system(msgs->v[i].role)) ultimo_utile = i;
+    }
+    const bool prefill_assistente =
+        ultimo_utile >= 0 && msgs->v[ultimo_utile].role &&
+        !strcmp(msgs->v[ultimo_utile].role, "assistant");
+
     for (int i = 0; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (role_is_system(m->role)) continue;
@@ -3181,6 +3204,19 @@ static char *render_qwen35_chat_prompt_text(const chat_msgs *msgs,
         const bool e_assistente = m->role && !strcmp(m->role, "assistant");
         buf_puts(&out, e_assistente ? "assistant" : "user");
         buf_puts(&out, "\n");
+        if (prefill_assistente && i == ultimo_utile) {
+            /* Aperto e lasciato aperto: nessun `</think>` se c'e' il solo
+             * ragionamento, nessun `<|im_end|>`, e nessun turno dopo. */
+            const char *rc = m->reasoning ? m->reasoning : "";
+            const char *ct = m->content ? m->content : "";
+            buf_puts(&out, "<think>\n");
+            append_trimmed_text(&out, rc);
+            if (ct[0]) {
+                buf_puts(&out, "\n</think>\n\n");
+                buf_puts(&out, ct);
+            }
+            return out.ptr;
+        }
         /* Il turno assistant passato porta il suo blocco di pensiero: e' cio'
          * che il chat_template del modello fa per default, e ometterlo mandava
          * fuori distribuzione ogni conversazione a piu' di un turno. */
@@ -16851,6 +16887,61 @@ static void test_qwen35_history_keeps_think_block(void) {
     chat_msgs_free(&msgs);
 }
 
+/* Un turno assistant in ultima posizione si CONTINUA, non si chiude.
+ *
+ * E' la convenzione con cui un client semina la lingua del ragionamento: dsoc4
+ * manda un turno assistant con il solo `reasoning_content`
+ * (`cartridge_lex/backends/http_b.py::_genera`).  Chiudendolo e aprendone un
+ * altro il modello ricomincia a pensare da capo -- misurato sul motore:
+ * pensiero da 1763 a 3620 caratteri, risposta da 159 caratteri a ZERO. */
+static void test_qwen35_ultimo_assistant_e_un_prefill(void) {
+    chat_msgs msgs = {0};
+    chat_msg u = {0};
+    u.role = xstrdup("user");
+    u.content = xstrdup("domanda");
+    chat_msgs_push(&msgs, u);
+    chat_msg a = {0};
+    a.role = xstrdup("assistant");
+    a.content = xstrdup("");
+    a.reasoning = xstrdup("  Ragioniamo in italiano.  ");
+    chat_msgs_push(&msgs, a);
+
+    char *reso = render_qwen35_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(reso != NULL);
+    /* Il pensiero resta APERTO e il testo finisce li'. */
+    TEST_ASSERT(strstr(reso, "<|im_start|>assistant\n<think>\nRagioniamo in italiano.") != NULL);
+    TEST_ASSERT(strstr(reso, "</think>") == NULL);
+    TEST_ASSERT(strstr(reso, "italiano.<|im_end|>") == NULL);
+    {   /* e non c'e' un secondo turno assistant dopo il prefill */
+        const char *primo = strstr(reso, "<|im_start|>assistant");
+        TEST_ASSERT(primo != NULL);
+        TEST_ASSERT(strstr(primo + 1, "<|im_start|>assistant") == NULL);
+    }
+    free(reso);
+
+    /* Con del contenuto il pensiero si chiude e si continua la RISPOSTA. */
+    free(msgs.v[1].content);
+    msgs.v[1].content = xstrdup("La risposta comincia");
+    reso = render_qwen35_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(reso != NULL);
+    TEST_ASSERT(strstr(reso, "<think>\nRagioniamo in italiano.\n</think>\n\nLa risposta comincia") != NULL);
+    TEST_ASSERT(strstr(reso, "La risposta comincia<|im_end|>") == NULL);
+    free(reso);
+
+    /* Un turno assistant NON ultimo resta un turno concluso. */
+    chat_msg u2 = {0};
+    u2.role = xstrdup("user");
+    u2.content = xstrdup("seconda domanda");
+    chat_msgs_push(&msgs, u2);
+    reso = render_qwen35_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(reso != NULL);
+    TEST_ASSERT(strstr(reso, "La risposta comincia<|im_end|>") != NULL);
+    TEST_ASSERT(strstr(reso, "<|im_start|>user\nseconda domanda<|im_end|>") != NULL);
+    free(reso);
+
+    chat_msgs_free(&msgs);
+}
+
 static void test_parse_glm_tool_call_message(void) {
     const char *generated =
         "<think>need bash</think>OK\n\n"
@@ -20201,6 +20292,7 @@ static void ds4_server_unit_tests_run(void) {
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
     test_qwen35_history_keeps_think_block();
+    test_qwen35_ultimo_assistant_e_un_prefill();
     test_parse_glm_tool_call_message();
     test_dsml_parser_recovers_loose_nested_parameters();
     test_dsml_repair_produces_parseable_calls();
