@@ -3015,6 +3015,70 @@ static bool text_starts_with_think_tag(const char *s) {
     return s && (!strncmp(s, "<think>", 7) || !strncmp(s, "</think>", 8));
 }
 
+/* Lo spazio iniziale NON cambia la semantica del marcatore: `" \n<think>…"` apre il blocco
+ * esattamente come `"<think>…"`, e riconoscerlo solo al byte zero lasciava passare la doppia
+ * apertura (astra 6). Si salta come fa gia' `append_trimmed_text` per il reasoning. */
+static const char *text_after_leading_space(const char *s) {
+    const unsigned char *p = (const unsigned char *)(s ? s : "");
+    while (*p && isspace(*p)) p++;
+    return (const char *)p;
+}
+
+static bool text_starts_with_think_open(const char *s) {
+    return !strncmp(text_after_leading_space(s), "<think>", 7);
+}
+
+/* UNA CONTRADDIZIONE SI RIFIUTA, NON SI INDOVINA (11/09, rilievo di astra 6).
+ *
+ * Due richieste sono contraddittorie e nessuna scelta del renderer le salva:
+ *
+ *   - `think_mode=none` con un ultimo assistant il cui `content` apre `<think>`: il client
+ *     chiede di non pensare e insieme apre il blocco del pensiero.  Emettere il content
+ *     riattiva il pensiero (il difetto che fable ha trovato); anteporre il blocco vuoto ne
+ *     produce due.  Entrambe le forme sono sbagliate, quindi la richiesta e' sbagliata.
+ *   - un prefill che porta INSIEME `reasoning` e un `content` che apre il blocco: sono due
+ *     pensieri concorrenti, e sceglierne uno vuol dire buttare l'altro in silenzio.
+ *
+ * Il renderer resta cosi' TOTALE: ogni ingresso che lo raggiunge ha una forma giusta e una
+ * sola.  E' lo stesso disegno di `request_validate_ignore_eos`, dodici righe piu' su. */
+static bool request_validate_prefill(const chat_msgs *msgs, ds4_think_mode think_mode,
+                                     server_model_syntax syntax,
+                                     char *err, size_t errlen) {
+    /* UNA POLITICA SI APPLICA DOVE E' DIMOSTRATA (astra 6). La riparazione, le prove e i test
+     * riguardano il renderer Qwen; DeepSeek e GLM hanno una loro forma e nessuna misura che
+     * dica come si comportano qui. Estendere il gate a loro sarebbe rifiutare richieste in
+     * base a un'ipotesi. */
+    if (syntax != SERVER_MODEL_SYNTAX_QWEN) return true;
+    int ultimo = -1;
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        if (!role_is_system(msgs->v[i].role)) ultimo = i;
+    }
+    if (ultimo < 0) return true;
+    const chat_msg *m = &msgs->v[ultimo];
+    if (!m->role || strcmp(m->role, "assistant")) return true;   /* non e' un prefill */
+
+    const char *ct = m->content ? m->content : "";
+    const char *rc = m->reasoning ? m->reasoning : "";
+    const bool apre = text_starts_with_think_open(ct);
+    const bool chiude = !strncmp(text_after_leading_space(ct), "</think>", 8);
+    if (!apre && !chiude) return true;
+
+    if (apre && !ds4_think_mode_enabled(think_mode)) {
+        snprintf(err, errlen,
+                 "the final assistant message opens <think> but thinking is disabled: "
+                 "drop the tag or enable thinking");
+        return false;
+    }
+    if (apre && rc[0]) {
+        snprintf(err, errlen,
+                 "the final assistant message carries both reasoning_content and a <think> "
+                 "tag in content: send only one");
+        return false;
+    }
+    return true;
+}
+
+
 static void append_trimmed_text(buf *out, const char *text) {
     const unsigned char *start = (const unsigned char *)(text ? text : "");
     while (*start && isspace(*start)) start++;
@@ -3209,6 +3273,43 @@ static char *render_qwen35_chat_prompt_text(const chat_msgs *msgs,
              * ragionamento, nessun `<|im_end|>`, e nessun turno dopo. */
             const char *rc = m->reasoning ? m->reasoning : "";
             const char *ct = m->content ? m->content : "";
+            /* IL CONTENUTO PUO' PORTARE GIA' IL MARCATORE, e allora non ne vuole un
+             * secondo: aprire qui produrrebbe `<think>` + `</think>` + `<think>`, cioe'
+             * due blocchi con uno chiuso in mezzo -- il guasto misurato il 29/08 su
+             * `/apply-template`, che il modello legge come «ho gia' pensato, adesso
+             * ricomincio».  L'helper esiste in questo file ed e' gia' usato dai turni
+             * passati: era questo ramo a saltarlo (11/09). */
+            if (text_starts_with_think_open(ct)) {
+                /* Il blocco lo apre il contenuto: qui non si aggiunge nulla.  Il caso
+                 * contraddittorio (pensiero spento, o `reasoning` insieme al tag) non
+                 * arriva fin qui: lo rifiuta `request_validate_prefill`. */
+                buf_puts(&out, ct);
+                return out.ptr;
+            }
+            if (text_starts_with_think_tag(ct)) {
+                /* Comincia con `</think>`: una CHIUSURA senza apertura, che emessa nuda
+                 * produce un prompt malformato (astra 6).  Si antepone l'apertura -- e se
+                 * c'e' un `reasoning`, e' lui a riempirla: i due si COMPONGONO, il pensiero
+                 * apre e il content lo chiude.  Prima il reasoning finiva scartato in
+                 * silenzio, che e' il difetto che questo ramo doveva togliere. */
+                buf_puts(&out, "<think>\n");
+                if (rc[0]) {
+                    append_trimmed_text(&out, rc);
+                    buf_puts(&out, "\n");
+                }
+                buf_puts(&out, ct);
+                return out.ptr;
+            }
+            /* A PENSIERO SPENTO il blocco si apre e si chiude VUOTO, newline compresi:
+             * e' cio' che il modello ha visto in addestramento, e lo dice il commento in
+             * testa a questa funzione.  Il ramo lo ignorava e apriva comunque `<think>`,
+             * cioe' invitava a pensare proprio dove il client aveva chiesto di non farlo.
+             * Un `reasoning` esplicito vince: se il client lo manda, l'ha voluto. */
+            if (!rc[0] && !think) {
+                buf_puts(&out, "<think>\n\n</think>\n\n");
+                buf_puts(&out, ct);
+                return out.ptr;
+            }
             buf_puts(&out, "<think>\n");
             append_trimmed_text(&out, rc);
             if (ct[0]) {
@@ -3863,6 +3964,12 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    if (!request_validate_prefill(&msgs, r->think_mode, r->model_syntax, err, errlen)) {
+        chat_msgs_free(&msgs);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
@@ -4090,6 +4197,11 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
+    if (!request_validate_prefill(&msgs, r->think_mode, r->model_syntax, err, errlen)) {
+        chat_msgs_free(&msgs);
+        request_free(r);
+        return false;
+    }
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
@@ -5108,6 +5220,11 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     responses_prepare_live_continuation(r, &msgs);
+    if (!request_validate_prefill(&msgs, r->think_mode, r->model_syntax, err, errlen)) {
+        chat_msgs_free(&msgs);
+        request_free(r);
+        return false;
+    }
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
@@ -13939,6 +14056,81 @@ static bool send_model(server *s, int fd, const char *id) {
     return ok;
 }
 
+/* POST /apply-template — il prompt che questo server costruisce per quei messaggi.
+ *
+ * Non genera: parsa, rende, risponde.  Serve a una cosa sola, e non e' diagnostica di lusso:
+ * senza, ogni prova sulla forma del prompt confronta la nostra RICOSTRUZIONE con il nostro
+ * ATTESO, cioe' verifica l'oracolo che abbiamo scritto noi.  Con questo endpoint la prova
+ * chiede al server cosa costruisce davvero.  Il nome e la semantica sono quelli di llama.cpp
+ * apposta: la stessa prova interroga i due motori con lo stesso codice, ed e' il confronto
+ * che serve a dire se una differenza fra loro e' del motore o del prompt.
+ *
+ * I due conteggi sono sui TOKEN e non sulle stringhe: una `<think>` scritta dentro la domanda
+ * dell'utente e' testo, il marcatore e' un token speciale, e solo il secondo conta per
+ * l'invariante.  Il testo mente, il token no. */
+static bool send_applied_template(server *s, int fd, const char *body) {
+    request req;
+    char err[160];
+    const int ctx_size = s->ctx_size;
+    if (!parse_chat_request(s->engine, s, body, s->default_tokens,
+                            ctx_size, &req, err, sizeof(err))) {
+        return http_error(fd, s->enable_cors, 400, err);
+    }
+    /* I TOTALI NON BASTANO, E SONO FALSIFICABILI DALL'INPUT (astra 6).
+     *
+     * `tokenize_rendered_chat_vocab` riconosce `<think>` ovunque nel testo reso, anche dentro
+     * la domanda dell'utente: contare i token speciali non distingue un marcatore strutturale
+     * da uno scritto in un messaggio.  E un totale, comunque, non dice se il blocco aperto e'
+     * l'ULTIMO: `1 aperto, 0 chiusi` vale sia per un prefill corretto sia per un blocco
+     * lasciato aperto a meta' prompt.
+     *
+     * Quello che il conteggio non sa e il renderer si': dove comincia l'ultimo turno
+     * assistant.  I marcatori che decidono l'invariante sono quelli da li' in poi; tutto cio'
+     * che precede e' cronologia o testo dell'utente e non puo' falsificare la misura.  Resta
+     * ambiguo un `<think>` dentro il content del turno finale -- ed e' il caso che
+     * `request_validate_prefill` rifiuta: le due difese si completano.
+     *
+     * I totali restano, col nome che dice cosa sono: `..._anywhere`.  Chiamarli `think_open`
+     * era meta' della bugia. */
+    const char *testo = req.prompt_text ? req.prompt_text : "";
+    int ovunque_apre = 0, ovunque_chiude = 0;
+    for (const char *p = testo; (p = strstr(p, "<think>")) != NULL; p += 7) ovunque_apre++;
+    for (const char *p = testo; (p = strstr(p, "</think>")) != NULL; p += 8) ovunque_chiude++;
+
+    const char *marcatore_turno = "<|im_start|>assistant\n";
+    const char *coda = NULL;
+    for (const char *p = testo; (p = strstr(p, marcatore_turno)) != NULL;
+         p += strlen(marcatore_turno)) {
+        coda = p + strlen(marcatore_turno);
+    }
+    int coda_apre = 0, coda_chiude = 0;
+    long coda_da = -1;
+    if (coda) {
+        coda_da = (long)(coda - testo);
+        for (const char *p = coda; (p = strstr(p, "<think>")) != NULL; p += 7) coda_apre++;
+        for (const char *p = coda; (p = strstr(p, "</think>")) != NULL; p += 8) coda_chiude++;
+    }
+    /* L'INVARIANTE, in una riga: nell'ultimo turno assistant un blocco e' aperto e non
+     * chiuso.  E' cio' che distingue un prefill che il modello continua da un turno concluso
+     * che lo fa ricominciare. */
+    const bool prefill_aperto = coda && (coda_apre - coda_chiude) == 1;
+
+    buf b = {0};
+    buf_puts(&b, "{\"prompt\":");
+    json_escape(&b, testo);
+    buf_printf(&b, ",\"tokens\":%d", req.prompt.len);
+    buf_printf(&b, ",\"final_turn_at\":%ld", coda_da);
+    buf_printf(&b, ",\"final_turn_open\":%d,\"final_turn_close\":%d",
+               coda_apre, coda_chiude);
+    buf_printf(&b, ",\"prefill_left_open\":%s", prefill_aperto ? "true" : "false");
+    buf_printf(&b, ",\"think_open_anywhere\":%d,\"think_close_anywhere\":%d}",
+               ovunque_apre, ovunque_chiude);
+    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    request_free(&req);
+    return ok;
+}
+
 static bool send_models(server *s, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
@@ -14087,6 +14279,11 @@ static void *client_main(void *arg) {
 
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         send_models(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/apply-template")) {
+        send_applied_template(s, fd, hr.body);
         http_request_free(&hr);
         goto done;
     }
@@ -16894,6 +17091,83 @@ static void test_qwen35_history_keeps_think_block(void) {
  * (`cartridge_lex/backends/http_b.py::_genera`).  Chiudendolo e aprendone un
  * altro il modello ricomincia a pensare da capo -- misurato sul motore:
  * pensiero da 1763 a 3620 caratteri, risposta da 159 caratteri a ZERO. */
+/* I TRE CASI CHE ASTRA 6 HA TROVATO SCOPERTI (11/09).
+ *
+ * La prima riparazione copriva il `content` col marcatore e il pensiero spento presi
+ * separatamente; restavano scoperte le loro COMBINAZIONI, ed erano proprio quelle in cui il
+ * renderer doveva scegliere fra due volonta' del client. La politica adottata: una
+ * contraddizione si rifiuta al confine, il renderer resta totale. */
+static void test_qwen35_prefill_contraddittorio_si_rifiuta(void) {
+    char err[256];
+    chat_msgs msgs = {0};
+    chat_msg u = {0};
+    u.role = xstrdup("user");
+    u.content = xstrdup("domanda");
+    chat_msgs_push(&msgs, u);
+    chat_msg a = {0};
+    a.role = xstrdup("assistant");
+    a.content = xstrdup("<think>\nsto pensando");
+    chat_msgs_push(&msgs, a);
+
+    /* pensiero SPENTO + il content che apre il blocco: due volonta' opposte. */
+    err[0] = 0;
+    TEST_ASSERT(!request_validate_prefill(&msgs, DS4_THINK_NONE, SERVER_MODEL_SYNTAX_QWEN, err, sizeof err));
+    TEST_ASSERT(strstr(err, "thinking is disabled") != NULL);
+
+    /* pensiero ACCESO: la richiesta e' coerente e passa. */
+    err[0] = 0;
+    TEST_ASSERT(request_validate_prefill(&msgs, DS4_THINK_HIGH, SERVER_MODEL_SYNTAX_QWEN, err, sizeof err));
+
+    /* `reasoning` INSIEME al tag nel content: due pensieri concorrenti. Prima uno dei due
+     * veniva scartato in silenzio, che e' il difetto che questo progetto insegue da otto
+     * ricorrenze. */
+    msgs.v[1].reasoning = xstrdup("e anche qui");
+    err[0] = 0;
+    TEST_ASSERT(!request_validate_prefill(&msgs, DS4_THINK_HIGH, SERVER_MODEL_SYNTAX_QWEN, err, sizeof err));
+    TEST_ASSERT(strstr(err, "send only one") != NULL);
+
+    /* Senza tag nel content non c'e' contraddizione, comunque sia il pensiero. */
+    free(msgs.v[1].content);
+    msgs.v[1].content = xstrdup("risposta normale");
+    TEST_ASSERT(request_validate_prefill(&msgs, DS4_THINK_NONE, SERVER_MODEL_SYNTAX_QWEN, err, sizeof err));
+    TEST_ASSERT(request_validate_prefill(&msgs, DS4_THINK_HIGH, SERVER_MODEL_SYNTAX_QWEN, err, sizeof err));
+
+    /* E un ultimo turno UTENTE non e' un prefill: non si valida niente. */
+    chat_msg u2 = {0};
+    u2.role = xstrdup("user");
+    u2.content = xstrdup("<think>\nnel turno utente non conta");
+    chat_msgs_push(&msgs, u2);
+    TEST_ASSERT(request_validate_prefill(&msgs, DS4_THINK_NONE, SERVER_MODEL_SYNTAX_QWEN, err, sizeof err));
+    chat_msgs_free(&msgs);
+}
+
+/* `</think>` in testa al content e' una CHIUSURA SENZA APERTURA: emessa nuda produce un
+ * prompt malformato. Si antepone l'apertura, cosi' la forma torna valida e il contenuto del
+ * client resta intatto (astra 6). */
+static void test_qwen35_prefill_con_chiusura_in_testa(void) {
+    chat_msgs msgs = {0};
+    chat_msg u = {0};
+    u.role = xstrdup("user");
+    u.content = xstrdup("domanda");
+    chat_msgs_push(&msgs, u);
+    chat_msg a = {0};
+    a.role = xstrdup("assistant");
+    a.content = xstrdup("</think>\n\nla risposta");
+    chat_msgs_push(&msgs, a);
+
+    char *reso = render_qwen35_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(reso != NULL);
+    TEST_ASSERT(strstr(reso, "<|im_start|>assistant\n<think>\n</think>\n\nla risposta") != NULL);
+    {   /* un'apertura sola, una chiusura sola */
+        const char *ap = strstr(reso, "<think>");
+        TEST_ASSERT(ap != NULL && strstr(ap + 1, "<think>") == NULL);
+        const char *ch = strstr(reso, "</think>");
+        TEST_ASSERT(ch != NULL && strstr(ch + 1, "</think>") == NULL);
+    }
+    free(reso);
+    chat_msgs_free(&msgs);
+}
+
 static void test_qwen35_ultimo_assistant_e_un_prefill(void) {
     chat_msgs msgs = {0};
     chat_msg u = {0};
@@ -16927,6 +17201,50 @@ static void test_qwen35_ultimo_assistant_e_un_prefill(void) {
     TEST_ASSERT(strstr(reso, "<think>\nRagioniamo in italiano.\n</think>\n\nLa risposta comincia") != NULL);
     TEST_ASSERT(strstr(reso, "La risposta comincia<|im_end|>") == NULL);
     free(reso);
+
+    /* IL CONTENUTO CHE PORTA GIA' IL MARCATORE non ne vuole un secondo (29/08, riparato
+     * l'11/09). Prima usciva `<think>` + `</think>` + `<think>`: due blocchi, uno chiuso in
+     * mezzo, che il modello legge come «ho gia' pensato, adesso ricomincio». */
+    free(msgs.v[1].reasoning);
+    msgs.v[1].reasoning = NULL;
+    free(msgs.v[1].content);
+    msgs.v[1].content = xstrdup("<think>\nSto gia' pensando");
+    reso = render_qwen35_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(reso != NULL);
+    {
+        const char *primo = strstr(reso, "<think>");
+        TEST_ASSERT(primo != NULL);
+        TEST_ASSERT(strstr(primo + 1, "<think>") == NULL);   /* UNO SOLO */
+    }
+    TEST_ASSERT(strstr(reso, "</think>") == NULL);
+    TEST_ASSERT(strstr(reso, "<|im_start|>assistant\n<think>\nSto gia' pensando") != NULL);
+    free(reso);
+
+    /* A PENSIERO SPENTO il blocco si apre e si chiude vuoto: e' la forma che il modello ha
+     * visto in addestramento. Il ramo del prefill lo ignorava e apriva comunque `<think>`,
+     * cioe' invitava a pensare dove il client aveva chiesto di non farlo. */
+    free(msgs.v[1].content);
+    msgs.v[1].content = xstrdup("La risposta comincia");
+    reso = render_qwen35_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_NONE);
+    TEST_ASSERT(reso != NULL);
+    TEST_ASSERT(strstr(reso, "<think>\n\n</think>\n\nLa risposta comincia") != NULL);
+    TEST_ASSERT(strstr(reso, "La risposta comincia<|im_end|>") == NULL);
+    free(reso);
+
+    /* ...ma un `reasoning` ESPLICITO vince anche a pensiero spento: se il client lo manda,
+     * l'ha voluto, e il server non e' il posto dove indovinare che non lo voleva. */
+    msgs.v[1].reasoning = xstrdup("Ragiono lo stesso");
+    free(msgs.v[1].content);
+    msgs.v[1].content = xstrdup("");
+    reso = render_qwen35_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_NONE);
+    TEST_ASSERT(reso != NULL);
+    TEST_ASSERT(strstr(reso, "<think>\nRagiono lo stesso") != NULL);
+    TEST_ASSERT(strstr(reso, "</think>") == NULL);
+    free(reso);
+    free(msgs.v[1].reasoning);
+    msgs.v[1].reasoning = xstrdup("  Ragioniamo in italiano.  ");
+    free(msgs.v[1].content);
+    msgs.v[1].content = xstrdup("La risposta comincia");
 
     /* Un turno assistant NON ultimo resta un turno concluso. */
     chat_msg u2 = {0};
@@ -20293,6 +20611,8 @@ static void ds4_server_unit_tests_run(void) {
     test_parse_short_dsml_and_canonical_suffix();
     test_qwen35_history_keeps_think_block();
     test_qwen35_ultimo_assistant_e_un_prefill();
+    test_qwen35_prefill_contraddittorio_si_rifiuta();
+    test_qwen35_prefill_con_chiusura_in_testa();
     test_parse_glm_tool_call_message();
     test_dsml_parser_recovers_loose_nested_parameters();
     test_dsml_repair_produces_parseable_calls();

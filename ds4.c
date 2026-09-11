@@ -65598,6 +65598,14 @@ bool ds4_engine_is_glm_dsa(ds4_engine *e) {
 
 /* True for the qwen35 family, which the server needs in order to render
  * ChatML instead of the DeepSeek or GLM markers. */
+int ds4_engine_think_start_id(ds4_engine *e) {
+    return e ? e->vocab.think_start_id : -1;
+}
+
+int ds4_engine_think_end_id(ds4_engine *e) {
+    return e ? e->vocab.think_end_id : -1;
+}
+
 bool ds4_engine_is_qwen35(ds4_engine *e) {
     (void)e;
     return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35;
