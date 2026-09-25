@@ -231,6 +231,11 @@ static void print_steering(FILE *fp, const help_colors *c) {
     opt(fp, c, "--dir-steering-file FILE", "Load one f32 direction vector per layer.");
     opt(fp, c, "--dir-steering-ffn F", "Apply steering after FFN outputs. Default with file: 1");
     opt(fp, c, "--dir-steering-attn F", "Apply steering after attention outputs. Default: 0");
+    opt(fp, c, "--dir-steering-residual", "GLM 5.3: apply the FFN scale to the residual stream (Qwen, V4.1: always)");
+    opt(fp, c, "--probe-dirs DIR", "Internal report: concept directions (rifiuto/verita/sa .f32 + .stat)");
+    opt(fp, c, "--probe-report FILE", "Append the internal report (question, answer, verdict) to FILE");
+    opt(fp, c, "--probe-logit FILE", "Logit lens: per layer, top tokens favoured by the last token's state (Qwen)");
+    opt(fp, c, "--probe-vocab FILE", "Write id<TAB>token-text, to translate --probe-logit ids to words");
     fputc('\n', fp);
 }
 

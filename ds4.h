@@ -143,6 +143,7 @@ typedef struct {
     const char *expert_profile_path;
     float directional_steering_attn;
     float directional_steering_ffn;
+    bool directional_steering_residual;
     int power_percent;
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
@@ -407,6 +408,12 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);
 int ds4_session_power(ds4_session *s);
 int ds4_session_set_power(ds4_session *s, int power_percent);
+/* Internal-state report (ds4_probe.inc), enabled by --probe-dirs/--probe-report. The CLI calls
+ * ds4_probe_report() at the end of each answer with the question and answer text. */
+void ds4_probe_report_begin(void);   /* carica le direzioni prima di generare (idempotente) */
+bool ds4_probe_report_active(void);
+void ds4_probe_report(const char *question, const char *answer, int prompt_tokens, const char *label);
+
 float ds4_session_directional_steering_ffn(ds4_session *s);
 /* Change steering for future evaluation without rebuilding the existing KV
  * state. Live changes are currently limited to non-distributed sessions. */

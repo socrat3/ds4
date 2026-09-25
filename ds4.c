@@ -18456,6 +18456,18 @@ static void metal_graph_debug_dump_tensor(
     }
 }
 
+#include "ds4_probe.inc"
+
+/* Public forwarders so the CLI (a separate translation unit) can drive the internal report, whose
+ * state stays static in ds4.c. */
+bool ds4_probe_report_active(void) { return ds4_probe_report_on(); }
+void ds4_probe_report(const char *question, const char *answer, int prompt_tokens, const char *label) {
+    ds4_probe_report_finish(question, answer, prompt_tokens, label);
+}
+/* Carica le direzioni-concetto prima della generazione, usando la geometria del modello, cosi' il
+ * resoconto e' attivo gia' alla prima risposta (senza dipendere dalla prima cattura del prefill). */
+void ds4_probe_report_begin(void) { ds4_probe_report_init(DS4_N_LAYER, DS4_N_EMBD); }
+
 static void metal_graph_debug_dump_f16_tensor(
         const char       *name,
         ds4_gpu_tensor *t,
@@ -40201,6 +40213,12 @@ typedef struct {
     ds4_gpu_tensor *engram_q_norm[2], *engram_k_norm[2];
     ds41_prefill_row batch, *rows_view;
     ds41_prefill_row carry;
+    /* True only while the prompt is processed: speculative rows must not overwrite
+     * the dumps (same rule as the Qwen graph). */
+    bool dump_prompt_rows;
+    /* Directional steering on the HC residual after each layer (like Qwen): 40 x 5120 f32. */
+    ds4_gpu_tensor *steer_dirs;
+    float steer_scale;
     ds4_gpu_tensor *prefill_tokens;
 #define DS41_FIELD(name, count) ds4_gpu_tensor *name;
     DS41_SCRATCH(DS41_FIELD)
@@ -40221,6 +40239,8 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
     ds4_gpu_decode_graphs_invalidate();
 #endif
     ds4_gpu_tensor_free(g->tp_logits_half);
+    ds4_gpu_tensor_free(g->steer_dirs);
+    g->steer_dirs = NULL;
     for (uint32_t i = 0; g->rows_view && i < g->prefill_cap; i++) {
 #define DS41_ROW_FREE(name, count) ds4_gpu_tensor_free(g->rows_view[i].name);
         DS41_PREFILL_ROWS(DS41_ROW_FREE)
@@ -40833,6 +40853,25 @@ static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
                                      (uint64_t)DS4_N_VOCAB * sizeof(float));
 }
 
+/* Logit lens (V4.1): applica la coda di ds41_graph_logits (hc_weighted_sum + output_norm + testa) al
+ * residuo a token singolo dopo lo strato il, e scrive i top-k token favoriti. All'ultimo strato
+ * riproduce i logit reali del token successivo (verifica). Solo GPU singola (niente TP). g->x/norm/logits
+ * sono scratch ricalcolati dallo strato seguente; g->pre e g->residual sono quelli correnti. */
+static void ds41_probe_logit_lens(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                                  uint32_t il, uint32_t pos) {
+    if (g->tp_logits_half) return;
+    bool ok = ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
+              ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, w->output_norm) &&
+              ds41_output_projection(g, g->logits, m, w, g->norm, 1);
+    const bool was_active = ds4_gpu_commands_active() != 0;
+    if (!ok || ds4_gpu_synchronize() == 0) { (void)ds4_probe_resume(was_active); return; }
+    float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    if (ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0)
+        ds4_probe_logit_topk(logits, (int)DS4_N_VOCAB, pos, il, 12);
+    free(logits);
+    (void)ds4_probe_resume(was_active);
+}
+
 static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
                                        const ds4_layer_weights *l, uint32_t il) {
     if (ds41_engram_layer(il) && !ds41_image_at(g, g->pos)) {
@@ -41260,6 +41299,49 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
         ds41_sum_partial_batch(g, b->routed, il, count);
 }
 
+/* Load the --dir-steering-file direction. V4.1 applies it to the residual only, so the scale is the
+ * --dir-steering-ffn one; --dir-steering-attn has no hook here and is refused. */
+static bool ds41_graph_load_steering(ds41_gpu_graph *g, const char *path,
+                                     float attn_scale, float ffn_scale) {
+    if (!g) return false;
+    if (attn_scale != 0.0f) {
+        fprintf(stderr, "ds4: V4.1 directional steering acts on the residual: use --dir-steering-ffn\n");
+        return false;
+    }
+    if (ffn_scale == 0.0f) return true;
+    if (!path || !path[0]) {
+        fprintf(stderr, "ds4: directional steering needs --dir-steering-file\n");
+        return false;
+    }
+    const uint64_t n = (uint64_t)DS4_N_LAYER * DS4_N_EMBD;
+    float *dirs = xmalloc((size_t)n * sizeof(dirs[0]));
+    bool ok = read_f32_binary_file(path, dirs, n);
+    if (ok) {
+        g->steer_dirs = ds4_gpu_tensor_alloc(n * sizeof(dirs[0]));
+        ok = g->steer_dirs != NULL &&
+             ds4_gpu_tensor_write(g->steer_dirs, 0, dirs, n * sizeof(dirs[0])) != 0;
+    }
+    free(dirs);
+    if (!ok) {
+        fprintf(stderr, "ds4: failed to load directional steering vectors from %s\n", path);
+        return false;
+    }
+    g->steer_scale = ffn_scale;
+    fprintf(stderr, "ds4: V4.1 directional steering enabled: %s residual=%g\n", path, (double)ffn_scale);
+    return true;
+}
+
+/* y -= scale * d * dot(d, y) over every HC row of `rows` tokens, after layer il. V4.1's residual is
+ * always BF16 between layers: re-round after the projection so decode, prefill and batch reach the
+ * same state (re-rounding a BF16 value is idempotent). */
+static bool ds41_graph_apply_steering(const ds41_gpu_graph *g, ds4_gpu_tensor *residual,
+                                      uint32_t il, uint32_t rows) {
+    if (!g || !g->steer_dirs || g->steer_scale == 0.0f || !residual || rows == 0) return true;
+    return ds4_gpu_directional_steering_project_tensor(residual, g->steer_dirs, il, DS4_N_EMBD,
+                                                       rows * DS4_N_HC, g->steer_scale) != 0 &&
+        ds4_gpu_dsv41_quantize(residual, DS4_N_EMBD * DS4_N_HC, rows, DS4_V41_BF16);
+}
+
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
                                              const ds4_weights *w, int token, float *logits) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
@@ -41299,6 +41381,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             ok = ds41_graph_layer(g, m, l, il, token);
 #endif
         }
+        if (ok) ok = ds41_graph_apply_steering(g, g->residual, il, 1);
         /* TP gates already submit ordered, bounded command buffers. Drain
          * before overwriting the first Engram table's shared input at layer
          * 14, and before publishing the completed token to the CPU. */
@@ -41308,6 +41391,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         if (ok && g->imatrix)
             ok = imatrix_collect_tensor_batch(g->imatrix, g->norm, g->mid,
                                                g->selected, false, il, 1);
+        if (ok && g->dump_prompt_rows) ds4_probe_dump_last_hc_mean(g->residual, 1, DS4_N_HC, DS4_N_EMBD, "ffn_out", il, 0);
+        if (ok) ds4_probe_rows(g->residual, il, g->pos, 1, DS4_N_HC, DS4_N_EMBD);
+        if (ok && ds4_probe_logit_on()) ds41_probe_logit_lens(g, m, w, il, g->pos);
         if (!ok) fprintf(stderr, "ds4: V4.1 layer %u failed at position %u\n", il, g->pos);
         if (ok && drain && !layer_resident && il + 1u < DS4_N_LAYER)
             ok = ds4_gpu_begin_commands() != 0;
@@ -41924,6 +42010,11 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             }
             DS41_STAGE("hc expand");
 #undef DS41_STAGE
+            /* rows_view[t].residual are contiguous views of batch.residual: one launch. */
+            if (ok) ok = ds41_graph_apply_steering(g, batch_hc ? active.residual : g->batch.residual,
+                                                   il, count);
+            if (ok) ds4_probe_rows(batch_hc ? active.residual : g->batch.residual, il, start, count,
+                                   DS4_N_HC, DS4_N_EMBD);
             if (ok && wide && il + 1u < DS4_N_LAYER) {
                 ok = ds41_carry_copy(g, off, count, true);
             }
@@ -41952,6 +42043,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 DS41_PREFILL_ROWS(DS41_ACTIVE_FREE)
 #undef DS41_ACTIVE_FREE
             }
+            if (ok && g->dump_prompt_rows && count > 0 && off + count == total_count)
+                ds4_probe_dump_last_hc_mean(g->rows_view[count - 1u].residual, 1, DS4_N_HC, DS4_N_EMBD, "ffn_out", il, 0);
             if (batch_hc && il + 1u == DS4_N_LAYER && off + count == total_count) {
                 row.residual = g->rows_view[count - 1u].residual;
                 row.pre = g->rows_view[count - 1u].ffn_split;
@@ -42111,6 +42204,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
                 active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
             ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, rows, DS4_V41_BF16);
+        if (ok) ok = ds41_graph_apply_steering(graphs[0], active.residual, il, rows);
+        if (ok && g->dump_prompt_rows)
+            ds4_probe_dump_last_hc_mean(active.residual, rows, DS4_N_HC, DS4_N_EMBD, "ffn_out", il, 0);
+        /* Probe only when every row is one session's prompt (short prefill): rows from different
+         * server sessions have no comparable positions. */
+        if (ok && prefill_rows == rows)
+            ds4_probe_rows(active.residual, il, positions[0], rows, DS4_N_HC, DS4_N_EMBD);
         /* The second Engram upload reuses the first one's input storage. */
         if (ok && il == 13) ok = ds4_gpu_end_commands() && ds4_gpu_begin_commands();
     }
@@ -44967,6 +45067,7 @@ static uint64_t glm_graph_host_memory_bytes(void) {
 #ifndef DS4_NO_GPU
 typedef struct ds4_glm_gpu_graph {
     const ds4_weights *weights;
+    const ds4_model *probe_model;   /* logit lens: model per la testa di uscita */
     uint32_t ctx_size;
     uint32_t ctx_cap;
     uint32_t normal_layers;
@@ -45263,6 +45364,61 @@ static bool glm_graph_apply_directional_steering_ffn(
     return glm_graph_apply_directional_steering(
             g, x, il, rows,
             g ? g->directional_steering_ffn_scale : 0.0f);
+}
+
+/* --dir-steering-residual: the GLM FFN scale acts on the mHC residual after hc_expand (every HC
+ * row of each token), as Qwen already does, instead of the FFN output only. Measured 22/09/2026:
+ * FFN-output steering leaves GLM at 19/20 refusals because the residual keeps what earlier
+ * layers wrote. Set once per engine, like g_requested_threads. */
+static bool g_glm_steer_residual;
+
+static bool glm_graph_steering_residuo(void) {
+    return g_glm_steer_residual;
+}
+
+static bool glm_graph_forward_output_head(ds4_glm_gpu_graph *g, const ds4_model *model,
+                                          const ds4_weights *weights, const ds4_gpu_tensor *hidden,
+                                          float *logits_out);
+static ds4_gpu_tensor *glm_graph_tensor_row_view_strided(ds4_gpu_tensor *base, uint32_t row, uint64_t stride_values, uint64_t row_values);
+
+/* Logit lens (GLM 5.3): media HC del residuo, ultima riga, poi testa di uscita finale; top-k token
+ * favoriti dopo lo strato il. All'ultimo strato riproduce il token realmente generato (verifica). Rifa'
+ * esattamente la coda reale (hc_weighted_sum media + testa sull'ultima riga). g->hc_output e g->logits
+ * sono scratch della testa; glm_graph_forward_output_head fa begin/end/read. */
+static void glm_probe_logit_lens_rows(ds4_glm_gpu_graph *g, const ds4_model *model, const ds4_weights *weights,
+                                      ds4_gpu_tensor *hc, uint32_t il, uint32_t pos0, uint32_t n_tokens) {
+    if (!hc || n_tokens == 0) return;
+    const bool was_active = ds4_gpu_commands_active() != 0;   /* il loop degli strati tiene aperto il batch */
+    /* Ultima riga HC del residuo (layout [n_tokens][HC][E]); media HC in g->hc_output (1 riga). */
+    const uint64_t hc_row = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    ds4_gpu_tensor *hc_last = ds4_gpu_tensor_view(hc, (uint64_t)(n_tokens - 1u) * hc_row, hc_row);
+    bool ok = hc_last && (was_active || ds4_gpu_begin_commands()) &&
+              ds4_gpu_hc_weighted_sum_tensor(g->hc_output, hc_last, g->hc_mean_weights, DS4_N_EMBD, DS4_N_HC) != 0 &&
+              ds4_gpu_end_commands() != 0;
+    ds4_gpu_tensor *last = ok ? glm_graph_tensor_row_view_strided(g->hc_output, 0, DS4_N_EMBD, DS4_N_EMBD) : NULL;
+    if (last) {
+        static float *logits;
+        if (!logits) logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+        if (glm_graph_forward_output_head(g, model, weights, last, logits))   /* fa begin/end/read da se' */
+            ds4_probe_logit_topk(logits, (int)DS4_N_VOCAB, pos0 + n_tokens - 1u, il, 12);
+        ds4_gpu_tensor_free(last);
+    }
+    ds4_gpu_tensor_free(hc_last);
+    if (was_active && !ds4_gpu_commands_active()) (void)ds4_gpu_begin_commands();
+}
+
+/* After hc_expand: steering on the residual (when requested) and capture for the builder. */
+static bool glm_graph_steer_resid_after_expand(ds4_glm_gpu_graph *g, ds4_gpu_tensor *hc,
+                                               uint32_t il, uint32_t rows, uint32_t pos) {
+    bool ok = true;
+    if (glm_graph_steering_residuo())
+        ok = glm_graph_apply_directional_steering(g, hc, il, rows * DS4_N_HC,
+                                                  g ? g->directional_steering_ffn_scale : 0.0f);
+    if (ok) ds4_probe_dump_last_hc_mean(hc, rows, DS4_N_HC, DS4_N_EMBD, "hc_resid", il, pos);
+    if (ok) ds4_probe_rows(hc, il, pos, rows, DS4_N_HC, DS4_N_EMBD);
+    if (ok && ds4_probe_logit_on() && g->probe_model)
+        glm_probe_logit_lens_rows(g, g->probe_model, g->weights, hc, il, pos, rows);
+    return ok;
 }
 
 static bool imatrix_collect_glm_one(
@@ -47144,6 +47300,7 @@ static bool glm_graph_alloc_slice(
     memset(g, 0, sizeof(*g));
     g->placement = placement;
     g->weights = weights;
+    g->probe_model = model;   /* per la logit lens: model->map serve alla testa di uscita */
     g->ssd_streaming = ssd_streaming;
     g->ssd_streaming_cold = ssd_streaming_cold;
 
@@ -49437,7 +49594,8 @@ static bool glm53_graph_encode_ffn_tail_one(
                                       DS4_N_EMBD,
                                       il,
                                       pos);
-        ok = glm_graph_apply_directional_steering_ffn(g, g->next, il, 1);
+        if (!glm_graph_steering_residuo())
+            ok = glm_graph_apply_directional_steering_ffn(g, g->next, il, 1);
     }
     if (ok) {
         ok = ds4_gpu_hc_expand_tensor(g->hc_next,
@@ -49448,6 +49606,7 @@ static bool glm53_graph_encode_ffn_tail_one(
                                       DS4_N_EMBD,
                                       DS4_N_HC) != 0;
     }
+    if (ok) ok = glm_graph_steer_resid_after_expand(g, g->hc_next, il, 1, pos);
     return ok;
 }
 
@@ -53073,8 +53232,9 @@ glm53_batch_attention_done:
             metal_graph_debug_dump_tensor(
                     "ffn_out", next,
                     (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
-            ok = glm_graph_apply_directional_steering_ffn(
-                    g, next, il, n_tokens);
+            if (!glm_graph_steering_residuo())
+                ok = glm_graph_apply_directional_steering_ffn(
+                        g, next, il, n_tokens);
         }
         if (ok && g->glm53) {
             failed_stage = "FFN mHC expand";
@@ -53084,6 +53244,7 @@ glm53_batch_attention_done:
                                                 g->batch_hc_split,
                                                 DS4_N_EMBD,
                                                 DS4_N_HC) != 0;
+            if (ok) ok = glm_graph_steer_resid_after_expand(g, hc_next, il, n_tokens, pos0);
             if (ok) {
                 metal_graph_debug_dump_tensor(
                         "glm53_hc_after_ffn", hc_next,
@@ -54836,8 +54997,9 @@ glm53_indexed_attention_done:
             metal_graph_debug_dump_tensor(
                     "ffn_out", next,
                     (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
-            ok = glm_graph_apply_directional_steering_ffn(
-                    g, next, il, n_tokens);
+            if (!glm_graph_steering_residuo())
+                ok = glm_graph_apply_directional_steering_ffn(
+                        g, next, il, n_tokens);
         }
         if (ok && g->glm53) {
             ok = ds4_gpu_hc_expand_split_tensor(hc_next,
@@ -54846,6 +55008,7 @@ glm53_indexed_attention_done:
                                                 g->batch_hc_split,
                                                 DS4_N_EMBD,
                                                 DS4_N_HC) != 0;
+            if (ok) ok = glm_graph_steer_resid_after_expand(g, hc_next, il, n_tokens, pos0);
             if (ok) {
                 ds4_gpu_tensor *tmp = hc_cur;
                 hc_cur = hc_next;
@@ -58709,6 +58872,31 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
     return ds4_gpu_tensor_write(g->ple_emb, 0, row, (uint64_t)T * E * sizeof(float)) != 0;
 }
 
+/* Logit lens (Qwen): applica la testa di uscita finale (output_hc_norm + output) al residuo dell'ultima
+ * riga DOPO lo strato il, e scrive i top-k token favoriti da quello stato. All'ultimo strato riproduce i
+ * logit reali del token successivo (verifica di correttezza). Riusa g->mixed/g->logits (scratch della
+ * testa, ricalcolati a fine forward) e ripristina g->R; sincronizza per leggere, come le altre sonde. */
+static void qwen4_probe_logit_lens(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                                   uint32_t il, uint32_t pos0, uint32_t T) {
+    const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
+    ds4_gpu_tensor *last = ds4_gpu_tensor_view(g->R, (uint64_t)(T - 1u) * hc_dim * sizeof(float),
+                                               hc_dim * sizeof(float));
+    if (!last) return;
+    ds4_gpu_tensor *R_save = g->R;
+    g->R = last;
+    bool ok = qwen4_graph_hc_mix(g, m, w->output_hc_norm, w->output_hc_down, w->output_hc_up, NULL, 1);
+    g->R = R_save;
+    ds4_gpu_tensor_free(last);
+    if (ok) ok = qwen4_gemv(g->logits, m, w->output, g->mixed, 1);
+    const bool was_active = ds4_gpu_commands_active() != 0;
+    if (!ok || ds4_gpu_synchronize() == 0) { (void)ds4_probe_resume(was_active); return; }
+    float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    if (ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0)
+        ds4_probe_logit_topk(logits, (int)DS4_N_VOCAB, pos0 + T - 1u, il, 12);
+    free(logits);
+    (void)ds4_probe_resume(was_active);
+}
+
 /* Forward T tokens at g->pos..; logits (optional) receive the last token's
  * row, or all T rows with all_rows (T <= n_logit_rows).  T <= cap_tokens;
  * everything is causal by construction because the recurrent kernels walk
@@ -58815,6 +59003,8 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
                                            (uint64_t)T * DS4_N_EXPERT, il, pos0);
         if (ok && g->dump_prompt_rows) qwen4_graph_dump_last_ffn(g, il, T);
         if (ok) ok = qwen4_graph_apply_steering_ffn(g, il, T);
+        if (ok) ds4_probe_rows(g->R, il, pos0, T, DS4_N_HC, DS4_N_EMBD);
+        if (ok && ds4_probe_logit_on()) qwen4_probe_logit_lens(g, m, w, il, pos0, T);
         QWEN4_PROF(5);
         /* Submit this prefix while the host encodes the remaining layers.
          * Flush keeps the same ordered queue and retains pending buffers;
@@ -70534,6 +70724,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         e->directional_steering_attn_scale = opt->directional_steering_attn;
         e->directional_steering_ffn_scale = opt->directional_steering_ffn;
     }
+    g_glm_steer_residual = opt->directional_steering_residual;
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     e->placement_ctx_hint = opt->placement_ctx_hint;
     e->placement_session_count_hint = opt->placement_session_count_hint;
@@ -70608,11 +70799,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
             !load_slice && !opt->dspark && !opt->glm_mtp &&
             !opt->first_token_test && !opt->metal_graph_test &&
             (!opt->mtp_path || !opt->mtp_path[0]) &&
-            (!opt->directional_steering_file || !opt->directional_steering_file[0]) &&
             e->power_percent == 100 && opt->context_size <= 1048576;
         if (!supported) {
             fprintf(stderr, "ds4: V4.1 requires Metal or single-GPU CUDA per rank (optional network tensor parallelism); "
-                            "DSpark, steering and legacy diagnostics are not supported (maximum context 1048576)\n");
+                            "DSpark and legacy diagnostics are not supported (maximum context 1048576)\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -72837,6 +73027,13 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             free(s);
             return 1;
         }
+        if (!ds41_graph_load_steering(&s->ds41_graph, e->directional_steering_file,
+                                      e->directional_steering_attn_scale,
+                                      e->directional_steering_ffn_scale)) {
+            ds41_graph_free(&s->ds41_graph);
+            free(s);
+            return 1;
+        }
         s->ds41_graph_ready = true;
         s->ds41_graph.quality = e->quality;
         if (e->tp.active) {
@@ -73368,6 +73565,12 @@ float ds4_session_directional_steering_ffn(ds4_session *s) {
     if (!s || !s->engine) return 0.0f;
 #ifndef DS4_NO_GPU
     if (!ds4_session_is_cpu(s)) {
+#ifdef DS4_HAS_QWEN4_GPU
+        if (s->qwen4_graph_ready) return s->qwen4_graph.steer_ffn_scale;
+#endif
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+        if (s->ds41_graph_ready) return s->ds41_graph.steer_scale;
+#endif
         return ds4_session_is_glm(s) ?
             s->glm_graph.directional_steering_ffn_scale :
             s->graph.directional_steering_ffn_scale;
@@ -73395,6 +73598,11 @@ int ds4_session_set_directional_steering_ffn(ds4_session *s, float scale) {
             loaded = s->qwen4_graph.steer_dirs != NULL;
         } else
 #endif
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+        if (s->ds41_graph_ready) {
+            loaded = s->ds41_graph.steer_dirs != NULL;
+        } else
+#endif
         if (ds4_session_is_glm(s)) {
             const int tier = glm_graph_directional_steering_tier(
                     &s->glm_graph, s->glm_graph.layer_start);
@@ -73418,6 +73626,11 @@ int ds4_session_set_directional_steering_ffn(ds4_session *s, float scale) {
         if (s->qwen4_graph_ready) {
             s->qwen4_graph.steer_ffn_scale = scale;
             s->glm_mtp_have = 0;
+        } else
+#endif
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+        if (s->ds41_graph_ready) {
+            s->ds41_graph.steer_scale = scale;
         } else
 #endif
         if (ds4_session_is_glm(s)) {
@@ -75408,6 +75621,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         }
         bool pending_logits = false, interrupted = false, decoder_pending = false;
         ds41_encoder_residency encoder = {0};
+        /* Like Qwen: the dumps apply only to the prompt rows. */
+        g->dump_prompt_rows = true;
         ds41_encoder_acquire(g, &e->model, &e->weights,
             (uint32_t)(prompt->len - s->checkpoint.len), &encoder, s->cancel, s->cancel_ud);
         for (int i = s->checkpoint.len; i < prompt->len;) {
@@ -75441,6 +75656,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                     s->progress, s->progress_ud, prompt->len, s->cancel, s->cancel_ud)) :
                 ds41_graph_step(g, &e->model, &e->weights, prompt->v[i], NULL);
             if (!ok) {
+                g->dump_prompt_rows = false;
                 ds41_encoder_release(g, &e->model, &encoder);
                 s->checkpoint_valid = false;
                 if (ds4_session_cancelled(s)) {
@@ -75459,6 +75675,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             if (s->progress)
                 s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
         }
+        g->dump_prompt_rows = false;
         ds41_encoder_release(g, &e->model, &encoder);
         if (decoder_pending) {
             s->checkpoint_valid = false;
@@ -78081,7 +78298,7 @@ static bool glm53_graph_encode_native_session_batch(
                                                 false,
                                                 NULL);
         stage = "FFN steering";
-        if (ok) ok = glm_graph_apply_directional_steering_ffn(
+        if (ok && !glm_graph_steering_residuo()) ok = glm_graph_apply_directional_steering_ffn(
                 g, next, il, rows);
         stage = "FFN mHC expand";
         if (ok) ok = ds4_gpu_hc_expand_split_tensor(hc_next,
@@ -78090,6 +78307,12 @@ static bool glm53_graph_encode_native_session_batch(
                                                      g->batch_hc_split,
                                                      DS4_N_EMBD,
                                                      DS4_N_HC) != 0;
+        /* Session batch in decode: same residual steering as the single-token path, with no dump
+         * (the rows belong to different sessions, not to one prompt). */
+        stage = "residual steering";
+        if (ok && glm_graph_steering_residuo())
+            ok = glm_graph_apply_directional_steering(g, hc_next, il, rows * DS4_N_HC,
+                                                      g->directional_steering_ffn_scale);
         if (ok) {
             ds4_gpu_tensor *tmp = hc_cur;
             hc_cur = hc_next;

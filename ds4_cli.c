@@ -3,6 +3,7 @@
 #include "ds4_gpu_args.h"
 #include "ds4_tp.h"
 #include "ds4_help.h"
+#include "ds4_probe.h"
 #include "ds4_prompt_prefix.h"
 #include "linenoise.h"
 
@@ -483,6 +484,7 @@ static void generation_done(void *ud) {
 }
 
 static void token_printer_write_text(token_printer *p, const char *text, size_t len) {
+    ds4_probe_tokens_write(text, len);
     if (p->format_thinking) {
         token_printer_process(p, text, len, false);
     } else if (len) {
@@ -536,12 +538,34 @@ static void cli_apply_model_sampling_defaults(
     if (!gen->min_p_set) gen->min_p = 0.0f;
 }
 
-static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
+/* Growable buffer for the answer text, so the internal report can quote it. */
+typedef struct { char *s; size_t len, cap; } cli_answer;
+static void cli_answer_add(cli_answer *a, const char *t, size_t n) {
+    if (!t || n == 0) return;
+    if (!a->s || a->len + n + 1 > a->cap) {
+        const size_t cap = (a->len + n + 1) * 2;
+        char *p = realloc(a->s, cap);
+        if (!p) return;   /* buffer e cap invariati: nessuna scrittura oltre il vecchio limite */
+        a->s = p;
+        a->cap = cap;
+    }
+    memcpy(a->s + a->len, t, n);
+    a->len += n;
+    a->s[a->len] = 0;
+}
+
+/* force_base: run this pass with steering off (the base half of the A/B comparison). label overrides
+ * the report heading. */
+static int run_sampled_generation_ex(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt,
+                                     bool force_base, const char *label) {
     ds4_session *session = NULL;
+    cli_answer answer = {0};
+    const bool report_on = ds4_probe_report_active();
     if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
         fprintf(stderr, "ds4: sampled CLI generation requires a session backend\n");
         return 1;
     }
+    if (force_base) (void)ds4_session_set_directional_steering_ffn(session, 0.0f);
     if (cli_wait_distributed_route(cfg, session) != 0) {
         ds4_session_free(session);
         return 1;
@@ -634,6 +658,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             size_t piece_len = 0;
             char *piece = ds4_token_text(engine, token, &piece_len);
             token_printer_write_text(&printer, piece, piece_len);
+            if (report_on) cli_answer_add(&answer, piece, piece_len);
             fflush(stdout);
             free(piece);
             generated++;
@@ -661,6 +686,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             size_t piece_len = 0;
             char *piece = ds4_token_text(engine, toks[j], &piece_len);
             token_printer_write_text(&printer, piece, piece_len);
+            if (report_on) cli_answer_add(&answer, piece, piece_len);
             fflush(stdout);
             free(piece);
             generated++;
@@ -672,6 +698,13 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     generation_done(&printer);
     if (cli_interrupt_requested()) cli_interrupt_clear();
 
+    if (report_on) {
+        const char *lbl = label ? label :
+            (ds4_session_directional_steering_ffn(session) != 0.0f ? "con steering" : "senza steering");
+        ds4_probe_report(cfg->gen.prompt, answer.s ? answer.s : "", prompt->len, lbl);
+    }
+    free(answer.s);
+
     const double prefill_s = t_prefill1 - t_prefill0;
     const double decode_s = t_decode1 - t_decode0;
     ds4_log(stderr,
@@ -682,6 +715,19 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
     ds4_session_free(session);
     return 0;
+}
+
+static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
+    const int rc = run_sampled_generation_ex(engine, cfg, prompt, false, NULL);
+    /* A/B comparison: when the report is on and steering is configured, replay the same prompt on a
+     * fresh session with steering off, so the .md holds both halves for the same question. */
+    if (rc == 0 && ds4_probe_report_active() &&
+        cfg->engine.directional_steering_file && cfg->engine.directional_steering_ffn != 0.0f) {
+        fprintf(stderr, "\n--- confronto: seconda risposta senza steering ---\n");
+        fputc('\n', stdout);
+        return run_sampled_generation_ex(engine, cfg, prompt, true, "senza steering");
+    }
+    return rc;
 }
 
 static bool json_utf8_valid(const char *s, size_t n) {
@@ -1182,9 +1228,36 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
     return 0;
 }
 
+/* Per la logit lens: mappa id<TAB>testo-token (\\ \n \t \r protetti), letta da `sonde logit` per
+ * tradurre gli id dei top-k in parole. Scritta una volta se DS4_PROBE_VOCAB e' impostato. */
+static void cli_dump_vocab(ds4_engine *engine) {
+    const char *path = getenv("DS4_PROBE_VOCAB");
+    if (!path || !path[0]) return;
+    FILE *fp = fopen(path, "w");
+    if (!fp) { fprintf(stderr, "ds4: cannot open DS4_PROBE_VOCAB %s\n", path); return; }
+    const int n = ds4_engine_vocab_size(engine);
+    for (int id = 0; id < n; id++) {
+        size_t len = 0;
+        char *t = ds4_token_text(engine, id, &len);
+        fprintf(fp, "%d\t", id);
+        for (size_t i = 0; t && i < len; i++) {
+            const char c = t[i];
+            if (c == '\\') fputs("\\\\", fp);
+            else if (c == '\n') fputs("\\n", fp);
+            else if (c == '\t') fputs("\\t", fp);
+            else if (c == '\r') fputs("\\r", fp);
+            else fputc(c, fp);
+        }
+        fputc('\n', fp);
+        free(t);
+    }
+    fclose(fp);
+}
+
 static int run_generation(ds4_engine *engine, const cli_config *cfg) {
     ds4_tokens prompt = {0};
     build_prompt(engine, &cfg->gen, &prompt);
+    cli_dump_vocab(engine);
 
     int rc = 0;
     if (cfg->gen.metal_graph_test) {
@@ -1237,9 +1310,21 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
                     ds4_backend_name(cfg->engine.backend));
         }
     } else {
+        ds4_probe_prompt_tokens(prompt.len);
+        ds4_probe_tokens_open();
+        for (int i = 0; ds4_probe_tokens_active() && i < prompt.len; i++) {
+            size_t len = 0;
+            char *text = ds4_token_text(engine, prompt.v[i], &len);
+            ds4_probe_tokens_write(text, len);
+            free(text);
+        }
+        /* Il resoconto interno e il confronto A/B vivono nel percorso "session": caricalo e forzalo
+         * quando e' richiesto, altrimenti con --temp 0 si prenderebbe l'argmax diretto senza resoconto. */
+        ds4_probe_report_begin();
         if (cfg->engine.distributed.role == DS4_DISTRIBUTED_COORDINATOR ||
             cfg->engine.tp.role == DS4_TP_LEADER ||
             getenv("DS4_CLI_FORCE_SESSION") != NULL ||
+            ds4_probe_report_active() ||
             cfg->gen.temperature > 0.0f ||
             ds4_engine_mtp_draft_tokens(engine) > 1) {
             /* TP leaders always drive the session path: the sync/eval
@@ -1577,6 +1662,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
     ds4_session_set_progress(chat->session, NULL, NULL);
     ds4_session_set_display_progress(chat->session, NULL, NULL);
     const double t_prefill1 = cli_now_sec();
+    ds4_probe_prompt_tokens(ds4_session_pos(chat->session));
 
     token_printer printer = {
         .engine = engine,
@@ -2112,6 +2198,16 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dir-steering-attn")) {
             c.engine.directional_steering_attn = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
             directional_steering_scale_set = true;
+        } else if (!strcmp(arg, "--dir-steering-residual")) {
+            c.engine.directional_steering_residual = true;
+        } else if (!strcmp(arg, "--probe-dirs")) {
+            setenv("DS4_PROBE_DIRS", need_arg(&i, argc, argv, arg), 1);
+        } else if (!strcmp(arg, "--probe-report")) {
+            setenv("DS4_PROBE_REPORT", need_arg(&i, argc, argv, arg), 1);
+        } else if (!strcmp(arg, "--probe-logit")) {
+            setenv("DS4_PROBE_LOGIT", need_arg(&i, argc, argv, arg), 1);
+        } else if (!strcmp(arg, "--probe-vocab")) {
+            setenv("DS4_PROBE_VOCAB", need_arg(&i, argc, argv, arg), 1);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--backend")) {
