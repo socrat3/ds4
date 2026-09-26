@@ -63,7 +63,14 @@ static void *fake_comfy(void *arg) {
         if (strncmp(req, "STOP", 4) == 0) { close(fd); break; }
 
         if (strstr(req, "POST /prompt")) {
-            const char *b = "{\"prompt_id\":\"testpid\",\"number\":1,\"node_errors\":{}}";
+            const char *b = strstr(req, "MiniMaxH3ImageToVideo")
+                ? "{\"prompt_id\":\"vidpid\",\"number\":1,\"node_errors\":{}}"
+                : "{\"prompt_id\":\"testpid\",\"number\":1,\"node_errors\":{}}";
+            send_response(fd, "200 OK", "application/json", b, strlen(b));
+        } else if (strstr(req, "GET /history/vidpid")) {
+            const char *b = "{\"vidpid\":{\"outputs\":{\"92\":{\"images\":[{\"filename\":\"ds4_clip.mp4\","
+                            "\"subfolder\":\"ds4\",\"type\":\"output\"}]}},"
+                            "\"status\":{\"status_str\":\"success\",\"completed\":true}}}";
             send_response(fd, "200 OK", "application/json", b, strlen(b));
         } else if (strstr(req, "GET /history/testpid")) {
             const char *b = "{\"testpid\":{\"outputs\":{\"8\":{\"images\":[{\"filename\":\"ds4_out_001_.png\","
@@ -71,9 +78,8 @@ static void *fake_comfy(void *arg) {
                             "\"status\":{\"status_str\":\"success\",\"completed\":true}}}";
             send_response(fd, "200 OK", "application/json", b, strlen(b));
         } else if (strstr(req, "GET /view")) {
-            VERIFICA(strstr(req, "filename=ds4_out_001_.png") != NULL, "view chiede il file giusto");
             VERIFICA(strstr(req, "subfolder=ds4") != NULL, "view passa il subfolder");
-            send_response(fd, "200 OK", "image/png", PNG_MAGIC, sizeof(PNG_MAGIC));
+            send_response(fd, "200 OK", "application/octet-stream", PNG_MAGIC, sizeof(PNG_MAGIC));
         } else if (strstr(req, "POST /upload/image")) {
             st->uploads++;
             VERIFICA(strstr(req, "multipart/form-data") != NULL, "upload e' multipart");
@@ -232,6 +238,31 @@ int main(void) {
     ok = ds4_media_image(m, &wreq, &wres, err, sizeof(err));
     VERIFICA(!ok && strstr(err, "32"), "rifiuta dimensioni non multiple di 32");
     ds4_media_result_free(&wres);
+
+    /* video H3: serve un riferimento, produce un .mp4 */
+    char refv[1024];
+    snprintf(refv, sizeof(refv), "%s/ref.png", dir);
+    FILE *vf = fopen(refv, "wb");
+    fwrite(PNG_MAGIC, 1, 8, vf);
+    fclose(vf);
+    ds4_media_video_req vreq = {.prompt = "un gatto che si muove", .ref = refv, .seconds = 5};
+    ds4_media_result vres = {0};
+    ok = ds4_media_video(m, &vreq, &vres, err, sizeof(err));
+    VERIFICA(ok, "genera video: %s", err);
+    if (ok) {
+        VERIFICA(vres.n_files == 1, "un file video prodotto (%d)", vres.n_files);
+        VERIFICA(strstr(vres.files[0], ".mp4") != NULL, "il file e' un .mp4 (%s)",
+                 vres.n_files ? vres.files[0] : "-");
+        VERIFICA(strcmp(vres.prompt_id, "vidpid") == 0, "prompt_id del video");
+    }
+    ds4_media_result_free(&vres);
+
+    /* video senza riferimento -> rifiutato */
+    ds4_media_video_req vbad = {.prompt = "x"};
+    ds4_media_result vbadr = {0};
+    ok = ds4_media_video(m, &vbad, &vbadr, err, sizeof(err));
+    VERIFICA(!ok && strstr(err, "riferimento"), "video senza --rif rifiutato");
+    ds4_media_result_free(&vbadr);
 
     /* server OpenAI: avvia ds4_media_serve in un thread e chiama /v1/images/generations */
     test_serve(m, st.port);

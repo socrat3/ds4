@@ -98,6 +98,48 @@ static int cmd_img(int argc, char **argv) {
     return ok ? 0 : 1;
 }
 
+static int cmd_video(int argc, char **argv) {
+    ds4_media *m = build(argc, argv);
+    ds4_media_video_req req = {0};
+    req.seed = atol(opt(argc, argv, "--seed", "-1"));
+    req.steps = atoi(opt(argc, argv, "--passi", "0"));
+    req.seconds = atof(opt(argc, argv, "--sec", "0"));
+    req.ref = opt(argc, argv, "--rif", NULL);
+    const char *size = opt(argc, argv, "--size", NULL);
+    if (size && !ds4_media_parse_size(size, &req.width, &req.height)) {
+        fprintf(stderr, "ds4-media: size non valida: %s\n", size);
+        ds4_media_free(m);
+        return 2;
+    }
+    const char *prompt = NULL;
+    for (int i = argc - 1; i >= 1; i--) {
+        if (argv[i][0] == '-') break;
+        if (i > 1 && argv[i - 1][0] == '-') { prompt = argv[i]; break; }
+        prompt = argv[i];
+        break;
+    }
+    if (!prompt || !req.ref) {
+        fprintf(stderr, "uso: ds4-media video --rif primo_fotogramma.png [--sec S] [--size WxH] \"descrizione\"\n");
+        ds4_media_free(m);
+        return 2;
+    }
+    req.prompt = prompt;
+    fprintf(stderr, "genero il video con MiniMax H3 (occupa la GPU, dura minuti): \"%.50s\"%s\n",
+            prompt, strlen(prompt) > 50 ? "..." : "");
+    ds4_media_result res = {0};
+    char err[256] = {0};
+    bool ok = ds4_media_video(m, &req, &res, err, sizeof(err));
+    if (ok) {
+        printf("%dx%d seed=%ld in %ld ms\n", res.width, res.height, res.seed, res.ms);
+        for (int i = 0; i < res.n_files; i++) printf("  %s\n", res.files[i]);
+    } else {
+        fprintf(stderr, "ds4-media: %s\n", err);
+    }
+    ds4_media_result_free(&res);
+    ds4_media_free(m);
+    return ok ? 0 : 1;
+}
+
 static int cmd_simple(int argc, char **argv, bool health) {
     ds4_media *m = build(argc, argv);
     char err[256] = {0};
@@ -110,12 +152,13 @@ static int cmd_simple(int argc, char **argv, bool health) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "uso: ds4-media {serve|img|health|free} [opzioni]\n");
+        fprintf(stderr, "uso: ds4-media {serve|img|video|health|free} [opzioni]\n");
         return 2;
     }
     const char *c = argv[1];
     if (!strcmp(c, "serve")) return cmd_serve(argc - 1, argv + 1);
     if (!strcmp(c, "img")) return cmd_img(argc - 1, argv + 1);
+    if (!strcmp(c, "video")) return cmd_video(argc - 1, argv + 1);
     if (!strcmp(c, "health")) return cmd_simple(argc - 1, argv + 1, true);
     if (!strcmp(c, "free")) return cmd_simple(argc - 1, argv + 1, false);
     fprintf(stderr, "ds4-media: comando sconosciuto '%s'\n", c);

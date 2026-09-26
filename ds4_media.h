@@ -70,9 +70,25 @@ void ds4_media_result_free(ds4_media_result *r);
 ds4_media *ds4_media_create(const ds4_media_config *cfg);
 void ds4_media_free(ds4_media *m);
 
+/* Video MiniMax H3 (image->video): dall'immagine di riferimento (primo fotogramma)
+ * genera una clip breve con audio del modello. ref e' obbligatorio. */
+typedef struct {
+    const char *prompt;
+    const char *ref;           /* file immagine: primo fotogramma (obbligatorio) */
+    double seconds;            /* 0 = 5 s; max ~15 (griglia 17k+5) */
+    int width, height;         /* 0,0 = 864x480 (0,4 MP 16:9) */
+    int steps;                 /* 0 = 20 */
+    long seed;                 /* <0 = casuale */
+} ds4_media_video_req;
+
 /* Genera una o piu' immagini. Su true, *out e' riempito (da liberare con
  * ds4_media_result_free); su false, err spiega causa e rimedio. */
 bool ds4_media_image(ds4_media *m, const ds4_media_image_req *req,
+                     ds4_media_result *out, char *err, size_t err_len);
+
+/* Genera un video H3. Occupa la GPU per intero (~110 GiB) e dura minuti: da usare a
+ * GPU libera. Su true out->files[0] e' l'MP4. */
+bool ds4_media_video(ds4_media *m, const ds4_media_video_req *req,
                      ds4_media_result *out, char *err, size_t err_len);
 
 /* ComfyUI risponde? Riempie model_names con "sì"/"no" per Qwen-Image se richiesto. */

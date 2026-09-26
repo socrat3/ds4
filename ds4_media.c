@@ -468,6 +468,138 @@ bool ds4_media_image(ds4_media *m, const ds4_media_image_req *req,
     return true;
 }
 
+#include "ds4_media_h3.inc"
+
+/* Sostituisce tutte le occorrenze di `needle` con `repl` (malloc'd). */
+static char *media_replace(const char *s, const char *needle, const char *repl) {
+    media_buf b = {0};
+    size_t nl = strlen(needle);
+    const char *p = s;
+    for (;;) {
+        const char *hit = strstr(p, needle);
+        if (!hit) { media_buf_puts(&b, p); break; }
+        media_buf_append(&b, p, (size_t)(hit - p));
+        media_buf_puts(&b, repl);
+        p = hit + nl;
+    }
+    return media_buf_take(&b);
+}
+
+/* Contenuto di una stringa JSON, senza le virgolette esterne (per i segnaposto tra ""). */
+static char *media_json_inner(const char *s) {
+    char *q = media_json_quote(s);   /* "...." */
+    size_t n = strlen(q);
+    if (n >= 2) { memmove(q, q + 1, n - 2); q[n - 2] = '\0'; }
+    return q;
+}
+
+/* Fotogrammi dal tempo, sulla griglia 17k+5 di H3 (124~5s, 362~15s). */
+static int media_h3_length(double seconds) {
+    if (seconds <= 0) seconds = 5.0;
+    long base = (long)(seconds * 24.0 + 0.5);
+    long k = (base - 5 + 8) / 17;   /* arrotonda */
+    long frames = 5 + k * 17;
+    if (frames < 5) frames = 5;
+    if (frames > 362) frames = 362;
+    return (int)frames;
+}
+
+bool ds4_media_video(ds4_media *m, const ds4_media_video_req *req,
+                     ds4_media_result *out, char *err, size_t err_len) {
+    memset(out, 0, sizeof(*out));
+    if (!req->prompt || !req->prompt[0]) { media_set_err(err, err_len, "prompt vuoto"); return false; }
+    if (!req->ref || !req->ref[0]) { media_set_err(err, err_len, "serve un'immagine di riferimento (--rif): H3 parte dal primo fotogramma"); return false; }
+    int width = req->width > 0 ? req->width : 864;
+    int height = req->height > 0 ? req->height : 480;
+    if (width % 32 || height % 32) { media_set_err(err, err_len, "dimensioni multiple di 32"); return false; }
+    int steps = req->steps > 0 ? req->steps : 20;
+    int length = media_h3_length(req->seconds);
+    long seed = req->seed >= 0 ? req->seed : (long)(time(NULL) ^ (getpid() << 8)) & 0x7fffffff;
+
+    /* Gate: H3 occupa la GPU per intero (~110 GiB). */
+    if (!m->no_gate) {
+        long avail = media_avail_kib(m);
+        long need = (110L + 6) * 1024 * 1024;
+        if (avail > 0 && need > avail) {
+            media_set_err(err, err_len, "H3 vuole ~110 GiB, liberi %ld GiB: spegni ogni modello prima del video",
+                          avail / (1024 * 1024));
+            return false;
+        }
+    }
+
+    char *refname = media_upload_ref(m, req->ref, err, err_len);
+    if (!refname) return false;
+
+    char stem[96];
+    time_t now = time(NULL);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    strftime(stem, sizeof(stem), "vid-%Y%m%d-%H%M%S", &tmv);
+    char prefix[160];
+    snprintf(prefix, sizeof(prefix), "ds4/%s-%ld", stem, seed);
+
+    char *qprompt = media_json_inner(req->prompt);
+    char *qimage = media_json_inner(refname);
+    free(refname);
+    char nums[8][24];
+    snprintf(nums[0], 24, "%d", width);
+    snprintf(nums[1], 24, "%d", height);
+    snprintf(nums[2], 24, "%d", length);
+    snprintf(nums[3], 24, "%ld", seed);
+    snprintf(nums[4], 24, "%d", steps);
+    char *g = media_xstrdup(DS4_MEDIA_H3_TEMPLATE);
+    const char *subs[][2] = {{"__PROMPT__", qprompt}, {"__IMAGE__", qimage}, {"__PREFIX__", prefix},
+                             {"__WIDTH__", nums[0]}, {"__HEIGHT__", nums[1]}, {"__LENGTH__", nums[2]},
+                             {"__SEED__", nums[3]}, {"__STEPS__", nums[4]}};
+    for (int i = 0; i < 8; i++) { char *n = media_replace(g, subs[i][0], subs[i][1]); free(g); g = n; }
+    free(qprompt);
+    free(qimage);
+
+    media_buf body = {0};
+    media_buf_puts(&body, "{\"prompt\":");
+    media_buf_puts(&body, g);
+    media_buf_puts(&body, ",\"client_id\":\"ds4-media\"}");
+    free(g);
+    char *graph = media_buf_take(&body);
+
+    media_log(m, "ds4: media video %dx%d %d fotogrammi (~%.1f s), attendo H3 (minuti)...",
+              width, height, length, length / 24.0);
+    long t0 = (long)time(NULL);
+    media_http_response resp = {0};
+    bool ok = media_http_post(m->host, m->port, "/prompt", "application/json",
+                              graph, strlen(graph), 30000, &resp, err, err_len);
+    free(graph);
+    if (!ok) return false;
+    if (resp.status != 200) {
+        char *ne = media_json_str(resp.body, "type");
+        media_set_err(err, err_len, "ComfyUI ha rifiutato il grafo H3 (%d)%s%s", resp.status,
+                      ne ? ": " : "", ne ? ne : "");
+        free(ne);
+        media_http_response_free(&resp);
+        return false;
+    }
+    char *pid = media_json_str(resp.body, "prompt_id");
+    media_http_response_free(&resp);
+    if (!pid) { media_set_err(err, err_len, "ComfyUI non ha dato un prompt_id"); return false; }
+    snprintf(out->prompt_id, sizeof(out->prompt_id), "%s", pid);
+
+    char *history = NULL;
+    ok = media_wait(m, pid, &history, 1800000, err, err_len);   /* fino a 30 min */
+    free(pid);
+    if (!ok) return false;
+    ok = media_fetch_outputs(m, history, stem, out, err, err_len);
+    free(history);
+    if (!ok) { ds4_media_result_free(out); return false; }
+    out->width = width;
+    out->height = height;
+    out->seed = seed;
+    out->ms = ((long)time(NULL) - t0) * 1000;
+    m->last_job = time(NULL);
+    media_log(m, "ds4: media video %s %ld ms -> %s", out->prompt_id, out->ms,
+              out->n_files ? out->files[0] : "(niente)");
+    return true;
+}
+
 bool ds4_media_health(ds4_media *m, char *err, size_t err_len) {
     media_http_response resp = {0};
     if (!media_http_get(m->host, m->port, "/system_stats", 5000, &resp, err, err_len)) return false;
