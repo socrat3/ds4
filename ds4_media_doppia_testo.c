@@ -69,7 +69,7 @@ int doppia_frasi_da_csv(const char *csv, double min_s, double max_s, doppia_fras
         bool parola = end0 != c0 && end1 != c1 && wl && !(w[wl - 1] == ']' && strchr(w, '['));
         if (parola && s1 >= s0) {
             if (da >= 0 && s1 - da > max_s) { frase_chiudi(out, &n, &cap, da, a, &t); da = -1; }
-            if (da < 0) da = s0;
+            if (da < 0) da = s0 < 0 ? 0 : s0;   /* un tempo negativo non ha posto nella traccia */
             if (w[0] != ' ' && t.len) media_buf_append(&t, " ", 1);
             media_buf_puts(&t, w);
             a = s1;

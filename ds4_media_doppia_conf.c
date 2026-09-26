@@ -9,6 +9,7 @@
 #include "ds4_media_http.h"
 
 #include <errno.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -117,8 +118,18 @@ static bool doppia_set_ex(doppia_conf *c, const char *chiave, const char *valore
     char *v = media_buf_take(&b);
     char *end;
     bool ok = !strchr(v, '\n') && !strchr(v, '\r');
-    if (ok && d->tipo == 'i' && v[0]) { errno = 0; strtol(v, &end, 10); ok = !*end && !errno; }
-    if (ok && d->tipo == 'd' && v[0]) { strtod(v, &end); ok = !*end && end != v; }
+    double num = 0;
+    if (ok && d->tipo == 'i' && v[0]) { errno = 0; num = (double)strtol(v, &end, 10); ok = !*end && !errno; }
+    if (ok && d->tipo == 'd' && v[0]) { num = strtod(v, &end); ok = !*end && end != v && isfinite(num); }
+    /* limiti che il resto del codice da' per scontati: fuori, l'errore arriverebbe ore
+     * dopo da ffmpeg o da ComfyUI */
+    static const struct { const char *k; double lo, hi; } LIM[] = {
+        {"da", 0, 1e6}, {"a", 0, 1e6}, {"caratteri_secondo", 1, 40}, {"risoluzione", 64, 2752},
+        {"passi", 1, 60}, {"seme", -1, 2147483647.0}, {"volume", -70, -1}, {"comfy_porta", 1, 65535}};
+    for (size_t l = 0; ok && v[0] && (d->tipo == 'i' || d->tipo == 'd') && l < sizeof(LIM) / sizeof(LIM[0]); l++)
+        if (!strcmp(LIM[l].k, chiave)) ok = num >= LIM[l].lo && num <= LIM[l].hi;
+    if (ok && !strcmp(chiave, "risoluzione") && v[0]) ok = (long)num % 32 == 0;
+    if (ok && (d->tipo == 'i' || d->tipo == 'd') && !v[0]) ok = false;   /* un numero vuoto non ha senso */
     if (ok && esistenza && d->tipo == 'f' && v[0]) ok = access(v, R_OK) == 0;
     if (ok && esistenza && d->tipo == 'x' && v[0]) ok = doppia_eseguibile(v);
     if (ok && d->scelte) {
@@ -163,6 +174,12 @@ bool doppia_verifica(const doppia_conf *c, char *err, size_t err_len) {
                           !v[0] ? "manca," : d->tipo == 'x' ? "eseguibile non trovato:" : "file non leggibile:", v, d->chiave);
             return false;
         }
+    }
+    char h[256];
+    int port;
+    if (!doppia_url(doppia_get(c, "traduttore_url"), h, sizeof(h), &port)) {
+        media_set_err(err, err_len, "Traduttore: URL non valido \"%s\" (serve http://host:porta)", doppia_get(c, "traduttore_url"));
+        return false;
     }
     if (!url && access(doppia_get(c, "sorgente"), R_OK) != 0) {
         media_set_err(err, err_len, "video non leggibile: %s", doppia_get(c, "sorgente"));

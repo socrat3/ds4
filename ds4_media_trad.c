@@ -43,7 +43,12 @@ int doppia_json_array(const char *testo, char ***out) {
         v[n++] = s;
         p = end;
         while (p < z && isspace((unsigned char)*p)) p++;
-        if (p < z && *p == ',') { p++; continue; }
+        if (p < z && *p == ',') {
+            p++;
+            while (p < z && isspace((unsigned char)*p)) p++;
+            if (p == z) goto fail;   /* ["a",] non e' JSON */
+            continue;
+        }
         if (p != z) goto fail;
     }
     *out = v;
@@ -59,8 +64,10 @@ static void trad_free_arr(char **v, int n) {
     free(v);
 }
 
-/* "http://host:porta" -> host, porta (80 senza porta). */
-static bool trad_url(const char *url, char *host, size_t hn, int *port) {
+/* "http://host:porta" (o "host:porta") -> host, porta (80 senza porta). https non e'
+ * supportato: il client HTTP del modulo parla solo in chiaro, e il traduttore e' locale. */
+bool doppia_url(const char *url, char *host, size_t hn, int *port) {
+    if (!strncmp(url, "https://", 8)) return false;
     const char *p = strncmp(url, "http://", 7) ? url : url + 7;
     size_t n = strcspn(p, ":/");
     if (!n || n >= hn) return false;
@@ -70,12 +77,18 @@ static bool trad_url(const char *url, char *host, size_t hn, int *port) {
     return *port > 0 && *port < 65536;
 }
 
-/* Una richiesta di chat: il contenuto della risposta (malloc'd) o NULL con err. */
-static char *trad_chiedi(doppia_conf *c, const char *sistema, const char *utente, char *err, size_t err_len) {
+/* Una richiesta di chat: il contenuto della risposta (malloc'd) o NULL con err. Con
+ * NULL, *fatale dice se e' il traduttore a non funzionare (rete, HTTP diverso da 200,
+ * risposta senza testo, timeout, annullamento): allora insistere non serve, e mettere
+ * l'inglese al posto dell'italiano sarebbe peggio che fermarsi. */
+static char *trad_chiedi(doppia_conf *c, const char *sistema, const char *utente, bool *fatale,
+                         char *err, size_t err_len) {
     char host[256];
     int port;
-    if (!trad_url(doppia_get(c, "traduttore_url"), host, sizeof(host), &port)) {
-        media_set_err(err, err_len, "URL del traduttore non valido: %s", doppia_get(c, "traduttore_url"));
+    *fatale = true;
+    if (!doppia_url(doppia_get(c, "traduttore_url"), host, sizeof(host), &port)) {
+        media_set_err(err, err_len, "URL del traduttore non valido (serve http://host:porta): %s",
+                      doppia_get(c, "traduttore_url"));
         return NULL;
     }
     char *qm = media_json_quote(doppia_get(c, "traduttore_modello"));
@@ -97,6 +110,7 @@ static char *trad_chiedi(doppia_conf *c, const char *sistema, const char *utente
     if (!ok) return NULL;
     char *content = r.status == 200 ? media_json_str(r.body, "content") : NULL;
     if (!content) media_set_err(err, err_len, "il traduttore ha risposto %d senza testo", r.status);
+    else *fatale = false;
     media_http_response_free(&r);
     return content;
 }
@@ -120,9 +134,10 @@ static char *trad_sistema(doppia_conf *c) {
     return media_buf_take(&b);
 }
 
-/* Traduce [da, da+n): true se tutte hanno ricevuto la loro traduzione. */
-static bool trad_blocco(doppia_conf *c, doppia_frase *f, int da, int n, const char *sistema,
-                        char *err, size_t err_len) {
+/* Traduce [da, da+n): 1 se tutte hanno ricevuto la loro traduzione, 0 se il modello
+ * ha risposto male tre volte, -1 se il traduttore non funziona (err dice perche'). */
+static int trad_blocco(doppia_conf *c, doppia_frase *f, int da, int n, const char *sistema,
+                       char *err, size_t err_len) {
     double cps = doppia_get_double(c, "caratteri_secondo");
     if (cps <= 0) cps = 14;
     media_buf u = {0};
@@ -150,10 +165,11 @@ static bool trad_blocco(doppia_conf *c, doppia_frase *f, int da, int n, const ch
         media_buf_puts(&u, line);
         free(qe);
     }
-    bool ok = false;
+    int ok = 0;
     for (int t = 0; t < TRAD_TENTATIVI && !ok; t++) {
-        char *risp = trad_chiedi(c, sistema, u.ptr, err, err_len);
-        if (!risp) { if (!strcmp(err, "annullato")) break; continue; }
+        bool fatale;
+        char *risp = trad_chiedi(c, sistema, u.ptr, &fatale, err, err_len);
+        if (!risp) { if (fatale) { ok = -1; break; } continue; }
         char **v;
         int k = doppia_json_array(risp, &v);
         free(risp);
@@ -164,27 +180,31 @@ static bool trad_blocco(doppia_conf *c, doppia_frase *f, int da, int n, const ch
         }
         for (int i = 0; i < n; i++) { free(f[da + i].it); f[da + i].it = v[i]; }
         free(v);
-        ok = true;
+        ok = 1;
     }
     free(u.ptr);
     return ok;
 }
 
-/* Un blocco che non passa si spezza: 20 -> 5 -> 1. Una frase che non passa resta in
- * inglese, segnalata, e il lavoro va avanti. */
-static void trad_ostinato(doppia_conf *c, doppia_frase *f, int da, int n, const char *sistema,
+/* Un blocco che il modello traduce male si spezza: 20 -> 5 -> 1. Una frase che il
+ * modello non riesce proprio a tradurre resta in inglese, segnalata, e il lavoro va
+ * avanti. Se invece e' il traduttore a non rispondere ci si ferma (false). */
+static bool trad_ostinato(doppia_conf *c, doppia_frase *f, int da, int n, const char *sistema,
                           int *rimaste, char *err, size_t err_len) {
-    if (trad_blocco(c, f, da, n, sistema, err, err_len) || !strcmp(err, "annullato")) return;
+    int r = trad_blocco(c, f, da, n, sistema, err, err_len);
+    if (r != 0) return r > 0;
     if (n == 1) {
         fprintf(stderr, "ds4-media: frase %d resta in inglese (%s)\n", da + 1, err);
         free(f[da].it);
         f[da].it = media_xstrdup(f[da].en);
         (*rimaste)++;
-        return;
+        return true;
     }
     int passo = n > 5 ? 5 : 1;
     for (int i = da; i < da + n; i += passo)
-        trad_ostinato(c, f, i, i + passo > da + n ? da + n - i : passo, sistema, rimaste, err, err_len);
+        if (!trad_ostinato(c, f, i, i + passo > da + n ? da + n - i : passo, sistema, rimaste, err, err_len))
+            return false;
+    return true;
 }
 
 /* Cerca `pat` in `s` come parole intere (senza lettere subito prima e subito dopo;
@@ -237,9 +257,17 @@ bool doppia_traduci(doppia_conf *c, doppia_frase *f, int n, const char *salva_in
         for (int j = i; j < i + k; j++) manca += !f[j].it || !f[j].it[0];
         if (!manca) continue;   /* gia' tradotto in un giro precedente */
         if (cancel && cancel(privdata)) { free(sistema); media_set_err(err, err_len, "annullato"); return false; }
-        trad_ostinato(c, f, i, k, sistema, &rimaste, err, err_len);
-        if (!strcmp(err, "annullato")) { free(sistema); return false; }
-        doppia_frasi_save(salva_in, f, n);
+        bool ok = trad_ostinato(c, f, i, k, sistema, &rimaste, err, err_len);
+        doppia_frasi_save(salva_in, f, n);   /* anche a meta': il fatto non si rifa' */
+        if (!ok) {
+            free(sistema);
+            if (strcmp(err, "annullato")) {
+                char e[400];
+                snprintf(e, sizeof(e), "traduttore: %s (le frasi mancanti restano da tradurre: rilancia con --riprendi)", err);
+                media_set_err(err, err_len, "%s", e);
+            }
+            return false;
+        }
         fprintf(stderr, "  traduzione %d/%d\n", i + k, n);
     }
     free(sistema);
@@ -248,6 +276,7 @@ bool doppia_traduci(doppia_conf *c, doppia_frase *f, int n, const char *salva_in
     char segno[1100];
     snprintf(segno, sizeof(segno), "%s.terza", salva_in);
     if (access(segno, F_OK) != 0) {
+        bool segno_ok = true;
         int idx[64], m = 0;
         for (int i = 0; i < n && m < 64; i++) if (f[i].it && doppia_parla_di_se(f[i].en, f[i].it)) idx[m++] = i;
         if (m) {
@@ -261,15 +290,17 @@ bool doppia_traduci(doppia_conf *c, doppia_frase *f, int n, const char *salva_in
                 media_buf_puts(&u, ",\"italiano\":"); media_buf_puts(&u, qi); media_buf_puts(&u, "}\n");
                 free(qe); free(qi);
             }
+            bool fatale;
             char *risp = trad_chiedi(c,
                 "Riscrivi ogni frase italiana in modo che, dove chi parla dice chi e' o che lavoro fa "
                 "(il suo nome, la professione, dove lavora o insegna, cosa ha fondato o creato), "
                 "diventi una terza persona riferita all'autore del video. Usa l'originale per capire il "
                 "senso. Lascia identiche le frasi che non parlano dell'identita' di chi parla. Rispondi "
                 "SOLO con un array JSON delle frasi italiane, nello stesso ordine.",
-                u.ptr, err, err_len);
+                u.ptr, &fatale, err, err_len);
             free(u.ptr);
             char **v = NULL;
+            if (!risp && fatale) segno_ok = false;
             int k = risp ? doppia_json_array(risp, &v) : -1;
             free(risp);
             if (k == m) {
@@ -281,7 +312,7 @@ bool doppia_traduci(doppia_conf *c, doppia_frase *f, int n, const char *salva_in
             }
             fprintf(stderr, "  terza persona: %d frasi %s\n", m, k == m ? "riviste" : "lasciate come erano");
         }
-        FILE *s = fopen(segno, "w");
+        FILE *s = segno_ok ? fopen(segno, "w") : NULL;   /* traduttore giu': si riprova alla ripresa */
         if (s) fclose(s);
     }
     if (rimaste) fprintf(stderr, "ds4-media: %d frasi rimaste in inglese\n", rimaste);

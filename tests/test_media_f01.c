@@ -5,6 +5,7 @@
 #include "../ds4_media.h"
 #include "../ds4_media_int.h"
 #include "media_fake.h"
+#include "../ds4_media_doppia.h"
 
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -270,6 +271,31 @@ static void t_cli(void) {
     VERIFICA(run_cli("img --boh gatto") == 2, "B10 opzione sconosciuta rifiutata");
     VERIFICA(run_cli("img -- --non-e-un-flag") == 0 && strstr(F.graph, "--non-e-un-flag"), "B10 -- separa la descrizione");
     VERIFICA(run_cli("health extra") == 2, "B10 argomento inatteso rifiutato");
+
+    /* aiuto: esce 0, non parla con ComfyUI; dopo "--" --help e' una parola */
+    int prima = F.prompts;
+    VERIFICA(run_cli("img --help") == 0 && run_cli("video -h") == 0 && run_cli("doppia --help") == 0,
+             "aiuto dei comandi con --help e -h");
+    VERIFICA(F.prompts == prima, "l'aiuto non manda lavori a ComfyUI");
+    VERIFICA(system("./ds4-media help >/dev/null 2>&1") == 0 && WEXITSTATUS(system("./ds4-media help boh >/dev/null 2>&1")) == 2,
+             "help generale 0, argomento sconosciuto 2");
+    VERIFICA(WEXITSTATUS(system("./ds4-media boh >/dev/null 2>&1")) == 2, "comando sconosciuto: 2");
+    VERIFICA(WEXITSTATUS(system("./ds4-media >/dev/null 2>&1")) == 2, "senza comando: aiuto su stderr e 2");
+    /* ogni voce di doppia.conf compare nell'aiuto di doppia */
+    FILE *h = popen("./ds4-media help doppia", "r");
+    char buf[65536] = {0};
+    size_t hn = h ? fread(buf, 1, sizeof(buf) - 1, h) : 0;
+    if (h) pclose(h);
+    buf[hn] = '\0';
+    int mancano = 0;
+    for (int i = 0; i < DOPPIA_N_VOCI; i++) {
+        char k[80];
+        snprintf(k, sizeof(k), "    %s ", DOPPIA_VOCI[i].chiave);
+        mancano += !strstr(buf, k);
+    }
+    VERIFICA(hn > 0 && mancano == 0, "tutte le %d voci di doppia nell'aiuto (%d mancano)", DOPPIA_N_VOCI, mancano);
+    prima = F.prompts;
+    VERIFICA(run_cli("img -- --help") == 0 && F.prompts == prima + 1, "dopo -- \"--help\" e' descrizione (al finto ComfyUI)");
 }
 
 /* ── serve ────────────────────────────────────────────────────────────────── */

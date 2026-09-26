@@ -82,6 +82,9 @@ int doppia_piano_pezzi(double durata, doppia_pezzo **out);
  * programma va nel log del lavoro. Con cancel il programma si ferma (SIGTERM al suo
  * gruppo) e si torna 130. Restituisce lo stato di uscita, -1 se non parte. */
 int doppia_esegui(const char *const *argv, const char *log, doppia_cancel_fn cancel, void *privdata);
+/* Gruppo di processi del programma esterno in corso, 0 se nessuno (per i segnali). */
+#include <sys/types.h>
+extern volatile pid_t doppia_figlio;
 /* Uscita (stdout+stderr, malloc'd) di un programma, NULL se non parte. */
 char *doppia_cattura(const char *const *argv);
 /* Cartella del lavoro, doppia.conf e titoli.txt: prima si caricano il doppia.conf del
@@ -91,9 +94,13 @@ bool doppia_prepara(doppia_conf *c, const char *const *override, char *err, size
 const char *doppia_titoli_path(const doppia_conf *c);
 /* Durata in secondi (da ffmpeg -i), dimensioni se w/h non NULL; <0 se illeggibile. */
 double doppia_durata(const char *ffmpeg, const char *file, int *w, int *h);
-/* testa.mp4: i pezzi uniti (dal secondo senza il primo fotogramma), tagliati a durata,
- * con la voce normalizzata. */
-bool doppia_monta_testa(const doppia_conf *c, char **pezzi, int n, double durata,
+/* ffmpeg che scrive su out.tmp.mp4 e rinomina solo se riuscito (argv con due posti
+ * liberi dopo argc: il file temporaneo e il NULL). */
+bool doppia_ffmpeg(const char **argv, int argc, const char *out, const char *log,
+                   doppia_cancel_fn cancel, void *pd, char *err, size_t err_len);
+/* testa.mp4: i pezzi uniti (dal secondo senza il primo fotogramma), ciascuno portato ai
+ * suoi fotogrammi previsti, tagliati a durata, con la voce normalizzata. */
+bool doppia_monta_testa(const doppia_conf *c, char **pezzi, const int *fotogrammi, int n, double durata,
                         const char *voce, const char *out, const char *log,
                         doppia_cancel_fn cancel, void *pd, char *err, size_t err_len);
 /* scena.mp4: la testa nel cerchio (cx,cy,r) del video originale, o a tutto schermo
@@ -110,6 +117,9 @@ bool doppia_titolo(const doppia_conf *c, const char *aiuti, const char *in, cons
  * salvando dopo ogni blocco. */
 bool doppia_traduci(doppia_conf *c, doppia_frase *f, int n, const char *salva_in,
                     doppia_cancel_fn cancel, void *privdata, char *err, size_t err_len);
+/* "http://host:porta" -> host e porta (80 senza porta); false per https o forme non
+ * valide. La usano la traduzione e il driver, cosi' leggono l'URL nello stesso modo. */
+bool doppia_url(const char *url, char *host, size_t hn, int *port);
 /* Chi parla dice chi e' o che lavoro fa (nome, professione, dove insegna...)? Dal
  * testo originale e dalla traduzione; queste frasi passano in terza persona. */
 bool doppia_parla_di_se(const char *en, const char *it);

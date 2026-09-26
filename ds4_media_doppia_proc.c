@@ -17,6 +17,14 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
+
+/* Il gruppo del programma esterno in corso (0 = nessuno): il gestore dei segnali della
+ * CLI lo ferma prima di uscire, cosi' un secondo Ctrl+C non lascia orfani che tengono
+ * la GPU. */
+volatile pid_t doppia_figlio = 0;
 
 static void proc_dormi_ms(long ms) {
     struct timespec ts = {.tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L};
@@ -43,6 +51,11 @@ static int proc_run(const char *const *argv, const char *log, media_buf *out,
     pid_t p = fork();
     if (p == 0) {
         setpgid(0, 0);
+#ifdef __linux__
+        /* se ds4-media muore (kill -9, terminale chiuso) il figlio riceve SIGTERM */
+        prctl(PR_SET_PDEATHSIG, SIGTERM);
+        if (getppid() == 1) _exit(1);   /* il padre e' gia' morto prima del prctl */
+#endif
         int dn = open("/dev/null", O_RDWR);
         if (dn >= 0) dup2(dn, 0);
         int o = out ? pfd[1] : lfd >= 0 ? lfd : dn;
@@ -52,6 +65,7 @@ static int proc_run(const char *const *argv, const char *log, media_buf *out,
     }
     if (p < 0) { if (lfd >= 0) close(lfd); if (out) { close(pfd[0]); close(pfd[1]); } return -1; }
     setpgid(p, p);   /* anche dal padre: nessuna finestra in cui il figlio e' nel nostro gruppo */
+    doppia_figlio = p;
     if (out) {
         close(pfd[1]);
         fcntl(pfd[0], F_SETFL, O_NONBLOCK);
@@ -69,6 +83,7 @@ static int proc_run(const char *const *argv, const char *log, media_buf *out,
             int i;
             for (i = 0; i < 100 && waitpid(p, &st, WNOHANG) != p; i++) proc_dormi_ms(100);
             if (i == 100) { kill(-p, SIGKILL); waitpid(p, &st, 0); }
+            doppia_figlio = 0;
             if (lfd >= 0) close(lfd);
             if (out) close(pfd[0]);
             return 130;
@@ -81,6 +96,7 @@ static int proc_run(const char *const *argv, const char *log, media_buf *out,
         while ((n = read(pfd[0], b, sizeof(b))) > 0) if (out->len < (1 << 20)) media_buf_append(out, b, (size_t)n);
         close(pfd[0]);
     }
+    doppia_figlio = 0;
     if (lfd >= 0) close(lfd);
     return WIFEXITED(st) ? WEXITSTATUS(st) : 128 + (WIFSIGNALED(st) ? WTERMSIG(st) : 0);
 }
@@ -121,7 +137,7 @@ double doppia_durata(const char *ffmpeg, const char *file, int *w, int *h) {
 
 /* Esegue ffmpeg scrivendo su out.tmp e rinomina solo se e' riuscito: un file finale
  * esiste solo se e' completo, e la ripresa del lavoro si fida della sua presenza. */
-static bool proc_ffmpeg(const char **argv, int argc, const char *out, const char *log,
+bool doppia_ffmpeg(const char **argv, int argc, const char *out, const char *log,
                         doppia_cancel_fn cancel, void *pd, char *err, size_t err_len) {
     char tmp[1200];
     snprintf(tmp, sizeof(tmp), "%s.tmp.mp4", out);
@@ -136,7 +152,7 @@ static bool proc_ffmpeg(const char **argv, int argc, const char *out, const char
     return true;
 }
 
-bool doppia_monta_testa(const doppia_conf *c, char **pezzi, int n, double durata,
+bool doppia_monta_testa(const doppia_conf *c, char **pezzi, const int *fotogrammi, int n, double durata,
                         const char *voce, const char *out, const char *log,
                         doppia_cancel_fn cancel, void *pd, char *err, size_t err_len) {
     const char **argv = media_xmalloc(sizeof(char *) * (size_t)(2 * n + 40));
@@ -148,9 +164,13 @@ bool doppia_monta_testa(const doppia_conf *c, char **pezzi, int n, double durata
     media_buf f = {0};
     char t[256];
     for (int i = 0; i < n; i++) {
-        /* dal secondo pezzo il primo fotogramma e' la foto, uguale all'ultimo di prima */
-        snprintf(t, sizeof(t), "[%d:v]%sfps=24,format=yuv420p,setsar=1[v%d];", i,
-                 i ? "trim=start_frame=1,setpts=PTS-STARTPTS," : "", i);
+        /* Dal secondo pezzo il primo fotogramma e' la foto, uguale all'ultimo di prima.
+         * Ogni pezzo e' portato ai suoi fotogrammi previsti (tpad + trim): se H3 ne desse
+         * uno in piu' o in meno, lo scarto non si sommerebbe sui pezzi dopo, e il labiale
+         * resta allineato alla voce fino alla fine. */
+        snprintf(t, sizeof(t), "[%d:v]fps=24,format=yuv420p,setsar=1,trim=start_frame=%d,setpts=PTS-STARTPTS,"
+                 "tpad=stop_mode=clone:stop=48,trim=end_frame=%d,setpts=PTS-STARTPTS[v%d];",
+                 i, i ? 1 : 0, fotogrammi[i] - (i ? 1 : 0), i);
         media_buf_puts(&f, t);
     }
     for (int i = 0; i < n; i++) { snprintf(t, sizeof(t), "[v%d]", i); media_buf_puts(&f, t); }
@@ -162,7 +182,7 @@ bool doppia_monta_testa(const doppia_conf *c, char **pezzi, int n, double durata
                            "medium", "-crf", "17", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
                            "-f", "mp4"};
     for (size_t i = 0; i < sizeof(resto) / sizeof(resto[0]); i++) argv[k++] = resto[i];
-    bool ok = proc_ffmpeg(argv, k, out, log, cancel, pd, err, err_len);
+    bool ok = doppia_ffmpeg(argv, k, out, log, cancel, pd, err, err_len);
     free(f.ptr);
     free(argv);
     return ok;
@@ -174,15 +194,26 @@ bool doppia_monta_scena(const doppia_conf *c, const char *sorgente, const char *
     int W = 0, H = 0;
     double dur = doppia_durata(doppia_get(c, "ffmpeg"), sorgente, &W, &H);
     if (dur <= 0 || W <= 0) { media_set_err(err, err_len, "non leggo durata e dimensioni di %s", sorgente); return false; }
-    char f[1024], ds[32];
+    char f[1024], ds[32], maschera[1300];
+    snprintf(maschera, sizeof(maschera), "%s.maschera.png", out);
     if (r > 0) {
-        /* cerchio con 2 px di bordo sfumato: 255 dentro, 0 fuori, rampa sul raggio */
+        /* La maschera del cerchio (2 px di bordo sfumato: 255 dentro, 0 fuori) si calcola
+         * una volta in un PNG: geq valutato su ogni fotogramma di un video lungo era la
+         * parte piu' lenta del montaggio. */
+        char mf[256], ms[64];
+        snprintf(ms, sizeof(ms), "color=c=black:s=%dx%d:d=1", 2 * r, 2 * r);
+        snprintf(mf, sizeof(mf), "format=gray,geq=lum='255*clip((%d-hypot(X-%d+0.5,Y-%d+0.5))/2,0,1)'", r, r, r);
+        const char *mv[] = {doppia_get(c, "ffmpeg"), "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                            "-i", ms, "-vf", mf, "-frames:v", "1", maschera, NULL};
+        if (doppia_esegui(mv, log, cancel, pd) != 0) {
+            media_set_err(err, err_len, "non preparo la maschera del cerchio (vedi il log)");
+            return false;
+        }
         snprintf(f, sizeof(f),
-                 "[1:v]scale=%d:%d,format=yuva420p,geq=lum='p(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':"
-                 "a='255*clip((%d-hypot(X-%d+0.5,Y-%d+0.5))/2,0,1)'[t];"
+                 "[1:v]scale=%d:%d,format=yuva420p[t0];[3:v]format=gray,scale=%d:%d[m];[t0][m]alphamerge[t];"
                  "[0:v][t]overlay=%d:%d:eof_action=repeat[v];"
                  "[2:a]loudnorm=I=%.1f:TP=-1.5:LRA=11,aresample=48000,apad[a]",
-                 2 * r, 2 * r, r, r, r, cx - r, cy - r, doppia_get_double(c, "volume"));
+                 2 * r, 2 * r, 2 * r, 2 * r, cx - r, cy - r, doppia_get_double(c, "volume"));
     } else {
         snprintf(f, sizeof(f),
                  "[1:v]scale=%d:%d:force_original_aspect_ratio=decrease:flags=lanczos,"
@@ -191,13 +222,22 @@ bool doppia_monta_scena(const doppia_conf *c, const char *sorgente, const char *
                  W, H, W, H, doppia_get_double(c, "volume"));
     }
     snprintf(ds, sizeof(ds), "%.3f", dur);
-    const char *argv[40] = {doppia_get(c, "ffmpeg"), "-hide_banner", "-loglevel", "error", "-y",
-                            "-i", sorgente, "-i", testa, "-i", voce, "-filter_complex", f,
-                            "-map", "[v]", "-map", "[a]", "-t", ds, "-c:v", "libx264", "-preset", "medium",
-                            "-crf", "18", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-f", "mp4"};
-    int k = 0;
-    while (argv[k]) k++;
-    return proc_ffmpeg(argv, k, out, log, cancel, pd, err, err_len);
+    /* la maschera e' un quarto ingresso solo con il cerchio (-loop vale solo per le immagini) */
+    const char *argv[48] = {doppia_get(c, "ffmpeg"), "-hide_banner", "-loglevel", "error", "-y",
+                            "-i", sorgente, "-i", testa, "-i", voce};
+    int k = 11;
+    if (r > 0) {
+        const char *m4[] = {"-loop", "1", "-framerate", "24", "-i", maschera};
+        for (int i = 0; i < 6; i++) argv[k++] = m4[i];
+    }
+    const char *resto[] = {"-filter_complex", f, "-map", "[v]", "-map", "[a]", "-t", ds, "-c:v", "libx264",
+                           "-preset", "medium", "-crf", "18", "-c:a", "aac", "-b:a", "192k",
+                           "-movflags", "+faststart", "-f", "mp4"};
+    for (size_t i = 0; i < sizeof(resto) / sizeof(resto[0]); i++) argv[k++] = resto[i];
+    argv[k] = NULL;
+    bool ok = doppia_ffmpeg(argv, k, out, log, cancel, pd, err, err_len);
+    unlink(maschera);
+    return ok;
 }
 
 /* mostra: e durata: di titoli.txt (le righe da disegnare le legge lo script). */
@@ -229,7 +269,7 @@ bool doppia_titolo(const doppia_conf *c, const char *aiuti, const char *in, cons
     if (!mostra || !doppia_is(c, "titolo", "si")) {
         const char *argv[] = {doppia_get(c, "ffmpeg"), "-hide_banner", "-loglevel", "error", "-y", "-i", in,
                               "-c", "copy", "-movflags", "+faststart", "-f", "mp4", NULL, NULL};
-        return proc_ffmpeg(argv, 13, out, log, cancel, pd, err, err_len);
+        return doppia_ffmpeg(argv, 13, out, log, cancel, pd, err, err_len);
     }
     int W = 0, H = 0;
     if (doppia_durata(doppia_get(c, "ffmpeg"), in, &W, &H) <= 0 || W <= 0) {
@@ -259,7 +299,7 @@ bool doppia_titolo(const doppia_conf *c, const char *aiuti, const char *in, cons
                           "-f", "mp4", NULL, NULL};
     int k = 0;
     while (argv[k]) k++;
-    bool ok = proc_ffmpeg(argv, k, out, log, cancel, pd, err, err_len);
+    bool ok = doppia_ffmpeg(argv, k, out, log, cancel, pd, err, err_len);
     unlink(png);
     return ok;
 }

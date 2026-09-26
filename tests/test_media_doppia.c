@@ -47,6 +47,9 @@ static void t_frasi(void) {
     doppia_frasi_free(f, n);
     VERIFICA(doppia_frasi_da_csv("", 3, 9, &f) == 0, "csv vuoto: nessuna frase");
     free(f);
+    n = doppia_frasi_da_csv("start,end,text\n-500,400,\" Hi.\"\n", 0, 9, &f);
+    VERIFICA(n == 1 && f[0].da == 0, "L8 tempo negativo portato a 0 (%d, %.2f)", n, n ? f[0].da : -1);
+    doppia_frasi_free(f, n);
 }
 
 static void t_piano(void) {
@@ -83,6 +86,7 @@ static void t_json(void) {
     VERIFICA(doppia_json_array("[\"a\" \"b\"]", &v) == -1, "manca la virgola: rifiutato");
     VERIFICA(doppia_json_array("[\"aperta]", &v) == -1, "stringa non chiusa: rifiutata");
     VERIFICA(doppia_json_array("niente", &v) == -1, "nessun array");
+    VERIFICA(doppia_json_array("[\"a\",]", &v) == -1, "L6 virgola finale rifiutata");
 }
 
 static void t_conf(void) {
@@ -96,6 +100,13 @@ static void t_conf(void) {
     VERIFICA(!doppia_set(&c, "foto", "/nonesiste.png", e, sizeof(e)), "file che non esiste rifiutato");
     VERIFICA(!doppia_set(&c, "glossario", "a\nb", e, sizeof(e)), "a capo nel valore rifiutato");
     VERIFICA(!doppia_set(&c, "boh", "1", e, sizeof(e)), "voce sconosciuta rifiutata");
+    VERIFICA(!doppia_set(&c, "da", "nan", e, sizeof(e)) && !doppia_set(&c, "volume", "-inf", e, sizeof(e)),
+             "L1 NaN e infinito rifiutati");
+    VERIFICA(!doppia_set(&c, "comfy_porta", "0", e, sizeof(e)) && !doppia_set(&c, "comfy_porta", "", e, sizeof(e)) &&
+             !doppia_set(&c, "risoluzione", "100", e, sizeof(e)) && !doppia_set(&c, "risoluzione", "-32", e, sizeof(e)) &&
+             !doppia_set(&c, "passi", "0", e, sizeof(e)), "L1 porta, lato e passi fuori limite rifiutati");
+    VERIFICA(doppia_set(&c, "risoluzione", "640", e, sizeof(e)) && doppia_set(&c, "risoluzione", "576", e, sizeof(e)),
+             "L1 lato multiplo di 32 accettato");
     VERIFICA(doppia_set(&c, "resa", "scena", e, sizeof(e)) && doppia_set(&c, "glossario", "A, B = C", e, sizeof(e)), "valori validi");
     char p[400];
     snprintf(p, sizeof(p), "%s/c.conf", DIR_);
@@ -213,6 +224,31 @@ static void t_traduci(void) {
     int prima = srv_richieste;
     VERIFICA(doppia_traduci(&c, f, n, p, NULL, NULL, e, sizeof(e)) && srv_richieste == prima, "ripresa: niente da rifare, nessuna richiesta");
     doppia_frasi_free(f, n);
+
+    /* H1: con il traduttore spento non si inventa nulla: si ferma, le frasi restano da
+     * tradurre e la ripresa le ritraduce (prima diventavano copie inglesi "tradotte"). */
+    int chiusa = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in b = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    bind(chiusa, (struct sockaddr *)&b, sizeof(b));
+    socklen_t bl = sizeof(b);
+    getsockname(chiusa, (struct sockaddr *)&b, &bl);
+    close(chiusa);   /* porta libera: nessuno in ascolto */
+    snprintf(url, sizeof(url), "http://127.0.0.1:%d", ntohs(b.sin_port));
+    doppia_set(&c, "traduttore_url", url, e, sizeof(e));
+    f = calloc(3, sizeof(*f));
+    for (int i = 0; i < 3; i++) f[i] = (doppia_frase){.da = i * 4.0, .a = i * 4.0 + 3, .en = strdup("hello")};
+    snprintf(p, sizeof(p), "%s/giu.tsv", DIR_);
+    ok = doppia_traduci(&c, f, 3, p, NULL, NULL, e, sizeof(e));
+    VERIFICA(!ok && strstr(e, "traduttore") && strstr(e, "--riprendi"), "H1 traduttore spento: errore chiaro [%s]", e);
+    VERIFICA(!f[0].it && !f[1].it && !f[2].it, "H1 nessuna frase segnata come tradotta");
+    char segno[500];
+    snprintf(segno, sizeof(segno), "%s.terza", p);
+    VERIFICA(access(segno, F_OK) != 0, "H1 terza persona non segnata come fatta");
+    doppia_frasi_free(f, 3);
+    char h[64];
+    int port;
+    VERIFICA(!doppia_url("https://x:1", h, sizeof(h), &port) && doppia_url("http://x:81", h, sizeof(h), &port) && port == 81,
+             "L2 https rifiutato, http letto");
     doppia_conf_free(&c);
 }
 

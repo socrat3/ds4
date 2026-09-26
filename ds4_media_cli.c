@@ -13,6 +13,7 @@
  * descrizione e' un errore, invece di usare il percorso come descrizione. */
 #include "ds4_media.h"
 #include "ds4_media_doppia.h"
+#include "ds4_media_help.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -31,7 +32,12 @@ static volatile sig_atomic_t g_stop;
  * secondo esce subito, per chi non vuole aspettare nemmeno quello. */
 static void on_signal(int sig) {
     (void)sig;
-    if (g_stop) _exit(130);
+    if (g_stop) {
+        /* il programma esterno di doppia (ffmpeg, whisper, la sintesi) non deve restare
+         * orfano con la GPU in mano: kill e' sicuro in un gestore di segnali */
+        if (doppia_figlio > 0) kill(-doppia_figlio, SIGTERM);
+        _exit(130);
+    }
     g_stop = 1;
 }
 
@@ -55,7 +61,7 @@ static const cli_opt OPTS[] = {
     {"--idle-free", true}, {"--size", true}, {"--seed", true}, {"--passi", true},
     {"--rif", true}, {"--sec", true}, {"--negativo", true}, {"--cfg", true}, {"--n", true},
     {"--da", true}, {"--a", true}, {"--resa", true}, {"--riprendi", true}, {"--voce", true},
-    {"--si", false}, {"--senza-titolo", false},
+    {"--si", false}, {"--senza-titolo", false}, {"--help", false}, {"-h", false},
     {"--bf16", false}, {"--trasparente", false}, {"--no-free", false}, {"--auto-free", false},
     {"--no-vista", false}, {"--tieni-comfy", false}, {"--no-gate", false}, {"--forza", false},
     {"-y", false}, {"--comfy", false}, {"--tutto", false}, {"--no-log", false},
@@ -192,6 +198,7 @@ static void on_signals(void) {
     sa.sa_handler = on_signal;   /* senza SA_RESTART: le attese si svegliano e vedono g_stop */
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);   /* terminale chiuso: come un Ctrl+C, il lavoro si ferma pulito */
 }
 
 static ds4_media *build(const cli_args *a) {
@@ -255,7 +262,7 @@ static int cmd_img(const cli_args *a) {
         fprintf(stderr, "ds4-media: size non valida: %s (WxH multipli di 32, lato max 2752, area max 2752x1536)\n", size);
         return 2;
     }
-    if (!a->prompt[0]) { fprintf(stderr, "uso: ds4-media img [opzioni] [--] descrizione...\n"); return 2; }
+    if (!a->prompt[0]) { fprintf(stderr, "uso: ds4-media img [opzioni] [--] descrizione... (ds4-media help img)\n"); return 2; }
     ds4_media *m = build(a);
     if (!m) return 2;
     on_signals();
@@ -302,7 +309,8 @@ static int cmd_video(const cli_args *a) {
         return 2;
     }
     if (!a->prompt[0] || a->nref != 1) {
-        fprintf(stderr, "uso: ds4-media video --rif primo_fotogramma.png [--sec S] [--size WxH] [--] descrizione...\n");
+        fprintf(stderr, "uso: ds4-media video --rif primo_fotogramma.png [--sec S] [--size WxH] [--] descrizione...\n"
+                        "(ds4-media help video)\n");
         return 2;
     }
     ds4_media *m = build(a);
@@ -413,13 +421,19 @@ static int cmd_doppia(const cli_args *a) {
     const char *dir = opt(a, "--riprendi", opt(a, "--dir", NULL));
     if (dir) snprintf(c.dir, sizeof(c.dir), "%s", dir);
     if (!a->prompt[0] && !dir) {
-        fprintf(stderr, "uso: ds4-media doppia URL|video [--da S] [--a S] [--resa testa|scena|entrambe]\n"
-                        "                  [--voce qwen|xtts] [--senza-titolo] [--dir D] [--si]\n"
-                        "     ds4-media doppia --riprendi CARTELLA_DEL_LAVORO\n");
+        fprintf(stderr, "uso: ds4-media doppia URL|video [opzioni], o --riprendi CARTELLA (ds4-media help doppia)\n");
         doppia_conf_free(&c);
         return 2;
     }
     char err[512] = {0}, conf[1100];
+    if (opt(a, "--riprendi", NULL)) {
+        snprintf(conf, sizeof(conf), "%s/doppia.conf", dir);
+        if (access(conf, R_OK) != 0) {
+            fprintf(stderr, "ds4-media: %s non e' la cartella di un lavoro (manca doppia.conf)\n", dir);
+            doppia_conf_free(&c);
+            return 2;
+        }
+    }
     if (!doppia_prepara(&c, ov, err, sizeof(err))) { fprintf(stderr, "ds4-media: %s\n", err); doppia_conf_free(&c); return 1; }
     on_signals();
     if (!flag(a, "--si") && isatty(0) && !doppia_wizard(&c, doppia_titoli_path(&c))) {
@@ -452,18 +466,26 @@ static int cmd_simple(const cli_args *a, bool health) {
     return ok ? 0 : 1;
 }
 
+/* --help o -h prima di un eventuale "--": dopo sono parole della descrizione. */
+static bool vuole_aiuto(int argc, char **argv) {
+    for (int i = 2; i < argc && strcmp(argv[i], "--"); i++)
+        if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) return true;
+    return false;
+}
+
+static const char *COMANDI[] = {"serve", "img", "video", "doppia", "clean", "health", "free", NULL};
+
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr, "uso: ds4-media {serve|img|video|doppia|clean|health|free} [opzioni]\n"
-                        "  doppia URL|video [--da S] [--a S] [--resa R] [--si]  doppia in italiano con il tuo volto\n"
-                        "  img [--size WxH] [--n N] [--seed S] [--passi N] [--cfg C] [--negativo T]\n"
-                        "      [--bf16] [--trasparente] [--rif F]... [--] descrizione...\n"
-                        "  clean [--dir D] [--comfy] [--no-log] [--forza]  cancella img-*.png, vid-*.mp4, *.log\n");
-        return 2;
-    }
-    static cli_args a;
-    if (!cli_parse(argc - 1, argv + 1, &a)) return 2;
+    if (argc < 2) { ds4_media_help(stderr, NULL); return 2; }
     const char *c = argv[1];
+    if (!strcmp(c, "help") || !strcmp(c, "--help") || !strcmp(c, "-h"))
+        return ds4_media_help(stdout, argc > 2 ? argv[2] : NULL);
+    bool noto = false;
+    for (int i = 0; COMANDI[i]; i++) noto |= !strcmp(c, COMANDI[i]);
+    if (!noto) { fprintf(stderr, "ds4-media: comando sconosciuto '%s' (ds4-media help)\n", c); return 2; }
+    if (vuole_aiuto(argc, argv)) return ds4_media_help(stdout, c);
+    static cli_args a;
+    if (!cli_parse(argc - 1, argv + 1, &a)) { fprintf(stderr, "(ds4-media help %s)\n", c); return 2; }
     bool words_ok = !strcmp(c, "img") || !strcmp(c, "video") || !strcmp(c, "doppia");
     if (!words_ok && a.prompt[0]) { fprintf(stderr, "ds4-media: argomento inatteso: %s\n", a.prompt); return 2; }
     if (!strcmp(c, "serve")) return cmd_serve(&a);
@@ -472,7 +494,5 @@ int main(int argc, char **argv) {
     if (!strcmp(c, "doppia")) return cmd_doppia(&a);
     if (!strcmp(c, "clean")) return cmd_clean(&a);
     if (!strcmp(c, "health")) return cmd_simple(&a, true);
-    if (!strcmp(c, "free")) return cmd_simple(&a, false);
-    fprintf(stderr, "ds4-media: comando sconosciuto '%s'\n", c);
-    return 2;
+    return cmd_simple(&a, false);   /* free: l'unico rimasto dei COMANDI */
 }
