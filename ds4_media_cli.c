@@ -119,6 +119,11 @@ static bool opt_long(const cli_args *a, const char *name, long def, long lo, lon
 static bool opt_double(const cli_args *a, const char *name, double def, double lo, double hi, double *out) {
     const char *s = opt(a, name, NULL);
     if (!s) { *out = def; return true; }
+    /* strtod accetterebbe anche 0x10, 1e1, inf: qui solo cifre e un punto. */
+    if (s[strspn(s, "0123456789.")] || !strchr("0123456789.", s[0])) {
+        fprintf(stderr, "ds4-media: %s non valido: %s\n", name, s);
+        return false;
+    }
     char *end;
     double v = strtod(s, &end);
     if (end == s || *end || !(v >= lo && v <= hi)) {
@@ -276,9 +281,10 @@ static int cmd_img(const cli_args *a) {
     } else {
         fprintf(stderr, "ds4-media: %s\n", err);
     }
+    int rc = ok ? 0 : g_stop ? 130 : res.invalid ? 2 : 1;
     ds4_media_result_free(&res);
     ds4_media_free(m);
-    return ok ? 0 : (g_stop ? 130 : 1);
+    return rc;
 }
 
 static int cmd_video(const cli_args *a) {

@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -69,8 +70,11 @@ static int ws_fill(media_ws *ws, long deadline) {
 }
 
 /* Manda un frame di controllo (pong, close): dal client i frame vanno sempre
- * mascherati, e i frame di controllo non superano 125 byte. */
-static void ws_send_control(media_ws *ws, int opcode, const unsigned char *p, size_t n) {
+ * mascherati, e i frame di controllo non superano 125 byte. Mai bloccante: un peer
+ * che manda ping senza leggere riempirebbe il socket e ci fermerebbe in send(),
+ * lontano da cancellazione e timeout. Se il frame non entra tutto, false: il
+ * chiamante chiude il websocket e ripiega su /history. */
+static bool ws_send_control(media_ws *ws, int opcode, const unsigned char *p, size_t n) {
     if (n > 125) n = 125;
     unsigned char f[2 + 4 + 125];
     ws->mask = ws->mask * 1103515245u + 12345u;
@@ -79,7 +83,9 @@ static void ws_send_control(media_ws *ws, int opcode, const unsigned char *p, si
     f[1] = (unsigned char)(0x80 | n);
     memcpy(f + 2, key, 4);
     for (size_t i = 0; i < n; i++) f[6 + i] = p[i] ^ key[i & 3];
-    (void)media_write_all(ws->fd, f, 6 + n);
+    ssize_t w;
+    do w = send(ws->fd, f, 6 + n, MSG_DONTWAIT | MSG_NOSIGNAL); while (w < 0 && errno == EINTR);
+    return w == (ssize_t)(6 + n);
 }
 
 /* Estrae un frame dal buffer. 1 = frame pronto (consumato; payload valido fino alla
@@ -142,7 +148,9 @@ int media_ws_read(media_ws *ws, int timeout_ms, char **msg, size_t *len, bool *b
             continue;
         }
         switch (op) {
-        case 0x9: ws_send_control(ws, 0xA, p, n); continue;   /* ping -> pong */
+        case 0x9:                                            /* ping -> pong */
+            if (!ws_send_control(ws, 0xA, p, n)) return -1;
+            continue;
         case 0xA: continue;                                  /* pong non richiesto */
         case 0x8: ws_send_control(ws, 0x8, p, n < 2 ? n : 2); return -1;
         case 0x0:                                            /* continuazione */

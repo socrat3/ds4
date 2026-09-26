@@ -721,9 +721,22 @@ MEDIA_HDRS = ds4_media.h ds4_media_int.h ds4_media_http.h ds4_media_ws.h ds4_med
 
 tests/test_media: tests/test_media.c $(MEDIA_SRCS) $(MEDIA_HDRS)
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_media.c $(MEDIA_SRCS) -lpthread -lm
-test-media: tests/test_media tests/test_media_f01 ds4-media
+test-media: tests/test_media tests/test_media_f01 tests/test_media_adv tests/test_media_adv_io ds4-media
 	./tests/test_media
 	./tests/test_media_f01
+	./tests/test_media_adv
+	./tests/test_media_adv_io
+
+tests/test_media_adv: tests/test_media_adv.c tests/media_adv_util.h tests/media_adv_fake.h $(MEDIA_SRCS) $(MEDIA_HDRS)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_media_adv.c $(MEDIA_SRCS) -lpthread -lm
+tests/test_media_adv_io: tests/test_media_adv_io.c tests/media_adv_util.h tests/media_adv_fake.h $(MEDIA_SRCS) $(MEDIA_HDRS)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_media_adv_io.c $(MEDIA_SRCS) -lpthread -lm
+
+# Test avversari (scritti da un revisore indipendente): il modulo e i suoi ingressi.
+.PHONY: test-media-adv
+test-media-adv: tests/test_media_adv tests/test_media_adv_io ds4-media
+	./tests/test_media_adv
+	./tests/test_media_adv_io
 
 tests/test_media_f01: tests/test_media_f01.c tests/media_fake.h $(MEDIA_SRCS) $(MEDIA_HDRS)
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_media_f01.c $(MEDIA_SRCS) -lpthread -lm

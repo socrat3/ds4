@@ -245,8 +245,9 @@ static int run_cli(const char *args) {
     int k = 0;
     while (args[k] && args[k] != ' ' && k < 15) { sub[k] = args[k]; k++; }
     sub[k] = '\0';
-    snprintf(cmd, sizeof(cmd), "./ds4-media %s --comfy-port %d --dir %s --no-free --no-vista --no-gate %s "
-             "</dev/null >/dev/null 2>&1", sub, F.port, DIR_, args + k);
+    /* HOME finto e --tieni-comfy: la CLI non deve mai toccare ~/comfy/ComfyUI/output. */
+    snprintf(cmd, sizeof(cmd), "HOME=%s ./ds4-media %s --comfy-port %d --dir %s --tieni-comfy --no-free --no-vista "
+             "--no-gate %s </dev/null >/dev/null 2>&1", DIR_, sub, F.port, DIR_, args + k);
     int st = system(cmd);
     return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }

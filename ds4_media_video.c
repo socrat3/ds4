@@ -114,7 +114,9 @@ bool ds4_media_video(ds4_media *m, const ds4_media_video_req *req,
     memset(out, 0, sizeof(*out));
     pthread_mutex_lock(&m->lock);
     media_job j = {.cancel = req->cancel, .cancel_privdata = req->cancel_privdata, .t_start = media_now_ms()};
+    media_job_bind(m, &j);
     bool ok = media_video_job(m, req, &j, out, err, err_len);
+    media_job_bind(m, NULL);
     pthread_mutex_unlock(&m->lock);
     return ok;
 }

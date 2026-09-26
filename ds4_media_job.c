@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -39,6 +40,17 @@ long media_now_ms(void) {
 bool media_job_cancelled(ds4_media *m, const media_job *j) {
     if (m->cancel && m->cancel(m->cancel_privdata)) return true;
     return j && j->cancel && j->cancel(j->cancel_privdata);
+}
+
+static bool media_job_http_cancel(void *pd) {
+    media_job *j = pd;
+    return media_job_cancelled(j->m, j);
+}
+
+void media_job_bind(ds4_media *m, media_job *j) {
+    if (!j) { media_http_set_cancel(NULL, NULL); return; }
+    j->m = m;
+    media_http_set_cancel(media_job_http_cancel, j);
 }
 
 void media_make_stem(char *stem, size_t n, const char *kind) {
@@ -77,6 +89,7 @@ static int media_history_status(const char *body, char *err, size_t err_len) {
  * esecuzione). Entrambe le richieste sono mirate a questo id: non toccano altri. */
 static void media_cancel_remote(ds4_media *m, const char *pid) {
     char body[160], e[64];
+    media_http_set_cancel(NULL, NULL);   /* queste due richieste devono partire comunque */
     media_http_response r = {0};
     snprintf(body, sizeof(body), "{\"delete\":[\"%s\"]}", pid);
     media_http_post(m->host, m->port, "/queue", "application/json", body, strlen(body), 5000, &r, e, sizeof(e));
@@ -257,15 +270,13 @@ static bool media_fetch_outputs(ds4_media *m, const char *history, const char *s
             media_http_response vr = {0};
             if (!media_http_get(m->host, m->port, vp.ptr, 60000, &vr, err, err_len)) ok = false;
             else if (vr.status != 200) { media_set_err(err, err_len, "/view di %s ha risposto %d", fn, vr.status); ok = false; }
+            else if (vr.body_len == 0) { media_set_err(err, err_len, "/view di %s: file vuoto", fn); ok = false; }
             free(vp.ptr);
-            char ext[8] = ".png";
-            const char *dot = strrchr(fn, '.');
-            if (dot && strlen(dot) <= 5 && dot[1]) {
-                bool clean = true;
-                for (const char *c = dot + 1; *c; c++)
-                    if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9'))) clean = false;
-                if (clean) snprintf(ext, sizeof(ext), "%s", dot);
-            }
+            /* L'estensione su disco la sceglie una lista nostra, non ComfyUI. */
+            static const char *exts[] = {".png", ".jpg", ".jpeg", ".webp", ".mp4", ".webm"};
+            const char *ext = ".png", *dot = strrchr(fn, '.');
+            for (size_t e = 0; dot && e < sizeof(exts) / sizeof(exts[0]); e++)
+                if (!strcasecmp(dot, exts[e])) ext = exts[e];
             char *dest = ok ? media_store(m, stem, &idx, ext, vr.body, vr.body_len, err, err_len) : NULL;
             if (ok && !dest) ok = false;
             if (dest) {

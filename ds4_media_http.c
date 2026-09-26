@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ── buffer e allocazione ─────────────────────────────────────────────────── */
@@ -133,18 +134,41 @@ int media_write_all(int fd, const void *buf, size_t len) {
     return 0;
 }
 
-/* Legge l'intera risposta finche' il peer chiude o scade il timeout. */
+/* Annullamento del lavoro in corso su questo thread (vedi media_http_set_cancel). */
+static __thread media_http_cancel_fn tl_cancel;
+static __thread void *tl_cancel_pd;
+
+void media_http_set_cancel(media_http_cancel_fn fn, void *privdata) {
+    tl_cancel = fn;
+    tl_cancel_pd = privdata;
+}
+
+static long media_http_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Legge l'intera risposta finche' il peer chiude. timeout_ms e' il silenzio massimo
+ * tra due letture (un download lungo ma vivo non scade). L'attesa e' a fette di
+ * 250 ms: tra una fetta e l'altra si guarda se il lavoro e' stato annullato, cosi'
+ * un Ctrl+C non aspetta un ComfyUI lento a rispondere. */
 static bool media_read_all(int fd, int timeout_ms, media_buf *out, char *err, size_t err_len) {
     char tmp[8192];
+    long deadline = media_http_now_ms() + timeout_ms;
     for (;;) {
+        if (tl_cancel && tl_cancel(tl_cancel_pd)) { media_set_err(err, err_len, "annullato"); return false; }
+        long left = deadline - media_http_now_ms();
+        if (left <= 0) { media_set_err(err, err_len, "timeout leggendo la risposta di ComfyUI"); return false; }
         struct pollfd pfd = {.fd = fd, .events = POLLIN};
-        int rc = poll(&pfd, 1, timeout_ms);
-        if (rc == 0) { media_set_err(err, err_len, "timeout leggendo la risposta di ComfyUI"); return false; }
+        int rc = poll(&pfd, 1, left < 250 ? (int)left : 250);
+        if (rc == 0) continue;
         if (rc < 0) { if (errno == EINTR) continue; media_set_err(err, err_len, "poll: %s", strerror(errno)); return false; }
         ssize_t n = read(fd, tmp, sizeof(tmp));
         if (n < 0) { if (errno == EINTR) continue; media_set_err(err, err_len, "read: %s", strerror(errno)); return false; }
         if (n == 0) break;
         media_buf_append(out, tmp, (size_t)n);
+        deadline = media_http_now_ms() + timeout_ms;
     }
     return true;
 }
@@ -182,14 +206,21 @@ static bool media_parse_response(media_buf *raw, media_http_response *resp,
         }
     if (!hdr_end) { media_set_err(err, err_len, "risposta HTTP malformata"); return false; }
     bool chunked = false;
-    /* header in minuscolo solo per il confronto */
+    long clen = -1;
     for (char *p = raw->ptr; p < hdr_end; p++) {
-        if ((p == raw->ptr || p[-1] == '\n') &&
-            strncasecmp(p, "Transfer-Encoding:", 18) == 0 &&
+        if (p != raw->ptr && p[-1] != '\n') continue;
+        if (strncasecmp(p, "Transfer-Encoding:", 18) == 0 &&
             strstr(p, "chunked") && strstr(p, "chunked") < strchr(p, '\n'))
             chunked = true;
+        if (strncasecmp(p, "Content-Length:", 15) == 0) clen = strtol(p + 15, NULL, 10);
     }
     size_t body_len = raw->len - (size_t)(hdr_end - raw->ptr);
+    /* Leggiamo fino alla chiusura: meno byte di quelli dichiarati = risposta troncata
+     * (un file salvato a meta' sembrerebbe un successo). */
+    if (!chunked && clen >= 0 && (size_t)clen != body_len) {
+        media_set_err(err, err_len, "risposta troncata: %zu byte su %ld dichiarati", body_len, clen);
+        return false;
+    }
     char *body = media_xmalloc(body_len + 1);
     memcpy(body, hdr_end, body_len);
     if (chunked) body_len = media_dechunk(body, body_len);
@@ -218,11 +249,13 @@ static bool media_send(const char *host, int port, media_buf *req, int timeout_m
 
 bool media_http_get(const char *host, int port, const char *path, int timeout_ms,
                     media_http_response *resp, char *err, size_t err_len) {
+    /* Il path puo' venire da ComfyUI (nomi di file): niente buffer fissi da troncare. */
     media_buf req = {0};
-    char line[1024];
-    snprintf(line, sizeof(line),
-             "GET %s HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\n\r\n", path, host, port);
-    media_buf_puts(&req, line);
+    char tail[320];
+    snprintf(tail, sizeof(tail), " HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\n\r\n", host, port);
+    media_buf_puts(&req, "GET ");
+    media_buf_puts(&req, path);
+    media_buf_puts(&req, tail);
     return media_send(host, port, &req, timeout_ms, resp, err, err_len);
 }
 
@@ -230,12 +263,12 @@ bool media_http_post(const char *host, int port, const char *path,
                      const char *content_type, const void *body, size_t body_len,
                      int timeout_ms, media_http_response *resp, char *err, size_t err_len) {
     media_buf req = {0};
-    char line[1024];
-    snprintf(line, sizeof(line),
-             "POST %s HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\n"
-             "Content-Type: %s\r\nContent-Length: %zu\r\n\r\n",
-             path, host, port, content_type, body_len);
-    media_buf_puts(&req, line);
+    char tail[512];
+    snprintf(tail, sizeof(tail), " HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\n"
+             "Content-Type: %s\r\nContent-Length: %zu\r\n\r\n", host, port, content_type, body_len);
+    media_buf_puts(&req, "POST ");
+    media_buf_puts(&req, path);
+    media_buf_puts(&req, tail);
     media_buf_append(&req, (const char *)body, body_len);
     return media_send(host, port, &req, timeout_ms, resp, err, err_len);
 }

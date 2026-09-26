@@ -24,6 +24,12 @@ void media_set_err(char *err, size_t err_len, const char *fmt, ...);
 int media_tcp_connect(const char *host, int port, char *err, size_t err_len);
 int media_write_all(int fd, const void *buf, size_t len);
 
+/* Annullamento per le richieste fatte da questo thread: se fn(privdata) diventa true
+ * durante un'attesa, la richiesta fallisce con "annullato" entro ~250 ms. NULL lo
+ * toglie. ds4_media lo imposta per la durata di un lavoro. */
+typedef bool (*media_http_cancel_fn)(void *privdata);
+void media_http_set_cancel(media_http_cancel_fn fn, void *privdata);
+
 /* Risposta HTTP: stato, corpo (malloc'd, \0-terminato ma binario-safe con body_len). */
 typedef struct { int status; char *body; size_t body_len; } media_http_response;
 void media_http_response_free(media_http_response *r);

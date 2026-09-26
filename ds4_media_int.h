@@ -34,6 +34,7 @@ struct ds4_media {
 
 /* Un lavoro: la cancellazione del chiamante, e i tempi delle fasi in ms monotoni. */
 typedef struct {
+    ds4_media *m;              /* impostato da media_job_bind */
     ds4_media_cancel_fn cancel;
     void *cancel_privdata;
     long t_start;              /* ingresso nel lavoro (dopo il mutex) */
@@ -45,6 +46,9 @@ typedef struct {
 void media_log(ds4_media *m, const char *fmt, ...);
 long media_now_ms(void);
 bool media_job_cancelled(ds4_media *m, const media_job *j);
+/* Lega (j != NULL) o slega (NULL) la cancellazione del lavoro alle richieste HTTP di
+ * questo thread: anche un invio o uno scarico lento si fermano al Ctrl+C. */
+void media_job_bind(ds4_media *m, media_job *j);
 
 /* Memoria per ComfyUI in KiB (vedi ds4_media_comfy_avail_gib), -1 se ignota; e il
  * gate: false con err se `need_kib` non ci sta, con `hint` come rimedio suggerito. */

@@ -10,6 +10,7 @@
  * ComfyUI e' in ds4_media_job.c, il video in ds4_media_video.c. */
 #include "ds4_media_int.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <math.h>
 #include <stdio.h>
@@ -171,11 +172,12 @@ static bool media_size_ok(int w, int h) {
 }
 
 bool ds4_media_parse_size(const char *s, int *width, int *height) {
-    if (!s) return false;
+    /* strtol accetterebbe spazi e segni: si vogliono solo cifre, 'x', cifre. */
+    if (!s || !isdigit((unsigned char)s[0])) return false;
     char *x = NULL, *end = NULL;
     errno = 0;
     long w = strtol(s, &x, 10);
-    if (x == s || (*x != 'x' && *x != 'X')) return false;
+    if (x == s || (*x != 'x' && *x != 'X') || !isdigit((unsigned char)x[1])) return false;
     long h = strtol(x + 1, &end, 10);
     if (end == x + 1 || *end || errno || w > DS4_MEDIA_MAX_SIDE || h > DS4_MEDIA_MAX_SIDE) return false;
     if (!media_size_ok((int)w, (int)h)) return false;
@@ -197,14 +199,16 @@ static void media_ref_scaled(int rw, int rh, int res, int *w, int *h) {
 
 /* Per una modifica senza dimensioni esplicite: la risoluzione che conserva l'area del
  * primo riferimento (almeno MEDIA_EDIT_MIN_RES), ridotta finche' l'uscita rientra nei
- * limiti. Riferimento illeggibile: 1024, il default del nodo. */
+ * limiti. Riferimento illeggibile: 1024, il default del nodo. 0 se nessuna risoluzione
+ * rientra (proporzioni oltre ~86:1: un lato supererebbe 2752 anche a 32 sull'altro). */
 static int media_edit_resolution(int rw, int rh, int *ow, int *oh) {
     if (rw <= 0 || rh <= 0) { rw = rh = 1024; }
     int res = (int)nearbyint(sqrt((double)rw * rh) / 32.0) * 32;
     if (res < MEDIA_EDIT_MIN_RES) res = MEDIA_EDIT_MIN_RES;
     for (;;) {
         media_ref_scaled(rw, rh, res, ow, oh);
-        if (media_size_ok(*ow, *oh) || res <= 32) return res;
+        if (media_size_ok(*ow, *oh)) return res;
+        if (res <= 32) return 0;
         res -= 32;
     }
 }
@@ -351,6 +355,10 @@ static bool media_image_plan(ds4_media *m, const ds4_media_image_req *req, media
             media_log(m, "ds4: media non leggo le dimensioni di %s: risoluzione 1024", req->refs[0]);
         p->resolution = media_edit_resolution(rw, rh, &p->width, &p->height);
         p->ref_latent = !explicit_size;
+        if (!p->resolution) {
+            media_set_err(err, err_len, "proporzioni del riferimento estreme (%dx%d): ritaglialo o dai --size", rw, rh);
+            return false;
+        }
     }
     if (explicit_size || req->n_refs == 0) {
         p->width = req->width > 0 ? req->width : 1024;
@@ -406,7 +414,9 @@ bool ds4_media_image(ds4_media *m, const ds4_media_image_req *req,
     memset(out, 0, sizeof(*out));
     pthread_mutex_lock(&m->lock);
     media_job j = {.cancel = req->cancel, .cancel_privdata = req->cancel_privdata, .t_start = media_now_ms()};
+    media_job_bind(m, &j);
     bool ok = media_image_job(m, req, &j, out, err, err_len);
+    media_job_bind(m, NULL);
     pthread_mutex_unlock(&m->lock);
     return ok;
 }

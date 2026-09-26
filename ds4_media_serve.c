@@ -33,6 +33,7 @@
 #define SERVE_MAX_HEADER (64 * 1024)
 #define SERVE_MAX_BODY (1024 * 1024)
 #define SERVE_READ_MS 30000
+#define SERVE_MAX_CONN 64          /* oltre: 503 subito, un client lento non esaurisce i thread */
 
 typedef struct { int fd; int port; ds4_media *m; } serve_conn;
 
@@ -252,6 +253,7 @@ static int serve_read_request(int fd, media_buf *raw, size_t *hdr_end) {
                 continue;
             }
             *hdr_end = (size_t)(e - raw->ptr) + 4;
+            if (*hdr_end > SERVE_MAX_HEADER) return 431;
             char saved = raw->ptr[*hdr_end];
             raw->ptr[*hdr_end] = '\0';   /* cerca Content-Length solo negli header */
             char *cl = strcasestr(raw->ptr, "\r\nContent-Length:");
@@ -337,6 +339,11 @@ bool ds4_media_serve(ds4_media *m, int port, volatile int *stop, char *err, size
         if (rc <= 0) continue;
         int fd = accept(srv, NULL, NULL);
         if (fd < 0) continue;
+        if (__sync_fetch_and_add(&serve_active, 0) >= SERVE_MAX_CONN) {
+            serve_error(fd, "503 Service Unavailable", "troppe connessioni");
+            close(fd);
+            continue;
+        }
         serve_conn *c = media_xmalloc(sizeof(*c));
         c->fd = fd;
         c->port = port;
