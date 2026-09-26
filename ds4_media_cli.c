@@ -82,6 +82,8 @@ static int cmd_img(int argc, char **argv) {
     if (!prompt) { fprintf(stderr, "uso: ds4-media img [opzioni] \"descrizione\"\n"); ds4_media_free(m); return 2; }
     req.prompt = prompt;
 
+    fprintf(stderr, "genero l'immagine con Qwen-Image (ComfyUI): \"%.60s\"%s\n",
+            prompt, strlen(prompt) > 60 ? "..." : "");
     ds4_media_result res = {0};
     char err[256] = {0};
     bool ok = ds4_media_image(m, &req, &res, err, sizeof(err));

@@ -444,9 +444,12 @@ bool ds4_media_image(ds4_media *m, const ds4_media_image_req *req,
     media_http_response_free(&resp);
     if (!pid) { media_set_err(err, err_len, "ComfyUI non ha dato un prompt_id"); return false; }
     snprintf(out->prompt_id, sizeof(out->prompt_id), "%s", pid);
+    media_log(m, "ds4: media inviato a ComfyUI (id %s), attendo la generazione"
+                 " (in coda dietro altri lavori GPU puo' richiedere piu' tempo)...", out->prompt_id);
 
+    /* Timeout ampio: se la GPU e' occupata (H3, un'altra generazione) l'immagine resta in coda. */
     char *history = NULL;
-    ok = media_wait(m, pid, &history, 300000, err, err_len);
+    ok = media_wait(m, pid, &history, 900000, err, err_len);
     free(pid);
     if (!ok) return false;
 
