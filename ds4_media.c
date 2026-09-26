@@ -115,21 +115,27 @@ long ds4_media_avail_gib(void) {
 }
 
 /* La memoria che ComfyUI gia' tiene (i pesi dell'ultimo lavoro, la cache di torch) non
- * compare in MemAvailable, ma ComfyUI la riusa: contarla evita di rifiutare la seconda
- * immagine quando la prima ha lasciato i pesi caricati. torch_vram_total e' quanto
- * l'allocatore di torch ha riservato; sul DGX Spark la memoria e' unificata. */
+ * compare in MemAvailable, ma ComfyUI la riusa: contarla evita di rifiutare il secondo
+ * lavoro quando il primo ha lasciato i pesi caricati. Si prende il massimo fra
+ * torch_vram_total e la GPU del processo (ds4_media_mem.c). */
 long media_comfy_avail_kib(ds4_media *m) {
     long avail = m->avail_override_kib > 0 ? m->avail_override_kib : media_meminfo_kib();
     if (avail < 0) return -1;
     media_http_response r = {0};
     char e[64];
+    long tenuta = 0;
     if (media_http_get(m->host, m->port, "/system_stats", 5000, &r, e, sizeof(e)) && r.status == 200) {
         bool found = false;
         long bytes = media_json_int(r.body, "torch_vram_total", &found);
-        if (found && bytes > 0) avail += bytes / 1024;
+        if (found && bytes > 0) tenuta = bytes / 1024;
     }
     media_http_response_free(&r);
-    return avail;
+    /* torch_vram_total sottostima con cudaMallocAsync: conta la GPU vera del processo */
+    if (!strcmp(m->host, "127.0.0.1") || !strcmp(m->host, "localhost")) {
+        long gpu = media_gpu_used_kib(media_pid_on_port(m->port));
+        if (gpu > tenuta) tenuta = gpu;
+    }
+    return avail + tenuta;
 }
 
 long ds4_media_comfy_avail_gib(ds4_media *m) {

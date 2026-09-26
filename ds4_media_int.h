@@ -53,6 +53,10 @@ void media_job_bind(ds4_media *m, media_job *j);
 /* Memoria per ComfyUI in KiB (vedi ds4_media_comfy_avail_gib), -1 se ignota; e il
  * gate: false con err se `need_kib` non ci sta, con `hint` come rimedio suggerito. */
 long media_comfy_avail_kib(ds4_media *m);
+/* ds4_media_mem.c: il pid in ascolto su una porta TCP locale (-1 se nessuno o non
+ * leggibile) e la memoria GPU che quel processo usa secondo nvidia-smi (0 se ignota). */
+long media_pid_on_port(int port);
+long media_gpu_used_kib(long pid);
 bool media_mem_gate(ds4_media *m, long need_kib, const char *hint, char *err, size_t err_len);
 
 /* Carica il riferimento `idx` su ComfyUI con un nome unico generato dal modulo

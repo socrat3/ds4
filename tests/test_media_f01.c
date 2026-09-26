@@ -172,6 +172,15 @@ static void t_gate(void) {
     ds4_media_free(m);
 }
 
+/* B4 su questa macchina: torch_vram_total sottostima con cudaMallocAsync; la memoria
+ * vera e' quella del processo in ascolto sulla porta di ComfyUI. Qui il finto ComfyUI
+ * e' dentro il test: il pid trovato deve essere il nostro. */
+static void t_pid_porta(void) {
+    VERIFICA(media_pid_on_port(F.port) == (long)getpid(), "B4 pid in ascolto sulla porta del finto ComfyUI (%ld)", media_pid_on_port(F.port));
+    VERIFICA(media_pid_on_port(1) == -1, "B4 nessuno in ascolto sulla porta 1");
+    VERIFICA(media_gpu_used_kib(-1) == 0, "B4 pid sconosciuto: nessuna memoria GPU");
+}
+
 /* B5: limiti su lato e area, simmetrici. */
 static void t_sizes(void) {
     int w, h;
@@ -376,6 +385,7 @@ int main(void) {
     t_ref_names();
     t_cancel();
     t_gate();
+    t_pid_porta();
     t_sizes();
     t_negative_batch();
     t_unwritable();

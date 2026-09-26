@@ -107,6 +107,29 @@ typedef struct {
     void *cancel_privdata;
 } ds4_media_video_req;
 
+/* Testa parlante MiniMax H3: la foto `face` parla con la traccia `audio`, ancorata dal
+ * fotogramma 0 (MiniMaxH3AddGuide), che guida il labiale. Con anchor_end la foto e'
+ * anche l'ultimo fotogramma: pezzi consecutivi ripartono tutti dalla stessa faccia e
+ * il volto non scivola da un pezzo all'altro. frames sulla griglia 17k+5, al massimo
+ * DS4_MEDIA_TALK_MAX_FRAMES (15,08 s a 24 fps, il massimo di H3). */
+typedef struct {
+    const char *prompt;
+    const char *face;          /* foto (primo fotogramma, e ultimo con anchor_end) */
+    const char *audio;         /* wav che guida il labiale, dal fotogramma 0 */
+    int width, height;         /* 0,0 = 576x576 */
+    int frames;                /* 17k+5, 5..DS4_MEDIA_TALK_MAX_FRAMES */
+    int steps;                 /* 0 = 20 */
+    long seed;                 /* <0 = casuale */
+    bool anchor_end;
+    ds4_media_cancel_fn cancel;
+    void *cancel_privdata;
+} ds4_media_talk_req;
+
+#define DS4_MEDIA_TALK_MAX_FRAMES 362
+
+bool ds4_media_talk(ds4_media *m, const ds4_media_talk_req *req,
+                    ds4_media_result *out, char *err, size_t err_len);
+
 /* Genera una o piu' immagini. Su true, *out e' riempito (da liberare con
  * ds4_media_result_free); su false, err spiega causa e rimedio. */
 bool ds4_media_image(ds4_media *m, const ds4_media_image_req *req,

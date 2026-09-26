@@ -12,6 +12,7 @@
  * posizione. Cosi' `img "gatto" --bf16` funziona e `img --rif foto.png` senza
  * descrizione e' un errore, invece di usare il percorso come descrizione. */
 #include "ds4_media.h"
+#include "ds4_media_doppia.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -53,6 +54,8 @@ static const cli_opt OPTS[] = {
     {"--port", true}, {"--host", true}, {"--comfy-port", true}, {"--dir", true},
     {"--idle-free", true}, {"--size", true}, {"--seed", true}, {"--passi", true},
     {"--rif", true}, {"--sec", true}, {"--negativo", true}, {"--cfg", true}, {"--n", true},
+    {"--da", true}, {"--a", true}, {"--resa", true}, {"--riprendi", true}, {"--voce", true},
+    {"--si", false}, {"--senza-titolo", false},
     {"--bf16", false}, {"--trasparente", false}, {"--no-free", false}, {"--auto-free", false},
     {"--no-vista", false}, {"--tieni-comfy", false}, {"--no-gate", false}, {"--forza", false},
     {"-y", false}, {"--comfy", false}, {"--tutto", false}, {"--no-log", false},
@@ -393,6 +396,51 @@ static int cmd_clean(const cli_args *a) {
     return 0;
 }
 
+/* ds4-media doppia: il wizard (se al terminale e senza --si) fa rivedere e cambiare
+ * ogni scelta; poi le fasi mancanti del lavoro. Le opzioni della riga di comando
+ * vincono sul doppia.conf del lavoro, che vince su ~/.ds4/doppia.conf. */
+static int cmd_doppia(const cli_args *a) {
+    static doppia_conf c;
+    doppia_conf_init(&c);
+    const char *ov[24];
+    int k = 0;
+    if (a->prompt[0]) { ov[k++] = "sorgente"; ov[k++] = a->prompt; }
+    const char *keys[][2] = {{"--da", "da"}, {"--a", "a"}, {"--resa", "resa"}, {"--voce", "voce_motore"}};
+    for (int i = 0; i < 4; i++)
+        if (opt(a, keys[i][0], NULL)) { ov[k++] = keys[i][1]; ov[k++] = opt(a, keys[i][0], NULL); }
+    if (flag(a, "--senza-titolo")) { ov[k++] = "titolo"; ov[k++] = "no"; }
+    ov[k] = NULL;
+    const char *dir = opt(a, "--riprendi", opt(a, "--dir", NULL));
+    if (dir) snprintf(c.dir, sizeof(c.dir), "%s", dir);
+    if (!a->prompt[0] && !dir) {
+        fprintf(stderr, "uso: ds4-media doppia URL|video [--da S] [--a S] [--resa testa|scena|entrambe]\n"
+                        "                  [--voce qwen|xtts] [--senza-titolo] [--dir D] [--si]\n"
+                        "     ds4-media doppia --riprendi CARTELLA_DEL_LAVORO\n");
+        doppia_conf_free(&c);
+        return 2;
+    }
+    char err[512] = {0}, conf[1100];
+    if (!doppia_prepara(&c, ov, err, sizeof(err))) { fprintf(stderr, "ds4-media: %s\n", err); doppia_conf_free(&c); return 1; }
+    on_signals();
+    if (!flag(a, "--si") && isatty(0) && !doppia_wizard(&c, doppia_titoli_path(&c))) {
+        fprintf(stderr, "uscito senza partire: le scelte non sono state salvate\n");
+        doppia_conf_free(&c);
+        return 0;
+    }
+    if (!doppia_get(&c, "foto")[0] || !doppia_get(&c, "voce_campione")[0]) {
+        fprintf(stderr, "ds4-media: servono foto e voce_campione (wizard, oppure ~/.ds4/doppia.conf)\n");
+        doppia_conf_free(&c);
+        return 2;
+    }
+    snprintf(conf, sizeof(conf), "%s/doppia.conf", c.dir);
+    if (!doppia_conf_save(&c, conf, err, sizeof(err))) fprintf(stderr, "ds4-media: %s\n", err);
+    fprintf(stderr, "lavoro in %s (log: doppia.log); Ctrl+C ferma, lo stesso comando riprende\n", c.dir);
+    bool ok = doppia_run(&c, cli_cancelled, NULL, err, sizeof(err));
+    if (!ok) fprintf(stderr, "ds4-media: %s\nper riprendere: ds4-media doppia --riprendi %s\n", err, c.dir);
+    doppia_conf_free(&c);
+    return ok ? 0 : g_stop ? 130 : 1;
+}
+
 static int cmd_simple(const cli_args *a, bool health) {
     ds4_media *m = build(a);
     if (!m) return 2;
@@ -406,7 +454,8 @@ static int cmd_simple(const cli_args *a, bool health) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "uso: ds4-media {serve|img|video|clean|health|free} [opzioni]\n"
+        fprintf(stderr, "uso: ds4-media {serve|img|video|doppia|clean|health|free} [opzioni]\n"
+                        "  doppia URL|video [--da S] [--a S] [--resa R] [--si]  doppia in italiano con il tuo volto\n"
                         "  img [--size WxH] [--n N] [--seed S] [--passi N] [--cfg C] [--negativo T]\n"
                         "      [--bf16] [--trasparente] [--rif F]... [--] descrizione...\n"
                         "  clean [--dir D] [--comfy] [--no-log] [--forza]  cancella img-*.png, vid-*.mp4, *.log\n");
@@ -415,11 +464,12 @@ int main(int argc, char **argv) {
     static cli_args a;
     if (!cli_parse(argc - 1, argv + 1, &a)) return 2;
     const char *c = argv[1];
-    bool words_ok = !strcmp(c, "img") || !strcmp(c, "video");
+    bool words_ok = !strcmp(c, "img") || !strcmp(c, "video") || !strcmp(c, "doppia");
     if (!words_ok && a.prompt[0]) { fprintf(stderr, "ds4-media: argomento inatteso: %s\n", a.prompt); return 2; }
     if (!strcmp(c, "serve")) return cmd_serve(&a);
     if (!strcmp(c, "img")) return cmd_img(&a);
     if (!strcmp(c, "video")) return cmd_video(&a);
+    if (!strcmp(c, "doppia")) return cmd_doppia(&a);
     if (!strcmp(c, "clean")) return cmd_clean(&a);
     if (!strcmp(c, "health")) return cmd_simple(&a, true);
     if (!strcmp(c, "free")) return cmd_simple(&a, false);

@@ -50,6 +50,10 @@ bool media_http_post_image(const char *host, int port, const char *path,
                            const char *file_name, const void *file_bytes, size_t file_len,
                            int timeout_ms, media_http_response *resp, char *err, size_t err_len);
 
+/* Decodifica la stringa JSON che inizia in p (sulla virgoletta): malloc'd, NULL se p
+ * non e' una virgoletta. *end (se non NULL) punta dopo la virgoletta di chiusura, o al
+ * punto in cui la stringa si e' interrotta (troncata o malformata). */
+char *media_json_parse_string(const char *p, const char **end);
 /* Estrae il valore stringa di "key" dal JSON (prima occorrenza), malloc'd o NULL. */
 char *media_json_str(const char *json, const char *key);
 /* Valore intero di "key" (found=false se assente). */

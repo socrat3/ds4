@@ -334,7 +334,7 @@ static void media_buf_put_utf8(media_buf *b, long cp) {
  * diventano UTF-8, coppie surrogate incluse (cosi' i client Python con ensure_ascii,
  * come Open WebUI, non perdono accenti ed emoji); una \u malformata o troncata chiude
  * la stringa senza leggere oltre il terminatore. */
-static char *media_json_parse_string_at(const char *p) {
+char *media_json_parse_string(const char *p, const char **end) {
     if (*p != '"') return NULL;
     p++;
     media_buf b = {0};
@@ -372,6 +372,7 @@ static char *media_json_parse_string_at(const char *p) {
         media_buf_append(&b, &c, 1);
         p++;
     }
+    if (end) *end = *p == '"' ? p + 1 : p;
     return media_buf_take(&b);
 }
 
@@ -385,7 +386,7 @@ char *media_json_str(const char *json, const char *key) {
         while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
         if (*p++ != ':') continue;
         while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
-        if (*p == '"') return media_json_parse_string_at(p);
+        if (*p == '"') return media_json_parse_string(p, NULL);
     }
     return NULL;
 }
