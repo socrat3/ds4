@@ -27,7 +27,7 @@
 #define MEDIA_MARGIN_KIB (6L * 1024 * 1024)   /* margine di sicurezza: 6 GiB */
 
 struct ds4_media {
-    char *host, *media_dir;
+    char *host, *media_dir, *comfy_output_dir;
     int port;
     ds4_media_weights weights;
     int idle_free_sec;
@@ -84,6 +84,8 @@ ds4_media *ds4_media_create(const ds4_media_config *cfg) {
     m->port = cfg->port > 0 ? cfg->port : 8188;
     m->media_dir = cfg->media_dir && cfg->media_dir[0] ? media_xstrdup(cfg->media_dir)
                                                        : media_default_dir();
+    m->comfy_output_dir = cfg->comfy_output_dir && cfg->comfy_output_dir[0]
+                              ? media_xstrdup(cfg->comfy_output_dir) : NULL;
     m->weights = cfg->weights;
     m->idle_free_sec = cfg->idle_free_sec;
     m->no_gate = cfg->no_gate;
@@ -101,6 +103,7 @@ void ds4_media_free(ds4_media *m) {
     if (!m) return;
     free(m->host);
     free(m->media_dir);
+    free(m->comfy_output_dir);
     free(m);
 }
 
@@ -372,6 +375,15 @@ static bool media_fetch_outputs(ds4_media *m, const char *history, const char *s
                     if (n == cap) { cap = cap ? cap * 2 : 4; list = realloc(list, (size_t)cap * sizeof(char *)); }
                     list[n++] = media_xstrdup(dest);
                     idx++;
+                    /* Togli la copia doppia che ComfyUI ha salvato (host locale): niente file sparsi. */
+                    if (m->comfy_output_dir) {
+                        char copy[1600];
+                        if (sub && sub[0])
+                            snprintf(copy, sizeof(copy), "%s/%s/%s", m->comfy_output_dir, sub, fn);
+                        else
+                            snprintf(copy, sizeof(copy), "%s/%s", m->comfy_output_dir, fn);
+                        unlink(copy);
+                    }
                 }
             }
             media_http_response_free(&vr);

@@ -27,6 +27,9 @@ typedef struct {
     const char *host;          /* ComfyUI, default "127.0.0.1" */
     int port;                  /* default 8188 */
     const char *media_dir;     /* cartella di uscita; default ~/.ds4/media */
+    const char *comfy_output_dir; /* cartella output di ComfyUI (host locale): dopo aver scaricato
+                                   * il file, ne rimuove la copia doppia lasciata da ComfyUI. NULL =
+                                   * non toccare (host remoto, o si vuole tenere anche quella copia). */
     ds4_media_weights weights; /* default int8 */
     int idle_free_sec;         /* dopo N s senza lavori, /free; 0 = mai */
     bool no_gate;              /* salta il controllo di memoria (per i test) */
