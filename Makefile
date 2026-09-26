@@ -720,6 +720,10 @@ tests/test_media: tests/test_media.c ds4_media.c ds4_media_http.c ds4_media.h ds
 test-media: tests/test_media
 	./tests/test_media
 
+# ds4-media: eseguibile autonomo (serve + img), senza GPU. Bersaglio fisso per Open WebUI.
+ds4-media: ds4_media_cli.c ds4_media.c ds4_media_http.c ds4_media_serve.c ds4_media.h ds4_media_http.h
+	$(CC) $(CFLAGS) -I. -o $@ ds4_media_cli.c ds4_media.c ds4_media_http.c ds4_media_serve.c -lpthread
+
 .PHONY: test-engram
 test-engram: tests/test_engram
 	./tests/test_engram

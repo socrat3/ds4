@@ -483,3 +483,18 @@ bool ds4_media_free_models(ds4_media *m, char *err, size_t err_len) {
     media_http_response_free(&resp);
     return ok;
 }
+
+bool ds4_media_parse_size(const char *s, int *width, int *height) {
+    if (!s) return false;
+    char *x = NULL;
+    long w = strtol(s, &x, 10);
+    if (!x || (*x != 'x' && *x != 'X')) return false;
+    long h = strtol(x + 1, NULL, 10);
+    if (w <= 0 || h <= 0 || w % 32 || h % 32 || w > MEDIA_MAX_W || h > MEDIA_MAX_H) return false;
+    *width = (int)w;
+    *height = (int)h;
+    return true;
+}
+
+/* Cartella di uscita, per il server che restituisce i file con response_format=url. */
+const char *ds4_media_dir(const ds4_media *m) { return m->media_dir; }

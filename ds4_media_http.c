@@ -353,6 +353,25 @@ char *media_url_encode(const char *s) {
     return media_buf_take(&b);
 }
 
+char *media_base64_encode(const unsigned char *data, size_t len) {
+    static const char tab[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t outlen = ((len + 2) / 3) * 4;
+    char *out = media_xmalloc(outlen + 1);
+    size_t j = 0;
+    for (size_t i = 0; i < len; i += 3) {
+        unsigned v = (unsigned)data[i] << 16;
+        if (i + 1 < len) v |= (unsigned)data[i + 1] << 8;
+        if (i + 2 < len) v |= (unsigned)data[i + 2];
+        out[j++] = tab[(v >> 18) & 63];
+        out[j++] = tab[(v >> 12) & 63];
+        out[j++] = (i + 1 < len) ? tab[(v >> 6) & 63] : '=';
+        out[j++] = (i + 2 < len) ? tab[v & 63] : '=';
+    }
+    out[j] = '\0';
+    return out;
+}
+
 char *media_json_quote(const char *s) {
     media_buf b = {0};
     media_buf_puts(&b, "\"");

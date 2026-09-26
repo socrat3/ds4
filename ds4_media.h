@@ -81,4 +81,15 @@ bool ds4_media_health(ds4_media *m, char *err, size_t err_len);
 /* Scarica i modelli da ComfyUI (POST /free): restituisce memoria al modello di chat. */
 bool ds4_media_free_models(ds4_media *m, char *err, size_t err_len);
 
+/* "1024x1024" -> width,height (multipli di 32). false se malformato o fuori limite. */
+bool ds4_media_parse_size(const char *s, int *width, int *height);
+
+/* Cartella di uscita configurata (per servire i file con response_format=url). */
+const char *ds4_media_dir(const ds4_media *m);
+
+/* Server HTTP compatibile con l'API Immagini di OpenAI (POST /v1/images/generations,
+ * GET /v1/media/files/<nome>, GET /v1/models): bersaglio fisso per Open WebUI. Blocca
+ * finche' non riceve SIGINT/SIGTERM o *stop diventa non-zero. */
+bool ds4_media_serve(ds4_media *m, int port, volatile int *stop, char *err, size_t err_len);
+
 #endif

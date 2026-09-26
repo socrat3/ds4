@@ -46,5 +46,7 @@ long media_json_int(const char *json, const char *key, bool *found);
 char *media_json_quote(const char *s);
 /* Percent-encoding per un valore di query (malloc'd). */
 char *media_url_encode(const char *s);
+/* base64 standard (malloc'd, \0-terminato). */
+char *media_base64_encode(const unsigned char *data, size_t len);
 
 #endif
