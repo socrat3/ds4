@@ -7,6 +7,7 @@
 #include "ds4_media_http.h"
 
 #include <errno.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,7 +38,8 @@ struct ds4_media {
     void *log_privdata;
     ds4_media_cancel_fn cancel;
     void *cancel_privdata;
-    time_t last_job;
+    time_t last_job;           /* fine dell'ultimo lavoro riuscito; 0 = nessuno da /free */
+    pthread_mutex_t lock;      /* un lavoro ComfyUI alla volta (il serve ha un thread per connessione) */
 };
 
 static void media_log(ds4_media *m, const char *fmt, ...) {
@@ -94,6 +96,7 @@ ds4_media *ds4_media_create(const ds4_media_config *cfg) {
     m->log_privdata = cfg->log_privdata;
     m->cancel = cfg->cancel;
     m->cancel_privdata = cfg->cancel_privdata;
+    pthread_mutex_init(&m->lock, NULL);
     if (!media_mkdir_p(m->media_dir))
         media_log(m, "ds4: media attenzione: non creo %s", m->media_dir);
     return m;
@@ -104,8 +107,11 @@ void ds4_media_free(ds4_media *m) {
     free(m->host);
     free(m->media_dir);
     free(m->comfy_output_dir);
+    pthread_mutex_destroy(&m->lock);
     free(m);
 }
+
+ds4_media_weights ds4_media_default_weights(const ds4_media *m) { return m->weights; }
 
 void ds4_media_result_free(ds4_media_result *r) {
     if (!r) return;
@@ -333,6 +339,17 @@ static bool media_wait(ds4_media *m, const char *prompt_id, char **out_history,
     }
 }
 
+/* Aggiunge al gambo del nome file i primi 8 caratteri del prompt_id di ComfyUI: due
+ * lavori nello stesso secondo (altro processo ds4-media) non si sovrascrivono. */
+static void media_job_stem(char *stem, size_t n, const char *prompt_id) {
+    char base[48];
+    size_t l = strlen(stem);   /* "img-YYYYMMDD-HHMMSS": 19 caratteri */
+    if (l >= sizeof(base)) l = sizeof(base) - 1;
+    memcpy(base, stem, l);
+    base[l] = '\0';
+    snprintf(stem, n, "%s-%.8s", base, prompt_id);
+}
+
 /* Scarica i file elencati in outputs con GET /view e li scrive in media_dir. Ogni
  * immagine e' un oggetto {"filename":..,"subfolder":..,"type":..}: per ogni "filename"
  * isolo l'oggetto (dal '{' precedente al '}' seguente) e ne leggo i tre campi. */
@@ -367,7 +384,10 @@ static bool media_fetch_outputs(ds4_media *m, const char *history, const char *s
             if (media_http_get(m->host, m->port, vpath, 60000, &vr, err, err_len) && vr.status == 200) {
                 const char *ext = strrchr(fn, '.');
                 char dest[1024];
-                snprintf(dest, sizeof(dest), "%s/%s-%03d%s", m->media_dir, stem, idx, ext ? ext : ".png");
+                /* mai sovrascrivere: se il nome esiste gia' (stesso secondo e stesso id) avanza l'indice */
+                do {
+                    snprintf(dest, sizeof(dest), "%s/%s-%03d%s", m->media_dir, stem, idx, ext ? ext : ".png");
+                } while (access(dest, F_OK) == 0 && ++idx < 1000);
                 FILE *of = fopen(dest, "wb");
                 if (of) {
                     fwrite(vr.body, 1, vr.body_len, of);
@@ -398,9 +418,8 @@ static bool media_fetch_outputs(ds4_media *m, const char *history, const char *s
     return true;
 }
 
-bool ds4_media_image(ds4_media *m, const ds4_media_image_req *req,
-                     ds4_media_result *out, char *err, size_t err_len) {
-    memset(out, 0, sizeof(*out));
+static bool media_image_job(ds4_media *m, const ds4_media_image_req *req,
+                            ds4_media_result *out, char *err, size_t err_len) {
     if (!req->prompt || !req->prompt[0]) { media_set_err(err, err_len, "prompt vuoto"); return false; }
     if (strlen(req->prompt) > 4000) { media_set_err(err, err_len, "prompt troppo lungo (max 4000)"); return false; }
     int width = req->width > 0 ? req->width : 1024;
@@ -456,6 +475,7 @@ bool ds4_media_image(ds4_media *m, const ds4_media_image_req *req,
     media_http_response_free(&resp);
     if (!pid) { media_set_err(err, err_len, "ComfyUI non ha dato un prompt_id"); return false; }
     snprintf(out->prompt_id, sizeof(out->prompt_id), "%s", pid);
+    media_job_stem(stem, sizeof(stem), pid);
     media_log(m, "ds4: media inviato a ComfyUI (id %s), attendo la generazione"
                  " (in coda dietro altri lavori GPU puo' richiedere piu' tempo)...", out->prompt_id);
 
@@ -478,6 +498,15 @@ bool ds4_media_image(ds4_media *m, const ds4_media_image_req *req,
               out->prompt_id, width, height, seed, out->ms,
               out->n_files ? out->files[0] : "(niente)");
     return true;
+}
+
+bool ds4_media_image(ds4_media *m, const ds4_media_image_req *req,
+                     ds4_media_result *out, char *err, size_t err_len) {
+    memset(out, 0, sizeof(*out));
+    pthread_mutex_lock(&m->lock);
+    bool ok = media_image_job(m, req, out, err, err_len);
+    pthread_mutex_unlock(&m->lock);
+    return ok;
 }
 
 #include "ds4_media_h3.inc"
@@ -516,9 +545,8 @@ static int media_h3_length(double seconds) {
     return (int)frames;
 }
 
-bool ds4_media_video(ds4_media *m, const ds4_media_video_req *req,
-                     ds4_media_result *out, char *err, size_t err_len) {
-    memset(out, 0, sizeof(*out));
+static bool media_video_job(ds4_media *m, const ds4_media_video_req *req,
+                            ds4_media_result *out, char *err, size_t err_len) {
     if (!req->prompt || !req->prompt[0]) { media_set_err(err, err_len, "prompt vuoto"); return false; }
     if (!req->ref || !req->ref[0]) { media_set_err(err, err_len, "serve un'immagine di riferimento (--rif): H3 parte dal primo fotogramma"); return false; }
     int width = req->width > 0 ? req->width : 864;
@@ -596,6 +624,7 @@ bool ds4_media_video(ds4_media *m, const ds4_media_video_req *req,
     media_http_response_free(&resp);
     if (!pid) { media_set_err(err, err_len, "ComfyUI non ha dato un prompt_id"); return false; }
     snprintf(out->prompt_id, sizeof(out->prompt_id), "%s", pid);
+    media_job_stem(stem, sizeof(stem), pid);
 
     char *history = NULL;
     ok = media_wait(m, pid, &history, 1800000, err, err_len);   /* fino a 30 min */
@@ -614,6 +643,15 @@ bool ds4_media_video(ds4_media *m, const ds4_media_video_req *req,
     return true;
 }
 
+bool ds4_media_video(ds4_media *m, const ds4_media_video_req *req,
+                     ds4_media_result *out, char *err, size_t err_len) {
+    memset(out, 0, sizeof(*out));
+    pthread_mutex_lock(&m->lock);
+    bool ok = media_video_job(m, req, out, err, err_len);
+    pthread_mutex_unlock(&m->lock);
+    return ok;
+}
+
 bool ds4_media_health(ds4_media *m, char *err, size_t err_len) {
     media_http_response resp = {0};
     if (!media_http_get(m->host, m->port, "/system_stats", 5000, &resp, err, err_len)) return false;
@@ -623,14 +661,38 @@ bool ds4_media_health(ds4_media *m, char *err, size_t err_len) {
     return ok;
 }
 
-bool ds4_media_free_models(ds4_media *m, char *err, size_t err_len) {
+static bool media_free_models_locked(ds4_media *m, char *err, size_t err_len) {
     const char *body = "{\"unload_models\":true,\"free_memory\":true}";
     media_http_response resp = {0};
     if (!media_http_post(m->host, m->port, "/free", "application/json", body, strlen(body),
                          10000, &resp, err, err_len)) return false;
     bool ok = resp.status == 200;
+    if (!ok) media_set_err(err, err_len, "ComfyUI ha risposto %d a /free", resp.status);
     media_http_response_free(&resp);
     return ok;
+}
+
+bool ds4_media_free_models(ds4_media *m, char *err, size_t err_len) {
+    pthread_mutex_lock(&m->lock);
+    bool ok = media_free_models_locked(m, err, err_len);
+    if (ok) m->last_job = 0;
+    pthread_mutex_unlock(&m->lock);
+    return ok;
+}
+
+bool ds4_media_idle_tick(ds4_media *m) {
+    if (m->idle_free_sec <= 0) return false;
+    if (pthread_mutex_trylock(&m->lock) != 0) return false;   /* lavoro in corso */
+    bool freed = false;
+    if (m->last_job && time(NULL) - m->last_job >= m->idle_free_sec) {
+        char err[128] = {0};
+        freed = media_free_models_locked(m, err, sizeof(err));
+        if (freed) media_log(m, "ds4: media inattivo da %d s, modelli scaricati da ComfyUI (free)", m->idle_free_sec);
+        else media_log(m, "ds4: media free automatico non riuscito: %s", err);
+        m->last_job = 0;   /* in ogni caso non riprovare a ogni giro */
+    }
+    pthread_mutex_unlock(&m->lock);
+    return freed;
 }
 
 long ds4_media_avail_gib(void) {

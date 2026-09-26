@@ -85,7 +85,8 @@ static void serve_generations(serve_conn *c, const char *body) {
     req.prompt = prompt;
     req.seed = has_seed ? seed : -1;
     req.steps = has_steps ? (int)steps : 0;
-    req.weights = (weights && strcmp(weights, "bf16") == 0) ? DS4_MEDIA_BF16 : DS4_MEDIA_INT8;
+    req.weights = weights ? (strcmp(weights, "bf16") == 0 ? DS4_MEDIA_BF16 : DS4_MEDIA_INT8)
+                          : ds4_media_default_weights(c->m);
     if (size && !ds4_media_parse_size(size, &req.width, &req.height)) {
         free(prompt); free(size); free(fmt); free(weights);
         serve_error(c->fd, "400 Bad Request", "size non valida (usa WxH multipli di 32)");
@@ -222,6 +223,7 @@ bool ds4_media_serve(ds4_media *m, int port, volatile int *stop, char *err, size
     while (!stop || !*stop) {
         struct pollfd pfd = {.fd = srv, .events = POLLIN};
         int rc = poll(&pfd, 1, 500);
+        ds4_media_idle_tick(m);   /* --idle-free: /free dopo N s senza lavori */
         if (rc <= 0) continue;
         int fd = accept(srv, NULL, NULL);
         if (fd < 0) continue;

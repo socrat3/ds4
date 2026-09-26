@@ -1,5 +1,5 @@
 /* ds4-media - eseguibile autonomo del modulo immagini/video, senza LLM ne' GPU.
- *   ds4-media serve [--port 8010] [--host H] [--comfy-port 8188] [--dir D] [--bf16]
+ *   ds4-media serve [--port 8010] [--host H] [--comfy-port 8188] [--dir D] [--bf16] [--idle-free S]
  *   ds4-media img [--size WxH] [--seed S] [--passi N] [--bf16] [--rif F]... "descrizione"
  *   ds4-media health
  *   ds4-media free
@@ -104,7 +104,7 @@ static int cmd_serve(int argc, char **argv) {
 static int cmd_img(int argc, char **argv) {
     ds4_media *m = build(argc, argv);
     ds4_media_image_req req = {0};
-    req.weights = flag(argc, argv, "--bf16") ? DS4_MEDIA_BF16 : DS4_MEDIA_INT8;
+    req.weights = ds4_media_default_weights(m);   /* --bf16 e' gia' nella config */
     req.seed = atol(opt(argc, argv, "--seed", "-1"));
     req.steps = atoi(opt(argc, argv, "--passi", "0"));
     req.transparent = flag(argc, argv, "--trasparente");

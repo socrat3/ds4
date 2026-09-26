@@ -25,7 +25,7 @@ static const char PNG_MAGIC[8] = {(char)0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '
 
 /* ── finto ComfyUI ────────────────────────────────────────────────────────── */
 
-typedef struct { int port; int uploads; int frees; } fake_state;
+typedef struct { int port; int uploads; int frees; int prompts_bf16; int prompts; } fake_state;
 
 static void send_response(int fd, const char *status, const char *ctype,
                           const void *body, size_t blen) {
@@ -63,6 +63,8 @@ static void *fake_comfy(void *arg) {
         if (strncmp(req, "STOP", 4) == 0) { close(fd); break; }
 
         if (strstr(req, "POST /prompt")) {
+            st->prompts++;
+            if (strstr(req, "qwen_image_2.1_bf16")) st->prompts_bf16++;
             const char *b = strstr(req, "MiniMaxH3ImageToVideo")
                 ? "{\"prompt_id\":\"vidpid\",\"number\":1,\"node_errors\":{}}"
                 : "{\"prompt_id\":\"testpid\",\"number\":1,\"node_errors\":{}}";
@@ -126,6 +128,52 @@ static void test_helpers(void) {
     char *e = media_url_encode("a b/c");
     VERIFICA(e && strcmp(e, "a%20b%2Fc") == 0, "media_url_encode");
     free(e);
+
+    /* \uXXXX -> UTF-8: come json.dumps di Python (ensure_ascii) manda accenti ed emoji */
+    char *u = media_json_str("{\"prompt\":\"citt\\u00e0 \\ud83c\\udf19 \\u20ac\"}", "prompt");
+    VERIFICA(u && strcmp(u, "citt\xc3\xa0 \xf0\x9f\x8c\x99 \xe2\x82\xac") == 0,
+             "media_json_str decodifica \\u in UTF-8 (accenti, coppia surrogata, 3 byte): [%s]", u ? u : "(null)");
+    free(u);
+    /* \u troncata o malformata: si ferma senza leggere oltre il terminatore */
+    char *tr = strdup("{\"prompt\":\"abc\\u");
+    char *t = media_json_str(tr, "prompt");
+    VERIFICA(t && strcmp(t, "abc") == 0, "\\u troncata chiude la stringa: [%s]", t ? t : "(null)");
+    free(t); free(tr);
+    char *t2 = media_json_str("{\"prompt\":\"ab\\u12x4cd\"}", "prompt");
+    VERIFICA(t2 && strcmp(t2, "ab") == 0, "\\u malformata chiude la stringa: [%s]", t2 ? t2 : "(null)");
+    free(t2);
+    char *t3 = media_json_str("{\"prompt\":\"x\\ud83cy\"}", "prompt");
+    VERIFICA(t3 && strcmp(t3, "x\xef\xbf\xbdy") == 0, "surrogato spaiato -> U+FFFD: [%s]", t3 ? t3 : "(null)");
+    free(t3);
+}
+
+/* ── lavori concorrenti ───────────────────────────────────────────────────── */
+
+typedef struct { ds4_media *m; ds4_media_result res; bool ok; char err[256]; } job_arg;
+static void *job_thread(void *a) {
+    job_arg *j = a;
+    ds4_media_image_req req = {.prompt = "due lavori insieme", .seed = 3};
+    j->ok = ds4_media_image(j->m, &req, &j->res, j->err, sizeof(j->err));
+    return NULL;
+}
+
+/* Due thread chiedono un'immagine nello stesso istante: il mutex li serializza e i
+ * file di uscita restano distinti (prompt_id nel nome). */
+static void test_concorrenza(ds4_media *m) {
+    job_arg a = {.m = m}, b = {.m = m};
+    pthread_t ta, tb;
+    pthread_create(&ta, NULL, job_thread, &a);
+    pthread_create(&tb, NULL, job_thread, &b);
+    pthread_join(ta, NULL);
+    pthread_join(tb, NULL);
+    VERIFICA(a.ok && b.ok, "entrambi i lavori riescono (%s / %s)", a.err, b.err);
+    if (a.ok && b.ok && a.res.n_files == 1 && b.res.n_files == 1) {
+        VERIFICA(strcmp(a.res.files[0], b.res.files[0]) != 0, "i due file hanno nomi diversi (%s)", a.res.files[0]);
+        VERIFICA(strstr(a.res.files[0], "-testpid-") != NULL, "il nome contiene il prompt_id (%s)", a.res.files[0]);
+        VERIFICA(access(a.res.files[0], R_OK) == 0 && access(b.res.files[0], R_OK) == 0, "entrambi i file esistono");
+    }
+    ds4_media_result_free(&a.res);
+    ds4_media_result_free(&b.res);
 }
 
 /* ── server OpenAI ────────────────────────────────────────────────────────── */
@@ -138,10 +186,11 @@ static void *serve_thread(void *a) {
     return NULL;
 }
 
-/* Avvia il server su una porta di test, gli manda una richiesta e controlla la risposta. */
-static void test_serve(ds4_media *m, int comfy_port) {
-    (void)comfy_port;
-    serve_arg sa = {.m = m, .port = 19010, .stop = 0};
+/* Avvia il server su una porta di test, gli manda una richiesta e controlla la risposta.
+ * Con st: verifica che senza "weights" nel corpo il serve usi i pesi della config. */
+static void test_serve(ds4_media *m, int port, fake_state *st, bool expect_bf16) {
+    int bf16_before = st->prompts_bf16, prompts_before = st->prompts;
+    serve_arg sa = {.m = m, .port = port, .stop = 0};
     pthread_t th;
     pthread_create(&th, NULL, serve_thread, &sa);
     usleep(200000);   /* lascia fare bind/listen */
@@ -149,13 +198,15 @@ static void test_serve(ds4_media *m, int comfy_port) {
     media_http_response resp = {0};
     char err[128] = {0};
     const char *body = "{\"prompt\":\"una rosa\",\"n\":1,\"size\":\"512x512\",\"response_format\":\"b64_json\"}";
-    bool ok = media_http_post("127.0.0.1", 19010, "/v1/images/generations",
+    bool ok = media_http_post("127.0.0.1", port, "/v1/images/generations",
                               "application/json", body, strlen(body), 20000, &resp, err, sizeof(err));
-    if (!ok) {
-        printf("nota: server non raggiungibile (porta 19010 occupata?), salto: %s\n", err);
-    } else {
+    VERIFICA(ok, "serve: server raggiungibile sulla porta %d: %s", port, err);
+    if (ok) {
         VERIFICA(resp.status == 200, "serve: 200 su /v1/images/generations (%d)", resp.status);
         VERIFICA(resp.body && strstr(resp.body, "\"b64_json\""), "serve: risposta con b64_json");
+        VERIFICA(st->prompts == prompts_before + 1, "serve: un grafo inviato a ComfyUI");
+        VERIFICA((st->prompts_bf16 - bf16_before) == (expect_bf16 ? 1 : 0),
+                 "serve: pesi %s dalla config quando il corpo non li indica", expect_bf16 ? "bf16" : "int8");
     }
     media_http_response_free(&resp);
     sa.stop = 1;
@@ -264,8 +315,33 @@ int main(void) {
     VERIFICA(!ok && strstr(err, "riferimento"), "video senza --rif rifiutato");
     ds4_media_result_free(&vbadr);
 
-    /* server OpenAI: avvia ds4_media_serve in un thread e chiama /v1/images/generations */
-    test_serve(m, st.port);
+    /* due lavori concorrenti sulla stessa istanza */
+    test_concorrenza(m);
+
+    /* free automatico dopo inattivita': idle_free_sec=1, un lavoro, poi il tick */
+    ds4_media_config icfg = cfg;
+    icfg.idle_free_sec = 1;
+    ds4_media *mi = ds4_media_create(&icfg);
+    VERIFICA(!ds4_media_idle_tick(mi), "idle: niente da liberare senza lavori");
+    ds4_media_image_req ireq = {.prompt = "x", .seed = 1};
+    ds4_media_result ires = {0};
+    VERIFICA(ds4_media_image(mi, &ireq, &ires, err, sizeof(err)), "idle: lavoro: %s", err);
+    ds4_media_result_free(&ires);
+    int frees_before = st.frees;
+    VERIFICA(!ds4_media_idle_tick(mi), "idle: subito dopo il lavoro non libera");
+    sleep(2);
+    VERIFICA(ds4_media_idle_tick(mi) && st.frees == frees_before + 1, "idle: dopo 2 s libera (frees %d)", st.frees);
+    VERIFICA(!ds4_media_idle_tick(mi), "idle: non libera due volte");
+    ds4_media_free(mi);
+
+    /* server OpenAI: avvia ds4_media_serve in un thread e chiama /v1/images/generations;
+     * poi la stessa cosa con una config bf16 per verificare che serve la rispetti */
+    test_serve(m, 19010, &st, false);
+    ds4_media_config bcfg = cfg;
+    bcfg.weights = DS4_MEDIA_BF16;
+    ds4_media *mb = ds4_media_create(&bcfg);
+    test_serve(mb, 19011, &st, true);
+    ds4_media_free(mb);
 
     ds4_media_free(m);
     stop_fake(st.port);

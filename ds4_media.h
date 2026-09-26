@@ -52,13 +52,16 @@ typedef struct {
     int steps;                 /* 0 = 25 */
     double cfg;                /* <=0 = 1.0 */
     long seed;                 /* <0 = casuale */
-    ds4_media_weights weights; /* override della config per questo lavoro */
+    ds4_media_weights weights; /* pesi di questo lavoro (il chiamante parte da
+                                * ds4_media_default_weights se non ha un override) */
     const char *const *refs;   /* percorsi dei file di riferimento */
     int n_refs;
     bool transparent;          /* avvolge il prompt nella formula RGBA, PNG con alfa */
 } ds4_media_image_req;
 
-/* Esito: percorsi dei PNG scritti (n_files), primo file per comodita', metadati. */
+/* Esito: percorsi dei file scritti (n_files), img-<data>-<ora>-<prompt_id8>-NNN.png
+ * (vid-...mp4 per i video), primo file per comodita', metadati. I lavori sono
+ * serializzati da un mutex interno: piu' thread possono chiamare queste funzioni. */
 typedef struct {
     char **files;
     int n_files;
@@ -99,6 +102,14 @@ bool ds4_media_health(ds4_media *m, char *err, size_t err_len);
 
 /* Scarica i modelli da ComfyUI (POST /free): restituisce memoria al modello di chat. */
 bool ds4_media_free_models(ds4_media *m, char *err, size_t err_len);
+
+/* Da chiamare periodicamente (il serve lo fa ogni 500 ms): se idle_free_sec > 0 e
+ * l'ultimo lavoro e' finito da almeno idle_free_sec, esegue /free. true se ha liberato.
+ * Non blocca: se un lavoro e' in corso non fa nulla. */
+bool ds4_media_idle_tick(ds4_media *m);
+
+/* Pesi di default della configurazione (per le richieste che non li specificano). */
+ds4_media_weights ds4_media_default_weights(const ds4_media *m);
 
 /* MemAvailable in GiB (da /proc/meminfo), -1 se non leggibile. Per la CLI: decidere
  * se offrire /free prima di un lavoro. Immagine int8: ~24 GiB; video H3: ~100 GiB. */

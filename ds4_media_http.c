@@ -269,37 +269,70 @@ bool media_http_post_image(const char *host, int port, const char *path,
 
 /* ── mini JSON ────────────────────────────────────────────────────────────── */
 
+/* Quattro cifre esadecimali in *out; false se ne manca una (si ferma al NUL). */
+static bool media_hex4(const char *p, long *out) {
+    long v = 0;
+    for (int i = 0; i < 4; i++) {
+        if (!isxdigit((unsigned char)p[i])) return false;
+        char c = p[i];
+        v = v * 16 + (isdigit((unsigned char)c) ? c - '0' : (tolower((unsigned char)c) - 'a' + 10));
+    }
+    *out = v;
+    return true;
+}
+
+/* Codifica un punto di codice in UTF-8 (1-4 byte). */
+static void media_buf_put_utf8(media_buf *b, long cp) {
+    unsigned char u[4];
+    int n;
+    if (cp < 0x80) { u[0] = (unsigned char)cp; n = 1; }
+    else if (cp < 0x800) { u[0] = 0xC0 | (cp >> 6); u[1] = 0x80 | (cp & 0x3F); n = 2; }
+    else if (cp < 0x10000) { u[0] = 0xE0 | (cp >> 12); u[1] = 0x80 | ((cp >> 6) & 0x3F); u[2] = 0x80 | (cp & 0x3F); n = 3; }
+    else { u[0] = 0xF0 | (cp >> 18); u[1] = 0x80 | ((cp >> 12) & 0x3F); u[2] = 0x80 | ((cp >> 6) & 0x3F); u[3] = 0x80 | (cp & 0x3F); n = 4; }
+    media_buf_append(b, (const char *)u, (size_t)n);
+}
+
+/* Decodifica la stringa JSON che inizia in p (virgolette comprese). Le sequenze \uXXXX
+ * diventano UTF-8, coppie surrogate incluse (cosi' i client Python con ensure_ascii,
+ * come Open WebUI, non perdono accenti ed emoji); una \u malformata o troncata chiude
+ * la stringa senza leggere oltre il terminatore. */
 static char *media_json_parse_string_at(const char *p) {
     if (*p != '"') return NULL;
     p++;
     media_buf b = {0};
     while (*p && *p != '"') {
-        if (*p == '\\' && p[1]) {
-            p++;
-            char c = *p;
-            switch (c) {
-                case 'n': c = '\n'; break;
-                case 't': c = '\t'; break;
-                case 'r': c = '\r'; break;
-                case 'b': c = '\b'; break;
-                case 'f': c = '\f'; break;
-                case '/': c = '/'; break;
-                case 'u': {
-                    /* solo BMP di base: byte ASCII o '?' */
-                    char hex[5] = {p[1], p[2], p[3], p[4], 0};
-                    long cp = strtol(hex, NULL, 16);
-                    p += 4;
-                    c = cp < 128 ? (char)cp : '?';
-                    break;
-                }
-                default: break;
-            }
-            media_buf_append(&b, &c, 1);
-            p++;
-        } else {
+        if (*p != '\\' || !p[1]) {
             media_buf_append(&b, p, 1);
             p++;
+            continue;
         }
+        p++;
+        char c = *p;
+        if (c == 'u') {
+            long cp;
+            if (!media_hex4(p + 1, &cp)) break;   /* troncata: fermati qui */
+            p += 5;
+            if (cp >= 0xD800 && cp <= 0xDBFF && p[0] == '\\' && p[1] == 'u') {
+                long lo;
+                if (media_hex4(p + 2, &lo) && lo >= 0xDC00 && lo <= 0xDFFF) {
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                    p += 6;
+                }
+            }
+            if (cp >= 0xD800 && cp <= 0xDFFF) cp = 0xFFFD;   /* surrogato spaiato */
+            media_buf_put_utf8(&b, cp);
+            continue;
+        }
+        switch (c) {
+            case 'n': c = '\n'; break;
+            case 't': c = '\t'; break;
+            case 'r': c = '\r'; break;
+            case 'b': c = '\b'; break;
+            case 'f': c = '\f'; break;
+            default: break;   /* \" \\ \/ e altri: il carattere stesso */
+        }
+        media_buf_append(&b, &c, 1);
+        p++;
     }
     return media_buf_take(&b);
 }
