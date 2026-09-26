@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static volatile int g_stop;
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
@@ -25,6 +26,43 @@ static bool flag(int argc, char **argv, const char *name) {
     for (int i = 0; i < argc; i++)
         if (!strcmp(argv[i], name)) return true;
     return false;
+}
+
+/* Domanda s/n sul terminale; default_yes = risposta con solo Invio. Fuori da un
+ * terminale (script) non chiede e restituisce il default. */
+static bool ask(const char *question, bool default_yes) {
+    if (!isatty(0)) return default_yes;
+    fprintf(stderr, "%s [%s] ", question, default_yes ? "S/n" : "s/N");
+    char line[16];
+    if (!fgets(line, sizeof(line), stdin)) return default_yes;
+    if (line[0] == '\n') return default_yes;
+    return line[0] == 's' || line[0] == 'S' || line[0] == 'y' || line[0] == 'Y';
+}
+
+/* Se i GiB liberi sono sotto la soglia, offre di scaricare i modelli da ComfyUI (/free).
+ * Con --auto-free libera senza chiedere; con --no-free non chiede e non libera. */
+static void offri_free(ds4_media *m, int argc, char **argv, long need_gib, const char *cosa) {
+    if (flag(argc, argv, "--no-free")) return;
+    long avail = ds4_media_avail_gib();
+    if (avail < 0 || avail >= need_gib) return;
+    fprintf(stderr, "memoria: %ld GiB liberi, per %s ne servono ~%ld.\n", avail, cosa, need_gib);
+    bool go = flag(argc, argv, "--auto-free") ||
+              ask("Libero i modelli caricati in ComfyUI (free)?", true);
+    if (!go) return;
+    char err[256] = {0};
+    if (ds4_media_free_models(m, err, sizeof(err)))
+        fprintf(stderr, "memoria liberata: ora %ld GiB.\n", ds4_media_avail_gib());
+    else
+        fprintf(stderr, "free non riuscito: %s\n", err);
+}
+
+/* Dopo un lavoro riuscito, chiede se aprire il file col visualizzatore di sistema. */
+static void offri_vista(int argc, char **argv, const char *path) {
+    if (!path || flag(argc, argv, "--no-vista")) return;
+    if (!ask("Vuoi visualizzare il risultato?", false)) return;
+    char cmd[1200];
+    snprintf(cmd, sizeof(cmd), "xdg-open %s >/dev/null 2>&1 &", path);
+    if (system(cmd) != 0) fprintf(stderr, "non riesco ad aprire il visualizzatore (xdg-open).\n");
 }
 
 static ds4_media *build(int argc, char **argv) {
@@ -82,6 +120,7 @@ static int cmd_img(int argc, char **argv) {
     if (!prompt) { fprintf(stderr, "uso: ds4-media img [opzioni] \"descrizione\"\n"); ds4_media_free(m); return 2; }
     req.prompt = prompt;
 
+    offri_free(m, argc, argv, 24, "un'immagine");   /* int8 ~18 + margine */
     fprintf(stderr, "genero l'immagine con Qwen-Image (ComfyUI): \"%.60s\"%s\n",
             prompt, strlen(prompt) > 60 ? "..." : "");
     ds4_media_result res = {0};
@@ -90,6 +129,7 @@ static int cmd_img(int argc, char **argv) {
     if (ok) {
         printf("%dx%d seed=%ld in %ld ms\n", res.width, res.height, res.seed, res.ms);
         for (int i = 0; i < res.n_files; i++) printf("  %s\n", res.files[i]);
+        if (res.n_files) offri_vista(argc, argv, res.files[0]);
     } else {
         fprintf(stderr, "ds4-media: %s\n", err);
     }
@@ -124,6 +164,7 @@ static int cmd_video(int argc, char **argv) {
         return 2;
     }
     req.prompt = prompt;
+    offri_free(m, argc, argv, 100, "un video H3");   /* H3 occupa la GPU per intero */
     fprintf(stderr, "genero il video con MiniMax H3 (occupa la GPU, dura minuti): \"%.50s\"%s\n",
             prompt, strlen(prompt) > 50 ? "..." : "");
     ds4_media_result res = {0};
@@ -132,6 +173,7 @@ static int cmd_video(int argc, char **argv) {
     if (ok) {
         printf("%dx%d seed=%ld in %ld ms\n", res.width, res.height, res.seed, res.ms);
         for (int i = 0; i < res.n_files; i++) printf("  %s\n", res.files[i]);
+        if (res.n_files) offri_vista(argc, argv, res.files[0]);
     } else {
         fprintf(stderr, "ds4-media: %s\n", err);
     }

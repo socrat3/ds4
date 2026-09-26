@@ -97,6 +97,10 @@ bool ds4_media_health(ds4_media *m, char *err, size_t err_len);
 /* Scarica i modelli da ComfyUI (POST /free): restituisce memoria al modello di chat. */
 bool ds4_media_free_models(ds4_media *m, char *err, size_t err_len);
 
+/* MemAvailable in GiB (da /proc/meminfo), -1 se non leggibile. Per la CLI: decidere
+ * se offrire /free prima di un lavoro. Immagine int8: ~24 GiB; video H3: ~100 GiB. */
+long ds4_media_avail_gib(void);
+
 /* "1024x1024" -> width,height (multipli di 32). false se malformato o fuori limite. */
 bool ds4_media_parse_size(const char *s, int *width, int *height);
 

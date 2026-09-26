@@ -516,13 +516,15 @@ bool ds4_media_video(ds4_media *m, const ds4_media_video_req *req,
     int length = media_h3_length(req->seconds);
     long seed = req->seed >= 0 ? req->seed : (long)(time(NULL) ^ (getpid() << 8)) & 0x7fffffff;
 
-    /* Gate: H3 occupa la GPU per intero (~110 GiB). */
+    /* Gate: H3 occupa la GPU per intero (~110 GiB in uso). Serve che nessun modello
+     * grande sia residente; a macchina scarica MemAvailable e' ~111-118 GiB. Richiedo
+     * >= 100 GiB liberi: passa a vuoto, blocca se un LLM/immagine e' ancora caricato. */
     if (!m->no_gate) {
         long avail = media_avail_kib(m);
-        long need = (110L + 6) * 1024 * 1024;
+        long need = 100L * 1024 * 1024;
         if (avail > 0 && need > avail) {
-            media_set_err(err, err_len, "H3 vuole ~110 GiB, liberi %ld GiB: spegni ogni modello prima del video",
-                          avail / (1024 * 1024));
+            media_set_err(err, err_len, "H3 vuole la GPU quasi intera, liberi solo %ld GiB: "
+                          "spegni ogni modello/immagine prima del video", avail / (1024 * 1024));
             return false;
         }
     }
@@ -617,6 +619,17 @@ bool ds4_media_free_models(ds4_media *m, char *err, size_t err_len) {
     bool ok = resp.status == 200;
     media_http_response_free(&resp);
     return ok;
+}
+
+long ds4_media_avail_gib(void) {
+    FILE *fp = fopen("/proc/meminfo", "r");
+    if (!fp) return -1;
+    char line[256];
+    long kib = -1;
+    while (fgets(line, sizeof(line), fp))
+        if (strncmp(line, "MemAvailable:", 13) == 0) { kib = strtol(line + 13, NULL, 10); break; }
+    fclose(fp);
+    return kib < 0 ? -1 : kib / (1024 * 1024);
 }
 
 bool ds4_media_parse_size(const char *s, int *width, int *height) {
