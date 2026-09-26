@@ -72,7 +72,7 @@ void media_http_response_free(media_http_response *r) {
 
 #define MEDIA_CONNECT_TIMEOUT_MS 3000
 
-static int media_tcp_connect(const char *host, int port, char *err, size_t err_len) {
+int media_tcp_connect(const char *host, int port, char *err, size_t err_len) {
     char service[32];
     snprintf(service, sizeof(service), "%d", port);
     struct addrinfo hints, *res = NULL;
@@ -84,7 +84,7 @@ static int media_tcp_connect(const char *host, int port, char *err, size_t err_l
         media_set_err(err, err_len, "getaddrinfo %s: %s", host, gai_strerror(gai));
         return -1;
     }
-    int fd = -1;
+    int fd = -1, last_errno = ECONNREFUSED;
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) continue;
@@ -100,23 +100,28 @@ static int media_tcp_connect(const char *host, int port, char *err, size_t err_l
                 getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &slen);
                 if (soerr == 0) { if (flags >= 0) fcntl(fd, F_SETFL, flags); break; }
                 errno = soerr;
+            } else {
+                errno = ETIMEDOUT;
             }
         }
+        last_errno = errno;   /* close() puo' sporcarlo */
         close(fd);
         fd = -1;
     }
     freeaddrinfo(res);
     if (fd < 0)
         media_set_err(err, err_len, "ComfyUI non risponde su %s:%d (%s): accendi ComfyUI (spark-switch avvia 18)",
-                      host, port, strerror(errno));
+                      host, port, strerror(last_errno));
     return fd;
 }
 
-static int media_write_all(int fd, const void *buf, size_t len) {
+int media_write_all(int fd, const void *buf, size_t len) {
     const char *p = buf;
     while (len) {
 #ifdef MSG_NOSIGNAL
+        /* send() per non ricevere SIGPIPE da un peer chiuso; sui file vale write(). */
         ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
+        if (n < 0 && errno == ENOTSOCK) n = write(fd, p, len);
 #else
         ssize_t n = write(fd, p, len);
 #endif

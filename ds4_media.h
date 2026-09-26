@@ -20,6 +20,8 @@
 typedef void (*ds4_media_log_fn)(void *privdata, const char *message);
 /* true = il chiamante chiede di annullare il lavoro in corso (Ctrl+C, disconnessione). */
 typedef bool (*ds4_media_cancel_fn)(void *privdata);
+/* Passo `step` di `total` del campionamento (dagli eventi websocket di ComfyUI). */
+typedef void (*ds4_media_progress_fn)(void *privdata, int step, int total);
 
 typedef enum { DS4_MEDIA_INT8 = 0, DS4_MEDIA_BF16 = 1 } ds4_media_weights;
 
@@ -38,26 +40,40 @@ typedef struct {
     void *log_privdata;
     ds4_media_cancel_fn cancel;
     void *cancel_privdata;
+    ds4_media_progress_fn progress;   /* opzionale */
+    void *progress_privdata;
 } ds4_media_config;
 
 typedef struct ds4_media ds4_media;
 
 /* Una richiesta di immagine da testo (o modifica, se n_refs>0). Le dimensioni sono
- * multipli di 32; seed<0 = casuale; steps 0 = default (25). refs = percorsi di file
- * immagine locali, al massimo 10, il primo e' il bersaglio della modifica. */
+ * multipli di 32, lato <= DS4_MEDIA_MAX_SIDE, area <= DS4_MEDIA_MAX_AREA; seed<0 =
+ * casuale; steps 0 = default (25). refs = percorsi di file immagine locali, al massimo
+ * 10, il primo e' il bersaglio della modifica: senza width/height l'uscita prende le
+ * proporzioni e (entro i limiti) l'area del primo riferimento. */
 typedef struct {
     const char *prompt;
-    const char *negative;      /* opzionale */
-    int width, height;         /* 0,0 = 1024x1024 */
+    const char *negative;      /* opzionale; con cfg 1 ComfyUI lo ignora, quindi se c'e'
+                                * e cfg non e' dato si usa DS4_MEDIA_NEG_CFG */
+    int width, height;         /* 0,0 = 1024x1024 (o dal primo riferimento) */
     int steps;                 /* 0 = 25 */
-    double cfg;                /* <=0 = 1.0 */
+    double cfg;                /* <=0 = 1.0 (DS4_MEDIA_NEG_CFG con un negativo) */
+    int n;                     /* immagini nello stesso lavoro, 0 = 1, max DS4_MEDIA_MAX_N */
     long seed;                 /* <0 = casuale */
     ds4_media_weights weights; /* pesi di questo lavoro (il chiamante parte da
                                 * ds4_media_default_weights se non ha un override) */
     const char *const *refs;   /* percorsi dei file di riferimento */
     int n_refs;
     bool transparent;          /* avvolge il prompt nella formula RGBA, PNG con alfa */
+    ds4_media_cancel_fn cancel;   /* opzionale, per questo lavoro (oltre a quella della config) */
+    void *cancel_privdata;
 } ds4_media_image_req;
+
+#define DS4_MEDIA_MAX_SIDE 2752
+#define DS4_MEDIA_MAX_AREA (2752L * 1536)
+#define DS4_MEDIA_MAX_N 4
+#define DS4_MEDIA_NEG_CFG 2.5
+#define DS4_MEDIA_VIDEO_NEED_GIB 100
 
 /* Esito: percorsi dei file scritti (n_files), img-<data>-<ora>-<prompt_id8>-NNN.png
  * (vid-...mp4 per i video), primo file per comodita', metadati. I lavori sono
@@ -68,6 +84,8 @@ typedef struct {
     int width, height;
     long seed;
     long ms;                   /* durata totale in millisecondi */
+    long ms_upload, ms_queue, ms_run, ms_fetch;   /* fasi: riferimenti, coda, generazione, scarico */
+    bool invalid;              /* su false: la richiesta stessa non era valida (errore del chiamante) */
     char prompt_id[64];
 } ds4_media_result;
 
@@ -85,6 +103,8 @@ typedef struct {
     int width, height;         /* 0,0 = 864x480 (0,4 MP 16:9) */
     int steps;                 /* 0 = 20 */
     long seed;                 /* <0 = casuale */
+    ds4_media_cancel_fn cancel;   /* opzionale, come per le immagini */
+    void *cancel_privdata;
 } ds4_media_video_req;
 
 /* Genera una o piu' immagini. Su true, *out e' riempito (da liberare con
@@ -111,11 +131,19 @@ bool ds4_media_idle_tick(ds4_media *m);
 /* Pesi di default della configurazione (per le richieste che non li specificano). */
 ds4_media_weights ds4_media_default_weights(const ds4_media *m);
 
-/* MemAvailable in GiB (da /proc/meminfo), -1 se non leggibile. Per la CLI: decidere
- * se offrire /free prima di un lavoro. Immagine int8: ~24 GiB; video H3: ~100 GiB. */
+/* MemAvailable in GiB (da /proc/meminfo), -1 se non leggibile. */
 long ds4_media_avail_gib(void);
 
-/* "1024x1024" -> width,height (multipli di 32). false se malformato o fuori limite. */
+/* Memoria a disposizione di ComfyUI in GiB: MemAvailable piu' quella che ComfyUI tiene
+ * gia' (torch_vram_total di /system_stats), che riusa per il prossimo lavoro. -1 se non
+ * leggibile. E' la stessa misura del gate interno. */
+long ds4_media_comfy_avail_gib(ds4_media *m);
+
+/* Fabbisogno stimato in GiB (margine compreso) di un'immagine: pesi, dimensioni, n. */
+long ds4_media_image_need_gib(ds4_media_weights w, int width, int height, int n);
+
+/* "1024x1024" -> width,height (multipli di 32, lato e area nei limiti). false se
+ * malformato o fuori limite. */
 bool ds4_media_parse_size(const char *s, int *width, int *height);
 
 /* Cartella di uscita configurata (per servire i file con response_format=url). */
@@ -123,7 +151,9 @@ const char *ds4_media_dir(const ds4_media *m);
 
 /* Server HTTP compatibile con l'API Immagini di OpenAI (POST /v1/images/generations,
  * GET /v1/media/files/<nome>, GET /v1/models): bersaglio fisso per Open WebUI. Blocca
- * finche' non riceve SIGINT/SIGTERM o *stop diventa non-zero. */
+ * finche' *stop diventa non-zero, poi aspetta (fino a 60 s) le connessioni in corso.
+ * false se non parte, o se allo scadere qualche connessione usa ancora m: in quel
+ * caso m non va liberata. */
 bool ds4_media_serve(ds4_media *m, int port, volatile int *stop, char *err, size_t err_len);
 
 #endif

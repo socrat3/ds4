@@ -715,14 +715,22 @@ test-ssd-cache: tests/test_ssd_cache
 
 tests/test_engram: tests/test_engram.c ds4_engram.c ds4_engram.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ tests/test_engram.c ds4_engram.c $(LDLIBS)
-tests/test_media: tests/test_media.c ds4_media.c ds4_media_http.c ds4_media_serve.c ds4_media.h ds4_media_http.h
-	$(CC) $(CFLAGS) -I. -o $@ tests/test_media.c ds4_media.c ds4_media_http.c ds4_media_serve.c -lpthread
-test-media: tests/test_media
+# Modulo immagini/video (ds4_media): C99, nessuna dipendenza oltre pthread e libm.
+MEDIA_SRCS = ds4_media.c ds4_media_job.c ds4_media_ref.c ds4_media_video.c ds4_media_ws.c ds4_media_http.c ds4_media_serve.c
+MEDIA_HDRS = ds4_media.h ds4_media_int.h ds4_media_http.h ds4_media_ws.h ds4_media_h3.inc
+
+tests/test_media: tests/test_media.c $(MEDIA_SRCS) $(MEDIA_HDRS)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_media.c $(MEDIA_SRCS) -lpthread -lm
+test-media: tests/test_media tests/test_media_f01 ds4-media
 	./tests/test_media
+	./tests/test_media_f01
+
+tests/test_media_f01: tests/test_media_f01.c tests/media_fake.h $(MEDIA_SRCS) $(MEDIA_HDRS)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_media_f01.c $(MEDIA_SRCS) -lpthread -lm
 
 # ds4-media: eseguibile autonomo (serve + img), senza GPU. Bersaglio fisso per Open WebUI.
-ds4-media: ds4_media_cli.c ds4_media.c ds4_media_http.c ds4_media_serve.c ds4_media.h ds4_media_http.h
-	$(CC) $(CFLAGS) -I. -o $@ ds4_media_cli.c ds4_media.c ds4_media_http.c ds4_media_serve.c -lpthread
+ds4-media: ds4_media_cli.c $(MEDIA_SRCS) $(MEDIA_HDRS)
+	$(CC) $(CFLAGS) -I. -o $@ ds4_media_cli.c $(MEDIA_SRCS) -lpthread -lm
 
 .PHONY: test-engram
 test-engram: tests/test_engram

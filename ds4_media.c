@@ -2,18 +2,20 @@
  * Il grafo testo-immagine e' quello del template ufficiale Qwen-Image 2.1 (t2i):
  *   UNETLoader -> (CLIPLoader, VAELoader) -> TextEncodeQwenImage21 -> KSampler
  *   -> VAEDecode -> SaveImage, 25 passi, cfg 1, euler/simple. La modifica aggiunge
- *   images.image_1..N a TextEncodeQwenImage21 (riferimenti caricati con /upload/image). */
-#include "ds4_media.h"
-#include "ds4_media_http.h"
+ *   images.image_1..N a TextEncodeQwenImage21 (riferimenti caricati con /upload/image)
+ *   e campiona sul latente che il nodo stesso dimensiona sul primo riferimento: con un
+ *   latente di altre dimensioni la modifica esce spostata (tooltip in nodes_qwen.py).
+ *
+ * Qui stanno ciclo di vita, memoria, grafo e lavoro delle immagini; il viaggio verso
+ * ComfyUI e' in ds4_media_job.c, il video in ds4_media_video.c. */
+#include "ds4_media_int.h"
 
 #include <errno.h>
-#include <pthread.h>
-#include <stdarg.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <time.h>
 #include <unistd.h>
 
 /* Nomi dei pesi come stanno su disco in ComfyUI (Comfy-Org/Qwen-Image-2.1). */
@@ -23,49 +25,11 @@
 #define QI_CLIP_BF16 "qwen3vl_8b_bf16.safetensors"
 #define QI_VAE       "qwen_image_2.1_vae_bf16.safetensors"
 
-#define MEDIA_MAX_W 2752
-#define MEDIA_MAX_H 1536
-#define MEDIA_MARGIN_KIB (6L * 1024 * 1024)   /* margine di sicurezza: 6 GiB */
-
-struct ds4_media {
-    char *host, *media_dir, *comfy_output_dir;
-    int port;
-    ds4_media_weights weights;
-    int idle_free_sec;
-    bool no_gate;
-    long avail_override_kib;
-    ds4_media_log_fn log;
-    void *log_privdata;
-    ds4_media_cancel_fn cancel;
-    void *cancel_privdata;
-    time_t last_job;           /* fine dell'ultimo lavoro riuscito; 0 = nessuno da /free */
-    pthread_mutex_t lock;      /* un lavoro ComfyUI alla volta (il serve ha un thread per connessione) */
-};
-
-static void media_log(ds4_media *m, const char *fmt, ...) {
-    if (!m->log) return;
-    char buf[512];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    m->log(m->log_privdata, buf);
-}
-
-static bool media_cancelled(ds4_media *m) {
-    return m->cancel && m->cancel(m->cancel_privdata);
-}
+#define GIB_KIB (1024L * 1024)
+#define MEDIA_MARGIN_KIB (6 * GIB_KIB)   /* margine di sicurezza: 6 GiB */
+#define MEDIA_EDIT_MIN_RES 512           /* sotto, Qwen-Image rende male: si ingrandisce */
 
 /* ── ciclo di vita ────────────────────────────────────────────────────────── */
-
-static char *media_default_dir(void) {
-    const char *home = getenv("HOME");
-    if (!home || !home[0]) home = ".";
-    media_buf b = {0};
-    media_buf_puts(&b, home);
-    media_buf_puts(&b, "/.ds4/media");
-    return media_buf_take(&b);
-}
 
 static bool media_mkdir_p(const char *path) {
     char tmp[1024];
@@ -84,8 +48,15 @@ ds4_media *ds4_media_create(const ds4_media_config *cfg) {
     memset(m, 0, sizeof(*m));
     m->host = media_xstrdup(cfg->host && cfg->host[0] ? cfg->host : "127.0.0.1");
     m->port = cfg->port > 0 ? cfg->port : 8188;
-    m->media_dir = cfg->media_dir && cfg->media_dir[0] ? media_xstrdup(cfg->media_dir)
-                                                       : media_default_dir();
+    if (cfg->media_dir && cfg->media_dir[0]) {
+        m->media_dir = media_xstrdup(cfg->media_dir);
+    } else {
+        const char *home = getenv("HOME");
+        media_buf b = {0};
+        media_buf_puts(&b, home && home[0] ? home : ".");
+        media_buf_puts(&b, "/.ds4/media");
+        m->media_dir = media_buf_take(&b);
+    }
     m->comfy_output_dir = cfg->comfy_output_dir && cfg->comfy_output_dir[0]
                               ? media_xstrdup(cfg->comfy_output_dir) : NULL;
     m->weights = cfg->weights;
@@ -96,6 +67,9 @@ ds4_media *ds4_media_create(const ds4_media_config *cfg) {
     m->log_privdata = cfg->log_privdata;
     m->cancel = cfg->cancel;
     m->cancel_privdata = cfg->cancel_privdata;
+    m->progress = cfg->progress;
+    m->progress_privdata = cfg->progress_privdata;
+    m->cache_node = -1;
     pthread_mutex_init(&m->lock, NULL);
     if (!media_mkdir_p(m->media_dir))
         media_log(m, "ds4: media attenzione: non creo %s", m->media_dir);
@@ -121,46 +95,135 @@ void ds4_media_result_free(ds4_media_result *r) {
     r->n_files = 0;
 }
 
-/* ── gate di memoria ──────────────────────────────────────────────────────── */
+/* ── memoria ──────────────────────────────────────────────────────────────── */
 
-static long media_avail_kib(ds4_media *m) {
-    if (m->avail_override_kib > 0) return m->avail_override_kib;
+static long media_meminfo_kib(void) {
     FILE *fp = fopen("/proc/meminfo", "r");
     if (!fp) return -1;
     char line[256];
     long kib = -1;
-    while (fgets(line, sizeof(line), fp)) {
+    while (fgets(line, sizeof(line), fp))
         if (strncmp(line, "MemAvailable:", 13) == 0) { kib = strtol(line + 13, NULL, 10); break; }
-    }
     fclose(fp);
     return kib;
 }
 
-/* Fabbisogno stimato (GiB) da pesi e dimensioni, dai picchi misurati il 25/09. */
-static long media_need_kib(ds4_media_weights w, int width, int height) {
-    long gib;
-    if (w == DS4_MEDIA_BF16) gib = ((long)width * height > 1024L * 1024) ? 37 : 32;
-    else gib = 18;
-    return gib * 1024 * 1024;
+long ds4_media_avail_gib(void) {
+    long kib = media_meminfo_kib();
+    return kib < 0 ? -1 : kib / GIB_KIB;
 }
 
-static bool media_gate(ds4_media *m, ds4_media_weights w, int width, int height,
-                       char *err, size_t err_len) {
-    if (m->no_gate) return true;
-    long avail = media_avail_kib(m);
-    if (avail < 0) return true;   /* non so leggere: non blocco */
-    long need = media_need_kib(w, width, height) + MEDIA_MARGIN_KIB;
-    if (need > avail) {
-        media_set_err(err, err_len,
-                      "servono ~%ld GiB liberi, disponibili %ld GiB: usa int8, riduci le dimensioni, "
-                      "o libera memoria (spegni un modello)",
-                      need / (1024 * 1024), avail / (1024 * 1024));
-        return false;
+/* La memoria che ComfyUI gia' tiene (i pesi dell'ultimo lavoro, la cache di torch) non
+ * compare in MemAvailable, ma ComfyUI la riusa: contarla evita di rifiutare la seconda
+ * immagine quando la prima ha lasciato i pesi caricati. torch_vram_total e' quanto
+ * l'allocatore di torch ha riservato; sul DGX Spark la memoria e' unificata. */
+long media_comfy_avail_kib(ds4_media *m) {
+    long avail = m->avail_override_kib > 0 ? m->avail_override_kib : media_meminfo_kib();
+    if (avail < 0) return -1;
+    media_http_response r = {0};
+    char e[64];
+    if (media_http_get(m->host, m->port, "/system_stats", 5000, &r, e, sizeof(e)) && r.status == 200) {
+        bool found = false;
+        long bytes = media_json_int(r.body, "torch_vram_total", &found);
+        if (found && bytes > 0) avail += bytes / 1024;
     }
+    media_http_response_free(&r);
+    return avail;
+}
+
+long ds4_media_comfy_avail_gib(ds4_media *m) {
+    long kib = media_comfy_avail_kib(m);
+    return kib < 0 ? -1 : kib / GIB_KIB;
+}
+
+/* Fabbisogno stimato: i picchi misurati il 25/09 per un'immagine, piu' ~2 GiB per
+ * megapixel per ogni immagine in piu' nello stesso lavoro (stima, da misurare). */
+static long media_need_kib(ds4_media_weights w, int width, int height, int n) {
+    long px = (long)width * height;
+    long gib;
+    if (w == DS4_MEDIA_BF16) gib = px > 1024L * 1024 ? 37 : 32;
+    else gib = 18;
+    long mp = (px + 1024L * 1024 - 1) / (1024L * 1024);
+    if (n > 1) gib += 2 * mp * (n - 1);
+    return gib * GIB_KIB + MEDIA_MARGIN_KIB;
+}
+
+long ds4_media_image_need_gib(ds4_media_weights w, int width, int height, int n) {
+    return (media_need_kib(w, width, height, n) + GIB_KIB - 1) / GIB_KIB;
+}
+
+bool media_mem_gate(ds4_media *m, long need_kib, const char *hint, char *err, size_t err_len) {
+    if (m->no_gate) return true;
+    long avail = media_comfy_avail_kib(m);
+    if (avail < 0) return true;   /* non so leggere: non blocco */
+    if (need_kib <= avail) return true;
+    media_set_err(err, err_len, "servono ~%ld GiB per ComfyUI, disponibili %ld GiB (liberi piu' "
+                  "quelli che ComfyUI tiene gia'): %s", (need_kib + GIB_KIB - 1) / GIB_KIB,
+                  avail / GIB_KIB, hint);
+    return false;
+}
+
+/* ── dimensioni ───────────────────────────────────────────────────────────── */
+
+static bool media_size_ok(int w, int h) {
+    return w > 0 && h > 0 && w % 32 == 0 && h % 32 == 0 &&
+           w <= DS4_MEDIA_MAX_SIDE && h <= DS4_MEDIA_MAX_SIDE && (long)w * h <= DS4_MEDIA_MAX_AREA;
+}
+
+bool ds4_media_parse_size(const char *s, int *width, int *height) {
+    if (!s) return false;
+    char *x = NULL, *end = NULL;
+    errno = 0;
+    long w = strtol(s, &x, 10);
+    if (x == s || (*x != 'x' && *x != 'X')) return false;
+    long h = strtol(x + 1, &end, 10);
+    if (end == x + 1 || *end || errno || w > DS4_MEDIA_MAX_SIDE || h > DS4_MEDIA_MAX_SIDE) return false;
+    if (!media_size_ok((int)w, (int)h)) return false;
+    *width = (int)w;
+    *height = (int)h;
     return true;
 }
 
-/* ── costruzione del grafo ────────────────────────────────────────────────── */
+/* Replica il ridimensionamento di TextEncodeQwenImage21: il riferimento va a circa
+ * res x res pixel con le sue proporzioni, lati multipli di 32. Python arrotonda alla
+ * pari (round), come nearbyint nel modo di arrotondamento di default. */
+static void media_ref_scaled(int rw, int rh, int res, int *w, int *h) {
+    double ratio = (double)rw / rh;
+    *w = (int)nearbyint(sqrt((double)res * res * ratio) / 32.0) * 32;
+    *h = (int)nearbyint(sqrt((double)res * res / ratio) / 32.0) * 32;
+    if (*w < 32) *w = 32;
+    if (*h < 32) *h = 32;
+}
+
+/* Per una modifica senza dimensioni esplicite: la risoluzione che conserva l'area del
+ * primo riferimento (almeno MEDIA_EDIT_MIN_RES), ridotta finche' l'uscita rientra nei
+ * limiti. Riferimento illeggibile: 1024, il default del nodo. */
+static int media_edit_resolution(int rw, int rh, int *ow, int *oh) {
+    if (rw <= 0 || rh <= 0) { rw = rh = 1024; }
+    int res = (int)nearbyint(sqrt((double)rw * rh) / 32.0) * 32;
+    if (res < MEDIA_EDIT_MIN_RES) res = MEDIA_EDIT_MIN_RES;
+    for (;;) {
+        media_ref_scaled(rw, rh, res, ow, oh);
+        if (media_size_ok(*ow, *oh) || res <= 32) return res;
+        res -= 32;
+    }
+}
+
+/* ── grafo ────────────────────────────────────────────────────────────────── */
+
+typedef struct {
+    ds4_media_weights weights;
+    long seed;
+    int width, height;         /* dimensioni attese dell'uscita */
+    int n, steps;
+    double cfg;
+    int resolution;            /* dei riferimenti in TextEncodeQwenImage21 */
+    bool ref_latent;           /* campiona sul latente del nodo 4 (modifica senza size) */
+    bool cache;                /* QwenImage21Cache tra UNET e KSampler */
+    char **refs;
+    int n_refs;
+    char prefix[160];
+} media_plan;
 
 /* Avvolge il prompt nella formula RGBA ufficiale per lo sfondo trasparente. */
 static char *media_wrap_transparent(const char *prompt) {
@@ -171,332 +234,170 @@ static char *media_wrap_transparent(const char *prompt) {
     return media_buf_take(&b);
 }
 
-/* Costruisce il JSON {"prompt": <grafo>, "client_id": ...} per POST /prompt.
- * ref_names = nomi dei file di riferimento gia' caricati su ComfyUI (o NULL). */
-static char *media_build_graph(ds4_media *m, const ds4_media_image_req *req,
-                               ds4_media_weights w, long seed, int width, int height,
-                               int steps, double cfg, char **ref_names, int n_refs,
-                               const char *prefix) {
-    (void)m;
-    const char *unet = (w == DS4_MEDIA_BF16) ? QI_UNET_BF16 : QI_UNET_INT8;
-    const char *clip = (w == DS4_MEDIA_BF16) ? QI_CLIP_BF16 : QI_CLIP_INT8;
-    char *eff_prompt = req->transparent ? media_wrap_transparent(req->prompt)
-                                        : media_xstrdup(req->prompt);
-    char *qprompt = media_json_quote(eff_prompt);
+/* L'oggetto JSON dei nodi. Id: 1-3 caricatori, 4 encoder, 5 latente, 6 KSampler,
+ * 7 VAEDecode, 8 SaveImage, 9 cache dei riferimenti, 100+i LoadImage. */
+static char *media_build_graph(const ds4_media_image_req *req, const media_plan *p) {
+    const char *unet = p->weights == DS4_MEDIA_BF16 ? QI_UNET_BF16 : QI_UNET_INT8;
+    const char *clip = p->weights == DS4_MEDIA_BF16 ? QI_CLIP_BF16 : QI_CLIP_INT8;
+    char *eff = req->transparent ? media_wrap_transparent(req->prompt) : media_xstrdup(req->prompt);
+    char *qprompt = media_json_quote(eff);
     char *qneg = media_json_quote(req->negative ? req->negative : "");
-    free(eff_prompt);
+    char *qprefix = media_json_quote(p->prefix);
+    free(eff);
 
     media_buf g = {0};
-    char line[1024];
-    media_buf_puts(&g, "{\"prompt\":{");
-    /* 1 UNETLoader, 2 CLIPLoader, 3 VAELoader */
+    char line[512];
     snprintf(line, sizeof(line),
-             "\"1\":{\"class_type\":\"UNETLoader\",\"inputs\":{\"unet_name\":\"%s\",\"weight_dtype\":\"default\"}},", unet);
+             "{\"1\":{\"class_type\":\"UNETLoader\",\"inputs\":{\"unet_name\":\"%s\",\"weight_dtype\":\"default\"}},"
+             "\"2\":{\"class_type\":\"CLIPLoader\",\"inputs\":{\"clip_name\":\"%s\",\"type\":\"qwen_image\",\"device\":\"default\"}},"
+             "\"3\":{\"class_type\":\"VAELoader\",\"inputs\":{\"vae_name\":\"%s\"}},", unet, clip, QI_VAE);
     media_buf_puts(&g, line);
-    snprintf(line, sizeof(line),
-             "\"2\":{\"class_type\":\"CLIPLoader\",\"inputs\":{\"clip_name\":\"%s\",\"type\":\"qwen_image\",\"device\":\"default\"}},", clip);
-    media_buf_puts(&g, line);
-    snprintf(line, sizeof(line),
-             "\"3\":{\"class_type\":\"VAELoader\",\"inputs\":{\"vae_name\":\"%s\"}},", QI_VAE);
-    media_buf_puts(&g, line);
-    /* 4 TextEncodeQwenImage21 (con eventuali riferimenti) */
     media_buf_puts(&g, "\"4\":{\"class_type\":\"TextEncodeQwenImage21\",\"inputs\":{\"clip\":[\"2\",0],\"prompt\":");
     media_buf_puts(&g, qprompt);
     media_buf_puts(&g, ",\"negative_prompt\":");
     media_buf_puts(&g, qneg);
-    media_buf_puts(&g, ",\"resolution\":1024");
-    for (int i = 0; i < n_refs; i++) {
+    snprintf(line, sizeof(line), ",\"resolution\":%d", p->resolution);
+    media_buf_puts(&g, line);
+    for (int i = 0; i < p->n_refs; i++) {
         snprintf(line, sizeof(line), ",\"images.image_%d\":[\"%d\",0]", i + 1, 100 + i);
         media_buf_puts(&g, line);
     }
     media_buf_puts(&g, ",\"vae\":[\"3\",0]}},");
-    /* 5 EmptyLatentImage */
-    snprintf(line, sizeof(line),
-             "\"5\":{\"class_type\":\"EmptyLatentImage\",\"inputs\":{\"width\":%d,\"height\":%d,\"batch_size\":1}},",
-             width, height);
+    if (!p->ref_latent)
+        snprintf(line, sizeof(line), "\"5\":{\"class_type\":\"EmptyLatentImage\",\"inputs\":"
+                 "{\"width\":%d,\"height\":%d,\"batch_size\":%d}},", p->width, p->height, p->n);
+    else if (p->n > 1)
+        snprintf(line, sizeof(line), "\"5\":{\"class_type\":\"RepeatLatentBatch\",\"inputs\":"
+                 "{\"samples\":[\"4\",2],\"amount\":%d}},", p->n);
+    else
+        line[0] = '\0';
     media_buf_puts(&g, line);
-    /* 6 KSampler */
+    const char *latent = (p->ref_latent && p->n == 1) ? "[\"4\",2]" : "[\"5\",0]";
+    if (p->cache)
+        media_buf_puts(&g, "\"9\":{\"class_type\":\"QwenImage21Cache\",\"inputs\":"
+                           "{\"model\":[\"1\",0],\"device\":\"auto\",\"dtype\":\"int8\"}},");
     snprintf(line, sizeof(line),
-             "\"6\":{\"class_type\":\"KSampler\",\"inputs\":{\"model\":[\"1\",0],\"positive\":[\"4\",0],"
-             "\"negative\":[\"4\",1],\"latent_image\":[\"5\",0],\"seed\":%ld,\"steps\":%d,\"cfg\":%.3f,"
+             "\"6\":{\"class_type\":\"KSampler\",\"inputs\":{\"model\":[\"%s\",0],\"positive\":[\"4\",0],"
+             "\"negative\":[\"4\",1],\"latent_image\":%s,\"seed\":%ld,\"steps\":%d,\"cfg\":%.3f,"
              "\"sampler_name\":\"euler\",\"scheduler\":\"simple\",\"denoise\":1.0}},",
-             seed, steps, cfg);
+             p->cache ? "9" : "1", latent, p->seed, p->steps, p->cfg);
     media_buf_puts(&g, line);
-    /* 7 VAEDecode, 8 SaveImage */
     media_buf_puts(&g, "\"7\":{\"class_type\":\"VAEDecode\",\"inputs\":{\"samples\":[\"6\",0],\"vae\":[\"3\",0]}},");
-    snprintf(line, sizeof(line),
-             "\"8\":{\"class_type\":\"SaveImage\",\"inputs\":{\"images\":[\"7\",0],\"filename_prefix\":\"%s\"}}", prefix);
-    media_buf_puts(&g, line);
-    /* nodi di caricamento dei riferimenti: 100+i LoadImage */
-    for (int i = 0; i < n_refs; i++) {
-        char *qn = media_json_quote(ref_names[i]);
+    media_buf_puts(&g, "\"8\":{\"class_type\":\"SaveImage\",\"inputs\":{\"images\":[\"7\",0],\"filename_prefix\":");
+    media_buf_puts(&g, qprefix);
+    media_buf_puts(&g, "}}");
+    for (int i = 0; i < p->n_refs; i++) {
+        char *qn = media_json_quote(p->refs[i]);
         snprintf(line, sizeof(line), ",\"%d\":{\"class_type\":\"LoadImage\",\"inputs\":{\"image\":", 100 + i);
         media_buf_puts(&g, line);
         media_buf_puts(&g, qn);
         media_buf_puts(&g, "}}");
         free(qn);
     }
-    media_buf_puts(&g, "},\"client_id\":\"ds4-media\"}");
+    media_buf_puts(&g, "}");
     free(qprompt);
     free(qneg);
+    free(qprefix);
     return media_buf_take(&g);
 }
 
-/* ── invio, attesa, scarico ───────────────────────────────────────────────── */
-
-static char *media_read_file(const char *path, size_t *len) {
-    FILE *fp = fopen(path, "rb");
-    if (!fp) return NULL;
-    fseek(fp, 0, SEEK_END);
-    long n = ftell(fp);
-    rewind(fp);
-    if (n < 0) { fclose(fp); return NULL; }
-    char *buf = media_xmalloc((size_t)n + 1);
-    size_t rd = fread(buf, 1, (size_t)n, fp);
-    fclose(fp);
-    buf[rd] = '\0';
-    if (len) *len = rd;
-    return buf;
+/* QwenImage21Cache e' sperimentale: lo si usa solo se il ComfyUI installato lo ha.
+ * Una sola domanda per istanza; se ComfyUI non risponde si riprova la volta dopo. */
+static bool media_has_cache_node(ds4_media *m) {
+    if (m->cache_node >= 0) return m->cache_node == 1;
+    media_http_response r = {0};
+    char e[64];
+    if (!media_http_get(m->host, m->port, "/object_info/QwenImage21Cache", 5000, &r, e, sizeof(e))) return false;
+    m->cache_node = (r.status == 200 && r.body && strstr(r.body, "\"QwenImage21Cache\"")) ? 1 : 0;
+    media_http_response_free(&r);
+    return m->cache_node == 1;
 }
 
-/* Carica un file di riferimento su ComfyUI; restituisce il nome assegnato. */
-static char *media_upload_ref(ds4_media *m, const char *path, char *err, size_t err_len) {
-    size_t len = 0;
-    char *bytes = media_read_file(path, &len);
-    if (!bytes) { media_set_err(err, err_len, "non leggo il riferimento %s", path); return NULL; }
-    const char *base = strrchr(path, '/');
-    base = base ? base + 1 : path;
-    const char *fields[] = {"overwrite", "true", "subfolder", "ds4", "type", "input", NULL};
-    media_http_response resp = {0};
-    bool ok = media_http_post_image(m->host, m->port, "/upload/image", fields, "image",
-                                    base, bytes, len, 30000, &resp, err, err_len);
-    free(bytes);
-    if (!ok) return NULL;
-    if (resp.status != 200) {
-        media_set_err(err, err_len, "/upload/image ha risposto %d", resp.status);
-        media_http_response_free(&resp);
-        return NULL;
-    }
-    char *name = media_json_str(resp.body, "name");
-    char *sub = media_json_str(resp.body, "subfolder");
-    media_http_response_free(&resp);
-    if (!name) { free(sub); media_set_err(err, err_len, "/upload/image senza nome"); return NULL; }
-    if (sub && sub[0]) {
-        media_buf b = {0};
-        media_buf_puts(&b, sub);
-        media_buf_puts(&b, "/");
-        media_buf_puts(&b, name);
-        free(name);
-        free(sub);
-        return media_buf_take(&b);
-    }
-    free(sub);
-    return name;
-}
+/* ── il lavoro ────────────────────────────────────────────────────────────── */
 
-/* Aspetta la fine del lavoro; su successo mette in outputs il corpo di /history. */
-static bool media_wait(ds4_media *m, const char *prompt_id, char **out_history,
-                       int timeout_ms, char *err, size_t err_len) {
-    int waited = 0;
-    char path[128];
-    snprintf(path, sizeof(path), "/history/%s", prompt_id);
-    for (;;) {
-        if (media_cancelled(m)) {
-            char ipath[160];
-            media_http_response ir = {0};
-            char body[128];
-            snprintf(body, sizeof(body), "{\"prompt_id\":\"%s\"}", prompt_id);
-            snprintf(ipath, sizeof(ipath), "/interrupt");
-            media_http_post(m->host, m->port, ipath, "application/json", body, strlen(body),
-                            5000, &ir, err, err_len);
-            media_http_response_free(&ir);
-            media_set_err(err, err_len, "annullato");
+/* Valida la richiesta e ne ricava il piano (dimensioni, cfg, risoluzione dei
+ * riferimenti). false = errore del chiamante, con err. Non parla con ComfyUI. */
+static bool media_image_plan(ds4_media *m, const ds4_media_image_req *req, media_plan *p,
+                             char *err, size_t err_len) {
+    if (!req->prompt || !req->prompt[0]) { media_set_err(err, err_len, "prompt vuoto"); return false; }
+    if (strlen(req->prompt) > 4000) { media_set_err(err, err_len, "prompt troppo lungo (max 4000)"); return false; }
+    if (req->negative && strlen(req->negative) > 4000) { media_set_err(err, err_len, "prompt negativo troppo lungo (max 4000)"); return false; }
+    if (req->n_refs < 0 || req->n_refs > 10) { media_set_err(err, err_len, "da 0 a 10 riferimenti"); return false; }
+    for (int i = 0; i < req->n_refs; i++)
+        if (!req->refs || !req->refs[i] || !req->refs[i][0]) { media_set_err(err, err_len, "riferimento %d mancante", i + 1); return false; }
+    if (req->n < 0 || req->n > DS4_MEDIA_MAX_N) { media_set_err(err, err_len, "da 1 a %d immagini per lavoro", DS4_MEDIA_MAX_N); return false; }
+    if (req->steps < 0 || req->steps > 60) { media_set_err(err, err_len, "passi da 1 a 60"); return false; }
+    if (!(req->cfg <= 20.0)) { media_set_err(err, err_len, "cfg oltre 20"); return false; }
+    if (req->width < 0 || req->height < 0) { media_set_err(err, err_len, "dimensioni negative"); return false; }
+
+    memset(p, 0, sizeof(*p));
+    p->weights = req->weights == DS4_MEDIA_BF16 ? DS4_MEDIA_BF16 : DS4_MEDIA_INT8;
+    p->n = req->n > 0 ? req->n : 1;
+    p->steps = req->steps > 0 ? req->steps : 25;
+    p->seed = req->seed >= 0 ? req->seed : (long)(time(NULL) ^ ((long)getpid() << 8)) & 0x7fffffff;
+    p->resolution = 1024;
+    bool neg = req->negative && req->negative[0];
+    if (req->cfg > 0) {
+        p->cfg = req->cfg;
+        if (neg && p->cfg <= 1.0) media_log(m, "ds4: media attenzione: con cfg %.2f ComfyUI ignora il prompt negativo", p->cfg);
+    } else {
+        p->cfg = neg ? DS4_MEDIA_NEG_CFG : 1.0;
+        if (neg) media_log(m, "ds4: media prompt negativo: cfg %.1f (il campionamento costa circa il doppio)", p->cfg);
+    }
+    bool explicit_size = req->width > 0 || req->height > 0;
+    if (req->n_refs > 0) {
+        int rw = 0, rh = 0;
+        if (!media_file_dims(req->refs[0], &rw, &rh))
+            media_log(m, "ds4: media non leggo le dimensioni di %s: risoluzione 1024", req->refs[0]);
+        p->resolution = media_edit_resolution(rw, rh, &p->width, &p->height);
+        p->ref_latent = !explicit_size;
+    }
+    if (explicit_size || req->n_refs == 0) {
+        p->width = req->width > 0 ? req->width : 1024;
+        p->height = req->height > 0 ? req->height : 1024;
+        if (p->width % 32 || p->height % 32) { media_set_err(err, err_len, "dimensioni multiple di 32"); return false; }
+        if (!media_size_ok(p->width, p->height)) {
+            media_set_err(err, err_len, "dimensioni oltre i limiti: lato max %d, area max %ld pixel (2752x1536)",
+                          DS4_MEDIA_MAX_SIDE, DS4_MEDIA_MAX_AREA);
             return false;
         }
-        media_http_response resp = {0};
-        if (!media_http_get(m->host, m->port, path, 10000, &resp, err, err_len)) return false;
-        bool has = resp.body && strstr(resp.body, "\"status\"") &&
-                   (strstr(resp.body, "\"success\"") || strstr(resp.body, "\"error\""));
-        if (has) {
-            if (strstr(resp.body, "\"status_str\": \"error\"") ||
-                strstr(resp.body, "\"status_str\":\"error\"")) {
-                char *msg = media_json_str(resp.body, "exception_message");
-                media_set_err(err, err_len, "ComfyUI: %s", msg ? msg : "errore di esecuzione");
-                free(msg);
-                media_http_response_free(&resp);
-                return false;
-            }
-            *out_history = resp.body;
-            resp.body = NULL;
-            media_http_response_free(&resp);
-            return true;
-        }
-        media_http_response_free(&resp);
-        struct timespec ts = {.tv_sec = 1, .tv_nsec = 0};
-        nanosleep(&ts, NULL);
-        waited += 1000;
-        if (waited >= timeout_ms) { media_set_err(err, err_len, "timeout: ComfyUI non ha finito in %d s", timeout_ms / 1000); return false; }
     }
-}
-
-/* Aggiunge al gambo del nome file i primi 8 caratteri del prompt_id di ComfyUI: due
- * lavori nello stesso secondo (altro processo ds4-media) non si sovrascrivono. */
-static void media_job_stem(char *stem, size_t n, const char *prompt_id) {
-    char base[48];
-    size_t l = strlen(stem);   /* "img-YYYYMMDD-HHMMSS": 19 caratteri */
-    if (l >= sizeof(base)) l = sizeof(base) - 1;
-    memcpy(base, stem, l);
-    base[l] = '\0';
-    snprintf(stem, n, "%s-%.8s", base, prompt_id);
-}
-
-/* Scarica i file elencati in outputs con GET /view e li scrive in media_dir. Ogni
- * immagine e' un oggetto {"filename":..,"subfolder":..,"type":..}: per ogni "filename"
- * isolo l'oggetto (dal '{' precedente al '}' seguente) e ne leggo i tre campi. */
-static bool media_fetch_outputs(ds4_media *m, const char *history, const char *stem,
-                                ds4_media_result *out, char *err, size_t err_len) {
-    const char *p = history;
-    char **list = NULL;
-    int n = 0, cap = 0, idx = 0;
-    const char *hit;
-    while ((hit = strstr(p, "\"filename\"")) != NULL) {
-        const char *obj_beg = hit;
-        while (obj_beg > history && *obj_beg != '{') obj_beg--;
-        const char *obj_end = strchr(hit, '}');
-        p = obj_end ? obj_end + 1 : hit + 10;
-        if (!obj_end) break;
-        size_t span = (size_t)(obj_end - obj_beg + 1);
-        char *chunk = media_xmalloc(span + 1);
-        memcpy(chunk, obj_beg, span);
-        chunk[span] = '\0';
-        char *fn = media_json_str(chunk, "filename");
-        char *sub = media_json_str(chunk, "subfolder");
-        char *type = media_json_str(chunk, "type");
-        free(chunk);
-        if (fn && (!type || strcmp(type, "output") == 0)) {
-            char *efn = media_url_encode(fn);
-            char *esub = media_url_encode(sub ? sub : "");
-            char vpath[1024];
-            snprintf(vpath, sizeof(vpath), "/view?filename=%s&subfolder=%s&type=output", efn, esub);
-            free(efn);
-            free(esub);
-            media_http_response vr = {0};
-            if (media_http_get(m->host, m->port, vpath, 60000, &vr, err, err_len) && vr.status == 200) {
-                const char *ext = strrchr(fn, '.');
-                char dest[1024];
-                /* mai sovrascrivere: se il nome esiste gia' (stesso secondo e stesso id) avanza l'indice */
-                do {
-                    snprintf(dest, sizeof(dest), "%s/%s-%03d%s", m->media_dir, stem, idx, ext ? ext : ".png");
-                } while (access(dest, F_OK) == 0 && ++idx < 1000);
-                FILE *of = fopen(dest, "wb");
-                if (of) {
-                    fwrite(vr.body, 1, vr.body_len, of);
-                    fclose(of);
-                    if (n == cap) { cap = cap ? cap * 2 : 4; list = realloc(list, (size_t)cap * sizeof(char *)); }
-                    list[n++] = media_xstrdup(dest);
-                    idx++;
-                    /* Togli la copia doppia che ComfyUI ha salvato (host locale): niente file sparsi. */
-                    if (m->comfy_output_dir) {
-                        char copy[1600];
-                        if (sub && sub[0])
-                            snprintf(copy, sizeof(copy), "%s/%s/%s", m->comfy_output_dir, sub, fn);
-                        else
-                            snprintf(copy, sizeof(copy), "%s/%s", m->comfy_output_dir, fn);
-                        unlink(copy);
-                    }
-                }
-            }
-            media_http_response_free(&vr);
-        }
-        free(fn);
-        free(sub);
-        free(type);
-    }
-    out->files = list;
-    out->n_files = n;
-    if (n == 0) { media_set_err(err, err_len, "nessuna immagine prodotta da ComfyUI"); return false; }
     return true;
 }
 
-static bool media_image_job(ds4_media *m, const ds4_media_image_req *req,
+static bool media_image_job(ds4_media *m, const ds4_media_image_req *req, media_job *j,
                             ds4_media_result *out, char *err, size_t err_len) {
-    if (!req->prompt || !req->prompt[0]) { media_set_err(err, err_len, "prompt vuoto"); return false; }
-    if (strlen(req->prompt) > 4000) { media_set_err(err, err_len, "prompt troppo lungo (max 4000)"); return false; }
-    int width = req->width > 0 ? req->width : 1024;
-    int height = req->height > 0 ? req->height : 1024;
-    if (width % 32 || height % 32) { media_set_err(err, err_len, "dimensioni multiple di 32"); return false; }
-    if (width > MEDIA_MAX_W || height > MEDIA_MAX_H) {
-        media_set_err(err, err_len, "dimensioni oltre il massimo %dx%d", MEDIA_MAX_W, MEDIA_MAX_H);
+    media_plan p;
+    if (!media_image_plan(m, req, &p, err, err_len)) { out->invalid = true; return false; }
+
+    if (!media_mem_gate(m, media_need_kib(p.weights, p.width, p.height, p.n),
+                        "usa int8, riduci dimensioni o numero di immagini, o spegni un modello", err, err_len))
         return false;
-    }
-    int steps = req->steps > 0 ? req->steps : 25;
-    if (steps > 60) { media_set_err(err, err_len, "passi oltre 60"); return false; }
-    if (req->n_refs > 10) { media_set_err(err, err_len, "massimo 10 riferimenti"); return false; }
-    double cfg = req->cfg > 0 ? req->cfg : 1.0;
-    ds4_media_weights w = req->weights;
-    long seed = req->seed >= 0 ? req->seed : (long)(time(NULL) ^ (getpid() << 8)) & 0x7fffffff;
+    if (media_job_cancelled(m, j)) { media_set_err(err, err_len, "annullato"); return false; }
 
-    if (!media_gate(m, w, width, height, err, err_len)) return false;
-
-    /* carica i riferimenti */
-    char *ref_names[10] = {0};
+    char *names[10] = {0};
     for (int i = 0; i < req->n_refs; i++) {
-        ref_names[i] = media_upload_ref(m, req->refs[i], err, err_len);
-        if (!ref_names[i]) { for (int j = 0; j < i; j++) free(ref_names[j]); return false; }
+        names[i] = media_upload_ref(m, req->refs[i], i, err, err_len);
+        if (!names[i]) { for (int k = 0; k < i; k++) free(names[k]); return false; }
     }
+    p.refs = names;
+    p.n_refs = req->n_refs;
+    p.cache = req->n_refs > 0 && media_has_cache_node(m);
 
-    char stem[96];
-    time_t now = time(NULL);
-    struct tm tmv;
-    localtime_r(&now, &tmv);
-    strftime(stem, sizeof(stem), "img-%Y%m%d-%H%M%S", &tmv);
-    char prefix[128];
-    snprintf(prefix, sizeof(prefix), "ds4/%s-%ld", stem, seed);
+    char stem[64];
+    media_make_stem(stem, sizeof(stem), "img");
+    snprintf(p.prefix, sizeof(p.prefix), "ds4/%s-%ld", stem, p.seed);
+    char *nodes = media_build_graph(req, &p);
+    for (int i = 0; i < req->n_refs; i++) free(names[i]);
 
-    char *graph = media_build_graph(m, req, w, seed, width, height, steps, cfg,
-                                    ref_names, req->n_refs, prefix);
-    for (int i = 0; i < req->n_refs; i++) free(ref_names[i]);
-
-    long t0 = (long)time(NULL);
-    media_http_response resp = {0};
-    bool ok = media_http_post(m->host, m->port, "/prompt", "application/json",
-                              graph, strlen(graph), 30000, &resp, err, err_len);
-    free(graph);
+    bool ok = media_run(m, j, nodes, stem, 900000, out, err, err_len);   /* in coda puo' attendere */
+    free(nodes);
     if (!ok) return false;
-    if (resp.status != 200) {
-        char *ne = media_json_str(resp.body, "type");
-        media_set_err(err, err_len, "ComfyUI ha rifiutato il grafo (%d)%s%s", resp.status,
-                      ne ? ": " : "", ne ? ne : "");
-        free(ne);
-        media_http_response_free(&resp);
-        return false;
-    }
-    char *pid = media_json_str(resp.body, "prompt_id");
-    media_http_response_free(&resp);
-    if (!pid) { media_set_err(err, err_len, "ComfyUI non ha dato un prompt_id"); return false; }
-    snprintf(out->prompt_id, sizeof(out->prompt_id), "%s", pid);
-    media_job_stem(stem, sizeof(stem), pid);
-    media_log(m, "ds4: media inviato a ComfyUI (id %s), attendo la generazione"
-                 " (in coda dietro altri lavori GPU puo' richiedere piu' tempo)...", out->prompt_id);
-
-    /* Timeout ampio: se la GPU e' occupata (H3, un'altra generazione) l'immagine resta in coda. */
-    char *history = NULL;
-    ok = media_wait(m, pid, &history, 900000, err, err_len);
-    free(pid);
-    if (!ok) return false;
-
-    ok = media_fetch_outputs(m, history, stem, out, err, err_len);
-    free(history);
-    if (!ok) { ds4_media_result_free(out); return false; }
-
-    out->width = width;
-    out->height = height;
-    out->seed = seed;
-    out->ms = ((long)time(NULL) - t0) * 1000;
-    m->last_job = time(NULL);
-    media_log(m, "ds4: media %s %dx%d seed=%ld %ld ms -> %s",
-              out->prompt_id, width, height, seed, out->ms,
-              out->n_files ? out->files[0] : "(niente)");
+    if (!out->width) { out->width = p.width; out->height = p.height; }
+    out->seed = p.seed;
+    media_log(m, "ds4: media %s %dx%d seed=%ld n=%d in %ld ms (riferimenti %ld, coda %ld, generazione %ld, scarico %ld) -> %s",
+              out->prompt_id, out->width, out->height, p.seed, p.n, out->ms, out->ms_upload,
+              out->ms_queue, out->ms_run, out->ms_fetch, out->files[0]);
     return true;
 }
 
@@ -504,153 +405,13 @@ bool ds4_media_image(ds4_media *m, const ds4_media_image_req *req,
                      ds4_media_result *out, char *err, size_t err_len) {
     memset(out, 0, sizeof(*out));
     pthread_mutex_lock(&m->lock);
-    bool ok = media_image_job(m, req, out, err, err_len);
+    media_job j = {.cancel = req->cancel, .cancel_privdata = req->cancel_privdata, .t_start = media_now_ms()};
+    bool ok = media_image_job(m, req, &j, out, err, err_len);
     pthread_mutex_unlock(&m->lock);
     return ok;
 }
 
-#include "ds4_media_h3.inc"
-
-/* Sostituisce tutte le occorrenze di `needle` con `repl` (malloc'd). */
-static char *media_replace(const char *s, const char *needle, const char *repl) {
-    media_buf b = {0};
-    size_t nl = strlen(needle);
-    const char *p = s;
-    for (;;) {
-        const char *hit = strstr(p, needle);
-        if (!hit) { media_buf_puts(&b, p); break; }
-        media_buf_append(&b, p, (size_t)(hit - p));
-        media_buf_puts(&b, repl);
-        p = hit + nl;
-    }
-    return media_buf_take(&b);
-}
-
-/* Contenuto di una stringa JSON, senza le virgolette esterne (per i segnaposto tra ""). */
-static char *media_json_inner(const char *s) {
-    char *q = media_json_quote(s);   /* "...." */
-    size_t n = strlen(q);
-    if (n >= 2) { memmove(q, q + 1, n - 2); q[n - 2] = '\0'; }
-    return q;
-}
-
-/* Fotogrammi dal tempo, sulla griglia 17k+5 di H3 (124~5s, 362~15s). */
-static int media_h3_length(double seconds) {
-    if (seconds <= 0) seconds = 5.0;
-    long base = (long)(seconds * 24.0 + 0.5);
-    long k = (base - 5 + 8) / 17;   /* arrotonda */
-    long frames = 5 + k * 17;
-    if (frames < 5) frames = 5;
-    if (frames > 362) frames = 362;
-    return (int)frames;
-}
-
-static bool media_video_job(ds4_media *m, const ds4_media_video_req *req,
-                            ds4_media_result *out, char *err, size_t err_len) {
-    if (!req->prompt || !req->prompt[0]) { media_set_err(err, err_len, "prompt vuoto"); return false; }
-    if (!req->ref || !req->ref[0]) { media_set_err(err, err_len, "serve un'immagine di riferimento (--rif): H3 parte dal primo fotogramma"); return false; }
-    int width = req->width > 0 ? req->width : 864;
-    int height = req->height > 0 ? req->height : 480;
-    if (width % 32 || height % 32) { media_set_err(err, err_len, "dimensioni multiple di 32"); return false; }
-    int steps = req->steps > 0 ? req->steps : 20;
-    int length = media_h3_length(req->seconds);
-    long seed = req->seed >= 0 ? req->seed : (long)(time(NULL) ^ (getpid() << 8)) & 0x7fffffff;
-
-    /* Gate: H3 occupa la GPU per intero (~110 GiB in uso). Serve che nessun modello
-     * grande sia residente; a macchina scarica MemAvailable e' ~111-118 GiB. Richiedo
-     * >= 100 GiB liberi: passa a vuoto, blocca se un LLM/immagine e' ancora caricato. */
-    if (!m->no_gate) {
-        long avail = media_avail_kib(m);
-        long need = 100L * 1024 * 1024;
-        if (avail > 0 && need > avail) {
-            media_set_err(err, err_len, "H3 vuole la GPU quasi intera, liberi solo %ld GiB: "
-                          "spegni ogni modello/immagine prima del video", avail / (1024 * 1024));
-            return false;
-        }
-    }
-
-    char *refname = media_upload_ref(m, req->ref, err, err_len);
-    if (!refname) return false;
-
-    char stem[96];
-    time_t now = time(NULL);
-    struct tm tmv;
-    localtime_r(&now, &tmv);
-    strftime(stem, sizeof(stem), "vid-%Y%m%d-%H%M%S", &tmv);
-    char prefix[160];
-    snprintf(prefix, sizeof(prefix), "ds4/%s-%ld", stem, seed);
-
-    char *qprompt = media_json_inner(req->prompt);
-    char *qimage = media_json_inner(refname);
-    free(refname);
-    char nums[8][24];
-    snprintf(nums[0], 24, "%d", width);
-    snprintf(nums[1], 24, "%d", height);
-    snprintf(nums[2], 24, "%d", length);
-    snprintf(nums[3], 24, "%ld", seed);
-    snprintf(nums[4], 24, "%d", steps);
-    char *g = media_xstrdup(DS4_MEDIA_H3_TEMPLATE);
-    const char *subs[][2] = {{"__PROMPT__", qprompt}, {"__IMAGE__", qimage}, {"__PREFIX__", prefix},
-                             {"__WIDTH__", nums[0]}, {"__HEIGHT__", nums[1]}, {"__LENGTH__", nums[2]},
-                             {"__SEED__", nums[3]}, {"__STEPS__", nums[4]}};
-    for (int i = 0; i < 8; i++) { char *n = media_replace(g, subs[i][0], subs[i][1]); free(g); g = n; }
-    free(qprompt);
-    free(qimage);
-
-    media_buf body = {0};
-    media_buf_puts(&body, "{\"prompt\":");
-    media_buf_puts(&body, g);
-    media_buf_puts(&body, ",\"client_id\":\"ds4-media\"}");
-    free(g);
-    char *graph = media_buf_take(&body);
-
-    media_log(m, "ds4: media video %dx%d %d fotogrammi (~%.1f s), attendo H3 (minuti)...",
-              width, height, length, length / 24.0);
-    long t0 = (long)time(NULL);
-    media_http_response resp = {0};
-    bool ok = media_http_post(m->host, m->port, "/prompt", "application/json",
-                              graph, strlen(graph), 30000, &resp, err, err_len);
-    free(graph);
-    if (!ok) return false;
-    if (resp.status != 200) {
-        char *ne = media_json_str(resp.body, "type");
-        media_set_err(err, err_len, "ComfyUI ha rifiutato il grafo H3 (%d)%s%s", resp.status,
-                      ne ? ": " : "", ne ? ne : "");
-        free(ne);
-        media_http_response_free(&resp);
-        return false;
-    }
-    char *pid = media_json_str(resp.body, "prompt_id");
-    media_http_response_free(&resp);
-    if (!pid) { media_set_err(err, err_len, "ComfyUI non ha dato un prompt_id"); return false; }
-    snprintf(out->prompt_id, sizeof(out->prompt_id), "%s", pid);
-    media_job_stem(stem, sizeof(stem), pid);
-
-    char *history = NULL;
-    ok = media_wait(m, pid, &history, 1800000, err, err_len);   /* fino a 30 min */
-    free(pid);
-    if (!ok) return false;
-    ok = media_fetch_outputs(m, history, stem, out, err, err_len);
-    free(history);
-    if (!ok) { ds4_media_result_free(out); return false; }
-    out->width = width;
-    out->height = height;
-    out->seed = seed;
-    out->ms = ((long)time(NULL) - t0) * 1000;
-    m->last_job = time(NULL);
-    media_log(m, "ds4: media video %s %ld ms -> %s", out->prompt_id, out->ms,
-              out->n_files ? out->files[0] : "(niente)");
-    return true;
-}
-
-bool ds4_media_video(ds4_media *m, const ds4_media_video_req *req,
-                     ds4_media_result *out, char *err, size_t err_len) {
-    memset(out, 0, sizeof(*out));
-    pthread_mutex_lock(&m->lock);
-    bool ok = media_video_job(m, req, out, err, err_len);
-    pthread_mutex_unlock(&m->lock);
-    return ok;
-}
+/* ── servizio ─────────────────────────────────────────────────────────────── */
 
 bool ds4_media_health(ds4_media *m, char *err, size_t err_len) {
     media_http_response resp = {0};
@@ -693,29 +454,6 @@ bool ds4_media_idle_tick(ds4_media *m) {
     }
     pthread_mutex_unlock(&m->lock);
     return freed;
-}
-
-long ds4_media_avail_gib(void) {
-    FILE *fp = fopen("/proc/meminfo", "r");
-    if (!fp) return -1;
-    char line[256];
-    long kib = -1;
-    while (fgets(line, sizeof(line), fp))
-        if (strncmp(line, "MemAvailable:", 13) == 0) { kib = strtol(line + 13, NULL, 10); break; }
-    fclose(fp);
-    return kib < 0 ? -1 : kib / (1024 * 1024);
-}
-
-bool ds4_media_parse_size(const char *s, int *width, int *height) {
-    if (!s) return false;
-    char *x = NULL;
-    long w = strtol(s, &x, 10);
-    if (!x || (*x != 'x' && *x != 'X')) return false;
-    long h = strtol(x + 1, NULL, 10);
-    if (w <= 0 || h <= 0 || w % 32 || h % 32 || w > MEDIA_MAX_W || h > MEDIA_MAX_H) return false;
-    *width = (int)w;
-    *height = (int)h;
-    return true;
 }
 
 /* Cartella di uscita, per il server che restituisce i file con response_format=url. */

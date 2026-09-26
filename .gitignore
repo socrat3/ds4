@@ -89,6 +89,7 @@ __pycache__/
 /tests/test_q8_prefill_variants
 /ds4-media
 tests/test_media
+tests/test_media_f01
 /media-prove/
 /media-webui/
 /media-serve.log

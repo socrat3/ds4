@@ -18,6 +18,12 @@ void *media_xmalloc(size_t n);
 char *media_xstrdup(const char *s);
 void media_set_err(char *err, size_t err_len, const char *fmt, ...);
 
+/* Connessione TCP con timeout di connect (3 s); -1 con err che suggerisce di accendere
+ * ComfyUI. Scrittura completa (EINTR e scritture parziali) su socket o file, 0 o -1.
+ * Usate anche dal client websocket, dal serve e per salvare i file. */
+int media_tcp_connect(const char *host, int port, char *err, size_t err_len);
+int media_write_all(int fd, const void *buf, size_t len);
+
 /* Risposta HTTP: stato, corpo (malloc'd, \0-terminato ma binario-safe con body_len). */
 typedef struct { int status; char *body; size_t body_len; } media_http_response;
 void media_http_response_free(media_http_response *r);
