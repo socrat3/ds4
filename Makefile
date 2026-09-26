@@ -715,8 +715,8 @@ test-ssd-cache: tests/test_ssd_cache
 
 tests/test_engram: tests/test_engram.c ds4_engram.c ds4_engram.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ tests/test_engram.c ds4_engram.c $(LDLIBS)
-tests/test_media: tests/test_media.c ds4_media.c ds4_media_http.c ds4_media.h ds4_media_http.h
-	$(CC) $(CFLAGS) -I. -o $@ tests/test_media.c ds4_media.c ds4_media_http.c -lpthread
+tests/test_media: tests/test_media.c ds4_media.c ds4_media_http.c ds4_media_serve.c ds4_media.h ds4_media_http.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_media.c ds4_media.c ds4_media_http.c ds4_media_serve.c -lpthread
 test-media: tests/test_media
 	./tests/test_media
 

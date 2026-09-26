@@ -122,6 +122,40 @@ static void test_helpers(void) {
     free(e);
 }
 
+/* ── server OpenAI ────────────────────────────────────────────────────────── */
+
+typedef struct { ds4_media *m; int port; volatile int stop; } serve_arg;
+static void *serve_thread(void *a) {
+    serve_arg *s = a;
+    char err[128] = {0};
+    ds4_media_serve(s->m, s->port, &s->stop, err, sizeof(err));
+    return NULL;
+}
+
+/* Avvia il server su una porta di test, gli manda una richiesta e controlla la risposta. */
+static void test_serve(ds4_media *m, int comfy_port) {
+    (void)comfy_port;
+    serve_arg sa = {.m = m, .port = 19010, .stop = 0};
+    pthread_t th;
+    pthread_create(&th, NULL, serve_thread, &sa);
+    usleep(200000);   /* lascia fare bind/listen */
+
+    media_http_response resp = {0};
+    char err[128] = {0};
+    const char *body = "{\"prompt\":\"una rosa\",\"n\":1,\"size\":\"512x512\",\"response_format\":\"b64_json\"}";
+    bool ok = media_http_post("127.0.0.1", 19010, "/v1/images/generations",
+                              "application/json", body, strlen(body), 20000, &resp, err, sizeof(err));
+    if (!ok) {
+        printf("nota: server non raggiungibile (porta 19010 occupata?), salto: %s\n", err);
+    } else {
+        VERIFICA(resp.status == 200, "serve: 200 su /v1/images/generations (%d)", resp.status);
+        VERIFICA(resp.body && strstr(resp.body, "\"b64_json\""), "serve: risposta con b64_json");
+    }
+    media_http_response_free(&resp);
+    sa.stop = 1;
+    pthread_join(th, NULL);
+}
+
 /* ── main ─────────────────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -198,6 +232,9 @@ int main(void) {
     ok = ds4_media_image(m, &wreq, &wres, err, sizeof(err));
     VERIFICA(!ok && strstr(err, "32"), "rifiuta dimensioni non multiple di 32");
     ds4_media_result_free(&wres);
+
+    /* server OpenAI: avvia ds4_media_serve in un thread e chiama /v1/images/generations */
+    test_serve(m, st.port);
 
     ds4_media_free(m);
     stop_fake(st.port);
