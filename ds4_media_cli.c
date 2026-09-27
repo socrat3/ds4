@@ -406,7 +406,7 @@ static int cmd_clean(const cli_args *a) {
 
 /* ds4-media doppia: il wizard (se al terminale e senza --si) fa rivedere e cambiare
  * ogni scelta; poi le fasi mancanti del lavoro. Le opzioni della riga di comando
- * vincono sul doppia.conf del lavoro, che vince su ~/.ds4/doppia.conf. */
+ * vincono sul doppia.conf del lavoro, che vince su ~/ds4-media/doppia.conf. */
 static int cmd_doppia(const cli_args *a) {
     static doppia_conf c;
     doppia_conf_init(&c);
@@ -442,7 +442,7 @@ static int cmd_doppia(const cli_args *a) {
         return 0;
     }
     if (!doppia_get(&c, "foto")[0] || !doppia_get(&c, "voce_campione")[0]) {
-        fprintf(stderr, "ds4-media: servono foto e voce_campione (wizard, oppure ~/.ds4/doppia.conf)\n");
+        fprintf(stderr, "ds4-media: servono foto e voce_campione (wizard, oppure ~/ds4-media/doppia.conf)\n");
         doppia_conf_free(&c);
         return 2;
     }

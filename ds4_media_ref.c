@@ -148,3 +148,16 @@ char *media_upload_ref(ds4_media *m, const char *path, int idx, char *err, size_
     free(sub);
     return media_buf_take(&b);
 }
+
+void media_forget_upload(ds4_media *m, const char *name) {
+    if (!m->comfy_output_dir || !name || !name[0] || name[0] == '/' || strstr(name, "..")) return;
+    char base[1024], p[2048];
+    snprintf(base, sizeof(base), "%s", m->comfy_output_dir);
+    size_t n = strlen(base);
+    while (n > 1 && base[n - 1] == '/') base[--n] = '\0';
+    char *sl = strrchr(base, '/');
+    if (!sl) return;
+    *sl = '\0';   /* .../ComfyUI/output -> .../ComfyUI */
+    snprintf(p, sizeof(p), "%s/input/%s", base, name);
+    unlink(p);
+}

@@ -108,8 +108,7 @@ bool doppia_prepara(doppia_conf *c, const char *const *override, char *err, size
     if (!c->dir[0]) {
         if (!doppia_get(c, "sorgente")[0]) { media_set_err(err, err_len, "manca il video da doppiare"); return false; }
         doppia_nome(c, nome, sizeof(nome));
-        const char *h = getenv("HOME");
-        snprintf(c->dir, sizeof(c->dir), "%s/.ds4/doppia/%s", h && h[0] ? h : ".", nome);
+        snprintf(c->dir, sizeof(c->dir), "%s/doppia/%s", ds4_media_home(), nome);
     }
     P(p, c, "doppia.conf");
     if (access(p, R_OK) == 0) {
@@ -134,6 +133,7 @@ bool doppia_run(doppia_conf *c, doppia_cancel_fn cancel, void *pd, char *err, si
     P(voce, c, "voce_it.wav");
     const char *ff = doppia_get(c, "ffmpeg"), *in = doppia_get(c, "sorgente");
     if (!doppia_verifica(c, err, err_len)) return false;
+    setenv("DS4_MEDIA_HOME", ds4_media_home(), 1);   /* gli script d'aiuto cercano li' i modelli */
     media_http_set_cancel(cancel, pd);
     bool ok = false;
     doppia_segmento *seg = NULL;

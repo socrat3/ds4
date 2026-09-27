@@ -160,7 +160,7 @@ static void t_conf(void) {
     snprintf(video, sizeof(video), "%s/lezione.mp4", DIR_);
     FILE *fp = fopen(video, "w"); fputs("x", fp); fclose(fp);
     const char *ov[] = {"sorgente", video, "da", "10", NULL};
-    VERIFICA(doppia_prepara(&c, ov, e, sizeof(e)) && strstr(c.dir, "/.ds4/doppia/lezione_10-0"), "cartella del lavoro [%s] %s", c.dir, e);
+    VERIFICA(doppia_prepara(&c, ov, e, sizeof(e)) && strstr(c.dir, "/ds4-media/doppia/lezione_10-0"), "cartella del lavoro [%s] %s", c.dir, e);
     char p2[1200];
     snprintf(p2, sizeof(p2), "%s/doppia.conf", c.dir);
     doppia_set(&c, "passi", "7", e, sizeof(e));

@@ -62,6 +62,10 @@ bool media_mem_gate(ds4_media *m, long need_kib, const char *hint, char *err, si
 /* Carica il riferimento `idx` su ComfyUI con un nome unico generato dal modulo
  * (ref-<pid>-<idx>-<hash del contenuto>.<ext>); restituisce il nome da dare a LoadImage. */
 char *media_upload_ref(ds4_media *m, const char *path, int idx, char *err, size_t err_len);
+/* A lavoro finito cancella il file caricato dalla cartella input di ComfyUI (solo con
+ * ComfyUI su questa macchina, cioe' con comfy_output_dir: input/ gli sta accanto).
+ * Senza, input/ds4 si riempiva di foto, audio e video di ogni lavoro. */
+void media_forget_upload(ds4_media *m, const char *name);
 
 /* Dimensioni di un'immagine dalle sue intestazioni (PNG, JPEG, WebP): dai byte o dal
  * file (letto fino a 1 MiB). false se il formato non e' riconosciuto. */

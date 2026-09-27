@@ -77,7 +77,6 @@ static bool media_video_job(ds4_media *m, const ds4_media_video_req *req, media_
     snprintf(prefix, sizeof(prefix), "ds4/%s-%ld", stem, seed);
     char *qprompt = media_json_inner(req->prompt);
     char *qimage = media_json_inner(refname);
-    free(refname);
     char nums[5][24];
     snprintf(nums[0], 24, "%d", width);
     snprintf(nums[1], 24, "%d", height);
@@ -101,6 +100,8 @@ static bool media_video_job(ds4_media *m, const ds4_media_video_req *req, media_
               width, height, length, length / 24.0);
     bool ok = media_run(m, j, g, stem, 1800000, out, err, err_len);   /* fino a 30 min */
     free(g);
+    media_forget_upload(m, refname);
+    free(refname);
     if (!ok) return false;
     out->width = width;
     out->height = height;
@@ -158,8 +159,6 @@ static bool media_talk_job(ds4_media *m, const ds4_media_talk_req *req, media_jo
     snprintf(prefix, sizeof(prefix), "ds4/%s-%ld", stem, seed);
     char *qprompt = media_json_inner(req->prompt), *qface = media_json_inner(face);
     char *qaudio = media_json_quote(audio);
-    free(face);
-    free(audio);
     snprintf(nums[0], 24, "%d", width);
     snprintf(nums[1], 24, "%d", height);
     snprintf(nums[2], 24, "%d", req->frames);
@@ -194,6 +193,10 @@ static bool media_talk_job(ds4_media *m, const ds4_media_talk_req *req, media_jo
     if (!ok) {
         free(g);
         free(tail.ptr);
+        media_forget_upload(m, face);
+        media_forget_upload(m, audio);
+        free(face);
+        free(audio);
         media_set_err(err, err_len, "template H3 inatteso: non so dove agganciare l'audio");
         return false;
     }
@@ -208,6 +211,10 @@ static bool media_talk_job(ds4_media *m, const ds4_media_talk_req *req, media_jo
               width, height, req->frames, req->frames / 24.0);
     ok = media_run(m, j, full.ptr, stem, 3600000, out, err, err_len);   /* fino a 60 min: la GPU puo' essere in coda */
     free(full.ptr);
+    media_forget_upload(m, face);
+    media_forget_upload(m, audio);
+    free(face);
+    free(audio);
     if (!ok) return false;
     out->width = width;
     out->height = height;

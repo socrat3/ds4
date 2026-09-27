@@ -28,7 +28,7 @@ typedef enum { DS4_MEDIA_INT8 = 0, DS4_MEDIA_BF16 = 1 } ds4_media_weights;
 typedef struct {
     const char *host;          /* ComfyUI, default "127.0.0.1" */
     int port;                  /* default 8188 */
-    const char *media_dir;     /* cartella di uscita; default ~/.ds4/media */
+    const char *media_dir;     /* cartella di uscita; default ds4_media_home()/immagini */
     const char *comfy_output_dir; /* cartella output di ComfyUI (host locale): dopo aver scaricato
                                    * il file, ne rimuove la copia doppia lasciata da ComfyUI. NULL =
                                    * non toccare (host remoto, o si vuole tenere anche quella copia). */
@@ -90,6 +90,11 @@ typedef struct {
 } ds4_media_result;
 
 void ds4_media_result_free(ds4_media_result *r);
+
+/* La cartella unica dei dati di ds4-media: $DS4_MEDIA_HOME, o ~/ds4-media. Dentro:
+ * immagini/ (img, video, serve), doppia/LAVORO/, doppia.conf, modelli/, strumenti/,
+ * prove/. Statica, senza slash finale; non la crea. */
+const char *ds4_media_home(void);
 
 ds4_media *ds4_media_create(const ds4_media_config *cfg);
 void ds4_media_free(ds4_media *m);

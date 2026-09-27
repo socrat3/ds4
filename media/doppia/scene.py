@@ -21,12 +21,13 @@ import cv2, numpy as np
 
 video, uscita = sys.argv[1:3]
 modello = "face_detection_yunet_2023mar.onnx"
-for d in (os.path.expanduser("~/.ds4"), os.path.dirname(os.path.abspath(__file__))):
+radice = os.environ.get("DS4_MEDIA_HOME") or os.path.expanduser("~/ds4-media")
+for d in (os.path.join(radice, "modelli"), os.path.expanduser("~/.ds4"), os.path.dirname(os.path.abspath(__file__))):
     if os.path.exists(os.path.join(d, modello)):
         modello = os.path.join(d, modello)
         break
 if not os.path.exists(modello):
-    sys.exit("manca face_detection_yunet_2023mar.onnx (in ~/.ds4): opencv_zoo, licenza MIT")
+    sys.exit("manca face_detection_yunet_2023mar.onnx (in DS4_MEDIA_HOME/modelli): opencv_zoo, licenza MIT")
 
 cap = cv2.VideoCapture(video)
 fps = cap.get(cv2.CAP_PROP_FPS) or 25.0

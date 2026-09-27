@@ -2,7 +2,7 @@
  * wizard. Vedi ds4_media_doppia.h.
  *
  * I valori si stratificano: predefiniti qui sotto (generici: nessun percorso
- * personale nel codice), poi ~/.ds4/doppia.conf (le scelte stabili dell'utente: foto,
+ * personale nel codice), poi ~/ds4-media/doppia.conf (le scelte stabili dell'utente: foto,
  * voce, strumenti), poi doppia.conf del lavoro, poi le opzioni della riga di comando.
  * Il wizard mostra il risultato e lascia cambiare tutto. */
 #include "ds4_media_doppia.h"
@@ -60,11 +60,11 @@ static int doppia_idx(const char *chiave) {
     return -1;
 }
 
+/* Le scelte stabili stanno nella cartella unica di ds4-media (ds4_media_home). */
 static char *doppia_home_conf(void) {
-    const char *h = getenv("HOME");
     media_buf b = {0};
-    media_buf_puts(&b, h && h[0] ? h : ".");
-    media_buf_puts(&b, "/.ds4/doppia.conf");
+    media_buf_puts(&b, ds4_media_home());
+    media_buf_puts(&b, "/doppia.conf");
     return media_buf_take(&b);
 }
 
@@ -73,6 +73,17 @@ void doppia_conf_init(doppia_conf *c) {
     c->val = media_xmalloc(sizeof(char *) * (size_t)DOPPIA_N_VOCI);
     for (int i = 0; i < DOPPIA_N_VOCI; i++) c->val[i] = media_xstrdup(DOPPIA_VOCI[i].predefinito);
     char *home = doppia_home_conf(), e[256];
+    if (access(home, R_OK) != 0) {
+        /* prima della cartella unica le scelte stavano in ~/.ds4/doppia.conf */
+        const char *h = getenv("HOME");
+        char vecchio[1024];
+        snprintf(vecchio, sizeof(vecchio), "%s/.ds4/doppia.conf", h && h[0] ? h : ".");
+        if (access(vecchio, R_OK) == 0) {
+            fprintf(stderr, "ds4-media: leggo %s; spostalo in %s\n", vecchio, home);
+            free(home);
+            home = media_xstrdup(vecchio);
+        }
+    }
     if (access(home, R_OK) == 0 && !doppia_conf_load(c, home, e, sizeof(e)))
         fprintf(stderr, "ds4-media: %s\n", e);
     free(home);

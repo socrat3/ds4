@@ -44,6 +44,16 @@ static bool media_mkdir_p(const char *path) {
     return mkdir(tmp, 0755) == 0 || errno == EEXIST;
 }
 
+const char *ds4_media_home(void) {
+    static char buf[1024];
+    const char *e = getenv("DS4_MEDIA_HOME"), *h = getenv("HOME");
+    if (e && e[0]) snprintf(buf, sizeof(buf), "%s", e);
+    else snprintf(buf, sizeof(buf), "%s/ds4-media", h && h[0] ? h : ".");
+    size_t n = strlen(buf);
+    while (n > 1 && buf[n - 1] == '/') buf[--n] = '\0';
+    return buf;
+}
+
 ds4_media *ds4_media_create(const ds4_media_config *cfg) {
     ds4_media *m = media_xmalloc(sizeof(*m));
     memset(m, 0, sizeof(*m));
@@ -52,10 +62,9 @@ ds4_media *ds4_media_create(const ds4_media_config *cfg) {
     if (cfg->media_dir && cfg->media_dir[0]) {
         m->media_dir = media_xstrdup(cfg->media_dir);
     } else {
-        const char *home = getenv("HOME");
         media_buf b = {0};
-        media_buf_puts(&b, home && home[0] ? home : ".");
-        media_buf_puts(&b, "/.ds4/media");
+        media_buf_puts(&b, ds4_media_home());
+        media_buf_puts(&b, "/immagini");
         m->media_dir = media_buf_take(&b);
     }
     m->comfy_output_dir = cfg->comfy_output_dir && cfg->comfy_output_dir[0]
@@ -402,10 +411,9 @@ static bool media_image_job(ds4_media *m, const ds4_media_image_req *req, media_
     media_make_stem(stem, sizeof(stem), "img");
     snprintf(p.prefix, sizeof(p.prefix), "ds4/%s-%ld", stem, p.seed);
     char *nodes = media_build_graph(req, &p);
-    for (int i = 0; i < req->n_refs; i++) free(names[i]);
-
     bool ok = media_run(m, j, nodes, stem, 900000, out, err, err_len);   /* in coda puo' attendere */
     free(nodes);
+    for (int i = 0; i < req->n_refs; i++) { media_forget_upload(m, names[i]); free(names[i]); }
     if (!ok) return false;
     if (!out->width) { out->width = p.width; out->height = p.height; }
     out->seed = p.seed;
