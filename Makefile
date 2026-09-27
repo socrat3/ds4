@@ -750,7 +750,7 @@ tests/test_media_f01: tests/test_media_f01.c tests/media_fake.h $(MEDIA_SRCS) $(
 
 # ds4-media: eseguibile autonomo (serve + img), senza GPU. Bersaglio fisso per Open WebUI.
 # ds4-media doppia: doppiaggio con volto e voce dell'utente (aiuti Python in media/doppia).
-DOPPIA_SRCS = ds4_media_doppia.c ds4_media_doppia_conf.c ds4_media_doppia_proc.c ds4_media_doppia_testo.c ds4_media_trad.c
+DOPPIA_SRCS = ds4_media_doppia.c ds4_media_doppia_fasi.c ds4_media_doppia_conf.c ds4_media_doppia_proc.c ds4_media_doppia_testo.c ds4_media_trad.c
 
 ds4-media: ds4_media_cli.c ds4_media_help.c ds4_media_help.h $(MEDIA_SRCS) $(DOPPIA_SRCS) $(MEDIA_HDRS) ds4_media_doppia.h
 	$(CC) $(CFLAGS) -I. -o $@ ds4_media_cli.c ds4_media_help.c $(MEDIA_SRCS) $(DOPPIA_SRCS) -lpthread -lm

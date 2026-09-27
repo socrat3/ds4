@@ -5,12 +5,16 @@
  * voce dell'utente. Fasi, ognuna con il suo file nella cartella del lavoro: se il
  * file c'e' la fase si salta, cosi' un lavoro interrotto riparte da dove era.
  *
- *   scarica    sorgente.mp4          yt-dlp (o copia del file), taglio da/a
+ *   scarica    sorgente.mp4          yt-dlp, o un file locale in qualsiasi formato
+ *                                    (copiato se mp4 lo accetta, se no ricodificato)
+ *   lingua     lingua.txt            riconosciuta dall'audio (lingua = auto)
  *   trascrivi  parole.csv            whisper.cpp, una parola per riga con i tempi
  *   frasi      frasi.tsv             parole -> frasi da 3 a 9 s
- *   traduci    frasi.tsv (colonna 4) ds4-server, blocchi da 20 frasi
- *   voce       voce_it.wav           voce clonata (Qwen3-TTS o XTTS), frasi ai loro tempi
- *   posizione  posizione.txt         cerchio della webcam (auto) o schermo intero
+ *   traduci    frasi.tsv (colonna 4) ds4-server, blocchi da 20 frasi (non se gia' in italiano)
+ *   voce       voce_it.wav           conversione della voce originale nella tua (stessi
+ *                                    tempi: video gia' in italiano) o sintesi della traduzione
+ *   posizione  posizione.txt         inquadrature riconosciute tratto per tratto: webcam
+ *                                    tonda o rettangolare, persona intera, nessuno
  *   pezzi      pezzi/pNNN.mp4        teste parlanti H3 da 15 s, ancorate alla foto
  *   monta      testa.mp4, scena.mp4  pezzi uniti; scena = testa nel cerchio del video
  *   titolo     <nome>_testa.mp4 ...  titolo di testa da titoli.txt (se richiesto)
@@ -74,6 +78,18 @@ int doppia_frasi_da_csv(const char *csv, double min_s, double max_s, doppia_fras
 bool doppia_frasi_save(const char *path, const doppia_frase *f, int n);
 int doppia_frasi_load(const char *path, doppia_frase **out);
 void doppia_frasi_free(doppia_frase *f, int n);
+/* La mappa delle inquadrature (posizione.txt): una riga per tratto,
+ *   da a cerchio CX CY R | da a riquadro X Y W H | da a intero | da a vuoto
+ * Il formato vecchio di una riga ("cerchio CX CY R" o "intero") vale per tutto il video.
+ * Le righe si leggono ordinate, senza buchi ne' sovrapposizioni oltre la durata. */
+typedef enum { SEG_VUOTO = 0, SEG_CERCHIO, SEG_RIQUADRO, SEG_INTERO } doppia_tipo_seg;
+typedef struct { double da, a; doppia_tipo_seg tipo; int x, y, w, h; } doppia_segmento;
+int doppia_posizione_load(const char *path, double durata, doppia_segmento **out);
+/* Il filtro ffmpeg della scena: ingressi 0 video originale, 1 testa parlante, 2 voce,
+ * poi una maschera PNG per ogni cerchio di raggio diverso (nomi in maschere, lati 2R).
+ * Una sovrapposizione per geometria, attiva solo nei suoi tratti. malloc'd. */
+char *doppia_filtro_scena(const doppia_segmento *s, int n, int W, int H, double volume,
+                          int *raggi, int *n_raggi);
 /* Piano dei pezzi H3 su una durata: inizio (s) e fotogrammi (17k+5) di ciascuno. */
 typedef struct { double inizio; int fotogrammi; bool ancora_fine; } doppia_pezzo;
 int doppia_piano_pezzi(double durata, doppia_pezzo **out);
@@ -103,15 +119,37 @@ bool doppia_ffmpeg(const char **argv, int argc, const char *out, const char *log
 bool doppia_monta_testa(const doppia_conf *c, char **pezzi, const int *fotogrammi, int n, double durata,
                         const char *voce, const char *out, const char *log,
                         doppia_cancel_fn cancel, void *pd, char *err, size_t err_len);
-/* scena.mp4: la testa nel cerchio (cx,cy,r) del video originale, o a tutto schermo
- * se r <= 0, con la voce normalizzata. */
+/* scena.mp4: la testa parlante messa, tratto per tratto, dove la mappa delle
+ * inquadrature dice (cerchio, riquadro, tutto schermo; niente nei tratti vuoti), con
+ * la voce normalizzata. */
 bool doppia_monta_scena(const doppia_conf *c, const char *sorgente, const char *testa,
-                        int cx, int cy, int r, const char *voce, const char *out, const char *log,
-                        doppia_cancel_fn cancel, void *pd, char *err, size_t err_len);
+                        const doppia_segmento *seg, int nseg, const char *voce, const char *out,
+                        const char *log, doppia_cancel_fn cancel, void *pd, char *err, size_t err_len);
 /* Titolo di testa da titoli.txt davanti a `in`, o copia se il file dice mostra: no. */
 bool doppia_titolo(const doppia_conf *c, const char *aiuti, const char *in, const char *titoli,
                    const char *out, const char *log, doppia_cancel_fn cancel, void *pd,
                    char *err, size_t err_len);
+
+/* Fasi (ds4_media_doppia_fasi.c), usate da doppia_run. */
+const char *doppia_aiuti(const doppia_conf *c);
+bool doppia_servizio_su(const char *host, int port, const char *path);
+int doppia_traduttore(const doppia_conf *c, char *host, size_t n);
+bool doppia_accendi(doppia_conf *c, const char *riga, const char *host, int port, const char *path,
+                    const char *cosa, const char *log, doppia_cancel_fn cancel, void *pd, char *err, size_t err_len);
+/* lingua.txt: il codice della lingua parlata (whisper), da lingua o riconosciuto. */
+bool doppia_fase_lingua(doppia_conf *c, const char *a16, const char *log, doppia_cancel_fn cancel, void *pd,
+                        char *lingua, size_t n, char *err, size_t err_len);
+/* voce_it.wav per conversione (stessa lingua) o sintesi (traduzione). */
+bool doppia_fase_voce(doppia_conf *c, const char *lingua, double durata, const char *log,
+                      doppia_cancel_fn cancel, void *pd, char *err, size_t err_len);
+bool doppia_fase_posizione(doppia_conf *c, double durata, const char *log, doppia_cancel_fn cancel, void *pd,
+                           doppia_segmento **seg, int *nseg, char *err, size_t err_len);
+bool doppia_fase_pezzi(doppia_conf *c, double durata, const char *log, doppia_cancel_fn cancel, void *pd,
+                       char *err, size_t err_len);
+bool doppia_titolo_se_serve(const doppia_conf *c, const char *in, const char *out, const char *log,
+                            doppia_cancel_fn cancel, void *pd, char *err, size_t err_len);
+/* Il file ha una traccia audio? (whisper e la voce ne hanno bisogno) */
+bool doppia_ha_audio(const char *ffmpeg, const char *file);
 
 /* Traduzione (ds4_media_trad.c): riempie `it` delle frasi che non lo hanno, a blocchi,
  * salvando dopo ogni blocco. */

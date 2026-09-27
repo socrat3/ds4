@@ -155,3 +155,134 @@ int doppia_piano_pezzi(double durata, doppia_pezzo **out) {
     }
     return n;
 }
+
+/* ── mappa delle inquadrature ─────────────────────────────────────────────── */
+
+static int seg_ordine(const void *a, const void *b) {
+    double d = ((const doppia_segmento *)a)->da - ((const doppia_segmento *)b)->da;
+    return d < 0 ? -1 : d > 0;
+}
+
+/* Un tipo con i suoi parametri da "tipo P1 P2 ..."; false se non si legge. */
+static bool seg_tipo(const char *s, doppia_segmento *g) {
+    char t[16] = {0};
+    int x = 0, y = 0, w = 0, h = 0;
+    int k = sscanf(s, "%15s %d %d %d %d", t, &x, &y, &w, &h);
+    if (k < 1) return false;
+    if (!strcmp(t, "cerchio") && k >= 4 && w > 0) { *g = (doppia_segmento){.tipo = SEG_CERCHIO, .x = x, .y = y, .w = w}; return true; }
+    if (!strcmp(t, "riquadro") && k == 5 && w > 0 && h > 0) { *g = (doppia_segmento){.tipo = SEG_RIQUADRO, .x = x, .y = y, .w = w, .h = h}; return true; }
+    if (!strcmp(t, "intero")) { *g = (doppia_segmento){.tipo = SEG_INTERO}; return true; }
+    if (!strcmp(t, "vuoto")) { *g = (doppia_segmento){.tipo = SEG_VUOTO}; return true; }
+    return false;
+}
+
+int doppia_posizione_load(const char *path, double durata, doppia_segmento **out) {
+    *out = NULL;
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+    char l[512];
+    int n = 0, cap = 0;
+    while (fgets(l, sizeof(l), fp)) {
+        char *s = l;
+        while (*s == ' ' || *s == '\t') s++;
+        if (*s == '#' || *s == '\n' || !*s) continue;
+        doppia_segmento g;
+        char *end;
+        double da = strtod(s, &end);
+        if (end != s) {                       /* "da a tipo ..." */
+            char *e2;
+            double a = strtod(end, &e2);
+            if (e2 == end || !seg_tipo(e2, &g)) continue;
+            g.da = da;
+            g.a = a;
+        } else {                              /* formato vecchio: tutto il video */
+            if (!seg_tipo(s, &g)) continue;
+            g.da = 0;
+            g.a = durata;
+        }
+        if (g.da < 0) g.da = 0;
+        if (durata > 0 && g.a > durata) g.a = durata;
+        if (!(g.a > g.da)) continue;
+        if (n == cap) { cap = cap ? cap * 2 : 16; *out = realloc(*out, sizeof(doppia_segmento) * (size_t)cap); if (!*out) abort(); }
+        (*out)[n++] = g;
+    }
+    fclose(fp);
+    if (n > 1) qsort(*out, (size_t)n, sizeof(doppia_segmento), seg_ordine);
+    for (int i = 1; i < n; i++) if ((*out)[i].da < (*out)[i - 1].a) (*out)[i].da = (*out)[i - 1].a;   /* niente sovrapposizioni */
+    return n;
+}
+
+static bool seg_stessa_geometria(const doppia_segmento *a, const doppia_segmento *b) {
+    return a->tipo == b->tipo && a->x == b->x && a->y == b->y && a->w == b->w && a->h == b->h;
+}
+
+/* Una sovrapposizione per geometria (non una per tratto: in un video di 20 minuti i
+ * tratti sono centinaia), accesa solo nei suoi tratti con enable='between(...)+...'. */
+char *doppia_filtro_scena(const doppia_segmento *s, int n, int W, int H, double volume,
+                          int *raggi, int *n_raggi) {
+    int *gruppo = media_xmalloc(sizeof(int) * (size_t)(n ? n : 1));   /* rappresentante di ogni gruppo */
+    int k = 0;
+    for (int i = 0; i < n; i++) {
+        if (s[i].tipo == SEG_VUOTO) continue;
+        int j = 0;
+        while (j < k && !seg_stessa_geometria(&s[gruppo[j]], &s[i])) j++;
+        if (j == k) gruppo[k++] = i;
+    }
+    media_buf f = {0};
+    char t[512];
+    *n_raggi = 0;
+    if (k == 0) {
+        media_buf_puts(&f, "[0:v]null[v];");
+    } else {
+        media_buf_puts(&f, k == 1 ? "[1:v]null[s0];" : "[1:v]split=");
+        if (k > 1) {
+            snprintf(t, sizeof(t), "%d", k);
+            media_buf_puts(&f, t);
+            for (int j = 0; j < k; j++) { snprintf(t, sizeof(t), "[s%d]", j); media_buf_puts(&f, t); }
+            media_buf_puts(&f, ";");
+        }
+        for (int j = 0; j < k; j++) {
+            const doppia_segmento *g = &s[gruppo[j]];
+            if (g->tipo == SEG_CERCHIO) {
+                int d = 2 * g->w, in = 3 + *n_raggi;
+                raggi[(*n_raggi)++] = g->w;
+                snprintf(t, sizeof(t), "[s%d]scale=%d:%d,format=yuva420p[a%d];[%d:v]format=gray,scale=%d:%d[m%d];"
+                         "[a%d][m%d]alphamerge[t%d];", j, d, d, j, in, d, d, j, j, j, j);
+            } else if (g->tipo == SEG_RIQUADRO) {
+                snprintf(t, sizeof(t), "[s%d]scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d,setsar=1[t%d];",
+                         j, g->w, g->h, g->w, g->h, j);
+            } else {
+                /* a tutto schermo: niente bande nere; ai lati la testa stessa, ingrandita
+                 * fino a coprire e sfocata, come nei video verticali */
+                snprintf(t, sizeof(t), "[s%d]split=2[f%d][g%d];[g%d]scale=%d:%d:force_original_aspect_ratio=increase,"
+                         "crop=%d:%d,boxblur=40:2[b%d];[f%d]scale=%d:%d:force_original_aspect_ratio=decrease:flags=lanczos[q%d];"
+                         "[b%d][q%d]overlay=(W-w)/2:(H-h)/2[t%d];",
+                         j, j, j, j, W, H, W, H, j, j, W, H, j, j, j, j);
+            }
+            media_buf_puts(&f, t);
+        }
+        for (int j = 0; j < k; j++) {
+            const doppia_segmento *g = &s[gruppo[j]];
+            int x = g->tipo == SEG_CERCHIO ? g->x - g->w : g->tipo == SEG_RIQUADRO ? g->x : 0;
+            int y = g->tipo == SEG_CERCHIO ? g->y - g->w : g->tipo == SEG_RIQUADRO ? g->y : 0;
+            if (j == 0) media_buf_puts(&f, "[0:v]");
+            else { snprintf(t, sizeof(t), "[o%d]", j - 1); media_buf_puts(&f, t); }
+            snprintf(t, sizeof(t), "[t%d]overlay=%d:%d:eof_action=repeat:enable='", j, x, y);
+            media_buf_puts(&f, t);
+            bool primo = true;
+            for (int i = 0; i < n; i++) {
+                if (!seg_stessa_geometria(&s[i], g)) continue;
+                snprintf(t, sizeof(t), "%sbetween(t,%.3f,%.3f)", primo ? "" : "+", s[i].da, s[i].a);
+                media_buf_puts(&f, t);
+                primo = false;
+            }
+            if (j == k - 1) snprintf(t, sizeof(t), "'[v];");   /* l'ultima sovrapposizione e' l'uscita */
+            else snprintf(t, sizeof(t), "'[o%d];", j);
+            media_buf_puts(&f, t);
+        }
+    }
+    snprintf(t, sizeof(t), "[2:a]loudnorm=I=%.1f:TP=-1.5:LRA=11,aresample=48000,apad[a]", volume);
+    media_buf_puts(&f, t);
+    free(gruppo);
+    return media_buf_take(&f);
+}

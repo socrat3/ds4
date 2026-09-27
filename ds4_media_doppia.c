@@ -1,11 +1,9 @@
-/* ds4_media_doppia - il driver del doppiaggio: cartella del lavoro, motori, fasi.
- * Vedi ds4_media_doppia.h per l'elenco delle fasi e dei loro file.
+/* ds4_media_doppia - il driver del doppiaggio: cartella del lavoro e ordine delle
+ * fasi, ognuna saltata se il suo file c'e' gia' (vedi ds4_media_doppia.h). Le fasi che
+ * parlano con motori, voce e inquadrature sono in ds4_media_doppia_fasi.c.
  *
- * La macchina ha un solo motore grande acceso per volta (spark-switch): il traduttore
- * (ds4-server, ~80 GiB) e ComfyUI con H3 (~110 GiB) non stanno insieme. Il driver li
- * accende quando servono, se la configurazione lo permette; altrimenti dice quale
- * riga accendere. Voce e trascrizione non vogliono ComfyUI carico: prima gli si
- * chiede di liberare la memoria. */
+ * La sorgente e' un URL (yt-dlp) o un file locale in qualsiasi formato che ffmpeg sa
+ * leggere: mp4, mkv, mov, webm, avi, ts... */
 #include "ds4_media_doppia.h"
 #include "ds4_media_http.h"
 
@@ -101,6 +99,12 @@ bool doppia_prepara(doppia_conf *c, const char *const *override, char *err, size
     char e[512], nome[128], p[1100];
     for (int i = 0; override && override[i]; i += 2)   /* prima: servono a trovare la cartella */
         if (!doppia_set(c, override[i], override[i + 1], err, err_len)) return false;
+    /* un file locale si ricorda con il percorso assoluto: la ripresa puo' partire da
+     * qualsiasi cartella */
+    const char *src = doppia_get(c, "sorgente");
+    char assoluto[4096];
+    if (src[0] && !e_url(src) && realpath(src, assoluto) && strcmp(assoluto, src))
+        doppia_set(c, "sorgente", assoluto, e, sizeof(e));
     if (!c->dir[0]) {
         if (!doppia_get(c, "sorgente")[0]) { media_set_err(err, err_len, "manca il video da doppiare"); return false; }
         doppia_nome(c, nome, sizeof(nome));
@@ -120,207 +124,8 @@ bool doppia_prepara(doppia_conf *c, const char *const *override, char *err, size
     return true;
 }
 
-/* ── motori ───────────────────────────────────────────────────────────────── */
-
-/* host e porta del traduttore da traduttore_url, letto come fa la traduzione. */
-static int traduttore(const doppia_conf *c, char *host, size_t n) {
-    int port = 0;
-    if (!doppia_url(doppia_get(c, "traduttore_url"), host, n, &port)) { snprintf(host, n, "127.0.0.1"); return 0; }
-    return port;
-}
-
-static bool servizio_su(const char *host, int port, const char *path) {
-    media_http_response r = {0};
-    char e[128];
-    bool ok = media_http_get(host, port, path, 3000, &r, e, sizeof(e)) && r.status == 200;
-    media_http_response_free(&r);
-    return ok;
-}
-
-/* Accende la riga di spark-switch (se permesso) e aspetta che host:port risponda. */
-static bool accendi(doppia_conf *c, const char *riga, const char *host, int port, const char *path,
-                    const char *cosa, const char *log, doppia_cancel_fn cancel, void *pd, char *err, size_t err_len) {
-    if (!doppia_is(c, "cambio_motori", "si")) {
-        media_set_err(err, err_len, "%s non risponde su %s:%d: accendilo (spark-switch avvia %s) e rilancia", cosa, host, port, riga);
-        return false;
-    }
-    fprintf(stderr, "  accendo %s: spark-switch avvia %s (ferma il motore acceso)\n", cosa, riga);
-    const char *argv[12] = {"spark-switch", "avvia"};
-    char r[128];
-    snprintf(r, sizeof(r), "%s", riga);
-    int k = 2;
-    for (char *save = NULL, *t = strtok_r(r, " ", &save); t && k < 10; t = strtok_r(NULL, " ", &save)) argv[k++] = t;
-    argv[k] = NULL;
-    int rc = doppia_esegui(argv, log, cancel, pd);
-    for (int i = 0; i < 120 && rc == 0; i++) {   /* fino a 10 minuti */
-        if (servizio_su(host, port, path)) return true;
-        if (cancel && cancel(pd)) { media_set_err(err, err_len, "annullato"); return false; }
-        struct timespec ts = {5, 0};
-        nanosleep(&ts, NULL);
-    }
-    media_set_err(err, err_len, rc == 130 ? "annullato" : "%s non si e' acceso (spark-switch avvia %s, vedi il log)", cosa, riga);
-    return false;
-}
-
-/* ── fasi ─────────────────────────────────────────────────────────────────── */
-
-static const char *g_aiuti(const doppia_conf *c) {
-    static char buf[1100];
-    if (doppia_get(c, "aiuti")[0]) return doppia_get(c, "aiuti");
-    char exe[1024];
-    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
-    exe[n > 0 ? n : 0] = '\0';
-    char *sl = strrchr(exe, '/');
-    if (sl) *sl = '\0';
-    snprintf(buf, sizeof(buf), "%s/media/doppia", n > 0 ? exe : ".");
-    return buf;
-}
-
-static void doppia_logfn(void *pd, const char *msg) { (void)pd; fprintf(stderr, "  %s\n", msg); }
-
-static char *prompt_testa(const doppia_conf *c) {
-    media_buf b = {0};
-    media_buf_puts(&b, "SUBJECT: ");
-    /* senza pronomi: la descrizione puo' essere di chiunque */
-    media_buf_puts(&b, doppia_get(c, "descrizione")[0] ? doppia_get(c, "descrizione") : "the person in the photo");
-    media_buf_puts(&b, ". ACTION: looks into the camera and talks calmly in Italian, explaining a topic; "
-                       "the lip sync follows the speech exactly, the mouth closes in the pauses, small natural "
-                       "head movements and occasional hand gestures. The same face, glasses and clothes for "
-                       "the whole clip. SETTING: plain, softly lit room. CAMERA: static, frontal, "
-                       "medium close-up. STYLE: realistic video, natural skin, no deformations.");
-    return media_buf_take(&b);
-}
-
-static bool fase_pezzi(doppia_conf *c, double durata, const char *log, doppia_cancel_fn cancel, void *pd,
-                       char *err, size_t err_len) {
-    doppia_pezzo *pz;
-    int n = doppia_piano_pezzi(durata, &pz), manca = 0;
-    char p[1100], a[1100], tmpd[1100];
-    for (int i = 0; i < n; i++) { snprintf(p, sizeof(p), "%s/pezzi/p%03d.mp4", c->dir, i); manca += !esiste(p); }
-    if (!manca) { free(pz); return true; }
-    int port = (int)doppia_get_long(c, "comfy_porta");
-    snprintf(tmpd, sizeof(tmpd), "%s/pezzi/.h3", c->dir);
-    const char *home = getenv("HOME");
-    char comfy_out[1100];
-    snprintf(comfy_out, sizeof(comfy_out), "%s/comfy/ComfyUI/output", home ? home : "");
-    ds4_media_config mc = {.host = "127.0.0.1", .port = port, .media_dir = tmpd,
-                           .comfy_output_dir = access(comfy_out, W_OK) == 0 ? comfy_out : NULL,
-                           .log = doppia_logfn, .cancel = cancel, .cancel_privdata = pd};
-    ds4_media *m = ds4_media_create(&mc);
-    /* Si cambia motore se ComfyUI e' spento, o se e' acceso ma la memoria non basta
-     * (il traduttore ancora carico): lo dice la misura vera, non il fatto che un
-     * traduttore risponda (potrebbe stare su un'altra macchina). */
-    bool su = servizio_su("127.0.0.1", port, "/system_stats");
-    long libera = su ? ds4_media_comfy_avail_gib(m) : -1;
-    if ((!su || (libera >= 0 && libera < DS4_MEDIA_VIDEO_NEED_GIB)) &&
-        !accendi(c, doppia_get(c, "riga_video"), "127.0.0.1", port, "/system_stats", "ComfyUI (H3)",
-                 log, cancel, pd, err, err_len)) { ds4_media_free(m); free(pz); return false; }
-    char *prompt = prompt_testa(c);
-    long somma = 0;
-    int fatti = 0;
-    bool ok = true;
-    for (int i = 0; i < n && ok; i++) {
-        snprintf(p, sizeof(p), "%s/pezzi/p%03d.mp4", c->dir, i);
-        if (esiste(p)) continue;
-        snprintf(a, sizeof(a), "%s/pezzi/p%03d.wav", c->dir, i);
-        char ss[32], dd[32], v[1100];
-        snprintf(ss, sizeof(ss), "%.3f", pz[i].inizio);
-        snprintf(dd, sizeof(dd), "%.3f", pz[i].fotogrammi / 24.0);
-        snprintf(v, sizeof(v), "%s/voce_it.wav", c->dir);
-        const char *argv[] = {doppia_get(c, "ffmpeg"), "-hide_banner", "-loglevel", "error", "-y", "-ss", ss,
-                              "-i", v, "-af", "apad", "-t", dd, "-ac", "1", "-ar", "48000", a, NULL};
-        if (doppia_esegui(argv, log, cancel, pd) != 0) { media_set_err(err, err_len, "non taglio l'audio del pezzo %d", i + 1); ok = false; break; }
-        fprintf(stderr, "  pezzo %d/%d (%.1f s da %.1f s)...\n", i + 1, n, pz[i].fotogrammi / 24.0, pz[i].inizio);
-        long t0 = time(NULL);
-        ds4_media_talk_req r = {.prompt = prompt, .face = doppia_get(c, "foto"), .audio = a,
-                                .width = (int)doppia_get_long(c, "risoluzione"), .height = (int)doppia_get_long(c, "risoluzione"),
-                                .frames = pz[i].fotogrammi, .steps = (int)doppia_get_long(c, "passi"),
-                                .seed = doppia_get_long(c, "seme") + i, .anchor_end = pz[i].ancora_fine};
-        ds4_media_result res;
-        ok = ds4_media_talk(m, &r, &res, err, err_len);
-        if (ok && rename(res.files[0], p) != 0) { media_set_err(err, err_len, "non sposto il pezzo in %s", p); ok = false; }
-        ds4_media_result_free(&res);
-        if (ok) {
-            somma += time(NULL) - t0;
-            fatti++;
-            int restano = 0;
-            for (int k = i + 1; k < n; k++) { snprintf(a, sizeof(a), "%s/pezzi/p%03d.mp4", c->dir, k); restano += !esiste(a); }
-            fprintf(stderr, "  pezzo %d/%d fatto in %ld s; ne restano %d, circa %ld min\n",
-                    i + 1, n, (long)(time(NULL) - t0), restano, somma / fatti * restano / 60);
-        }
-    }
-    free(prompt);
-    ds4_media_free(m);
-    free(pz);
-    return ok;
-}
-
-/* posizione.txt: "cerchio cx cy r" o "intero". */
-static bool fase_posizione(doppia_conf *c, const char *log, doppia_cancel_fn cancel, void *pd,
-                           int *cx, int *cy, int *r, char *err, size_t err_len) {
-    char p[1100], s[1100], script[1100];
-    P(p, c, "posizione.txt");
-    P(s, c, "sorgente.mp4");
-    const char *pos = doppia_get(c, "posizione");
-    if (!strcmp(pos, "auto")) {
-        if (!esiste(p)) {
-            snprintf(script, sizeof(script), "%s/cerchio.py", g_aiuti(c));
-            const char *argv[] = {doppia_get(c, "python_cv"), script, s, p, NULL};
-            if (doppia_esegui(argv, log, cancel, pd) != 0 || !esiste(p)) {
-                media_set_err(err, err_len, "non trovo la webcam nel video: indica la posizione (cx,cy,r o intero)");
-                return false;
-            }
-        }
-    } else {
-        FILE *fp = fopen(p, "w");
-        if (!fp) { media_set_err(err, err_len, "non scrivo %s", p); return false; }
-        int a, b, k;
-        if (sscanf(pos, "%d,%d,%d", &a, &b, &k) == 3 && k > 0) fprintf(fp, "cerchio %d %d %d\n", a, b, k);
-        else fprintf(fp, "intero\n");
-        fclose(fp);
-    }
-    FILE *fp = fopen(p, "r");
-    char l[256] = {0};
-    if (fp) { if (!fgets(l, sizeof(l), fp)) l[0] = '\0'; fclose(fp); }
-    *r = 0;
-    if (sscanf(l, "cerchio %d %d %d", cx, cy, r) != 3) *r = 0;
-    fprintf(stderr, "  posizione: %s", l[0] ? l : "intero\n");
-    return true;
-}
-
-/* Il titolo si rifa' solo se e' cambiato qualcosa: il testo di titoli.txt, la scelta
- * titolo si/no, o il video sotto (dimensione e data). Rifarlo a ogni ripresa costava
- * una ricodifica completa del video finale, due con resa = entrambe. */
-static unsigned long long firma_titolo(const doppia_conf *c, const char *in) {
-    unsigned long long h = 1469598103934665603ULL;
-    FILE *fp = fopen(doppia_titoli_path(c), "r");
-    for (int ch; fp && (ch = fgetc(fp)) != EOF;) h = (h ^ (unsigned char)ch) * 1099511628211ULL;
-    if (fp) fclose(fp);
-    struct stat st;
-    char buf[160];
-    snprintf(buf, sizeof(buf), "|%s|%lld|%lld", doppia_get(c, "titolo"),
-             stat(in, &st) == 0 ? (long long)st.st_size : -1LL, stat(in, &st) == 0 ? (long long)st.st_mtime : -1LL);
-    for (const char *p = buf; *p; p++) h = (h ^ (unsigned char)*p) * 1099511628211ULL;
-    return h;
-}
-
-static bool titolo_se_serve(const doppia_conf *c, const char *in, const char *out, const char *log,
-                            doppia_cancel_fn cancel, void *pd, char *err, size_t err_len) {
-    char fp_path[1300], vecchia[32] = {0}, nuova[32];
-    snprintf(fp_path, sizeof(fp_path), "%s.firma", out);
-    snprintf(nuova, sizeof(nuova), "%016llx", firma_titolo(c, in));
-    FILE *f = fopen(fp_path, "r");
-    if (f) { if (!fgets(vecchia, sizeof(vecchia), f)) vecchia[0] = '\0'; fclose(f); }
-    vecchia[strcspn(vecchia, "\n")] = '\0';
-    if (esiste(out) && !strcmp(vecchia, nuova)) { fprintf(stderr, "  %s: titolo invariato\n", out); return true; }
-    if (!doppia_titolo(c, g_aiuti(c), in, doppia_titoli_path(c), out, log, cancel, pd, err, err_len)) return false;
-    f = fopen(fp_path, "w");
-    if (f) { fprintf(f, "%s\n", nuova); fclose(f); }
-    return true;
-}
-
 bool doppia_run(doppia_conf *c, doppia_cancel_fn cancel, void *pd, char *err, size_t err_len) {
-    char log[1100], orig[1100], src[1100], a16[1100], csv[1100], tsv[1100], voce[1100], e[512];
+    char log[1100], orig[1100], src[1100], a16[1100], csv[1100], tsv[1100], voce[1100], lingua[16];
     P(log, c, "doppia.log");
     P(src, c, "sorgente.mp4");
     P(a16, c, "audio16k.wav");
@@ -331,10 +136,12 @@ bool doppia_run(doppia_conf *c, doppia_cancel_fn cancel, void *pd, char *err, si
     if (!doppia_verifica(c, err, err_len)) return false;
     media_http_set_cancel(cancel, pd);
     bool ok = false;
+    doppia_segmento *seg = NULL;
+    int nseg = 0;
 
-    /* 1 scarica */
+    /* 1 scarica, o prende il file locale */
     if (!esiste(src)) {
-        fprintf(stderr, "[1/9] scarico il video\n");
+        fprintf(stderr, "[1/10] %s\n", e_url(in) ? "scarico il video" : "preparo il video");
         if (e_url(in)) {
             char tmpl[1100];
             P(tmpl, c, "originale.%(ext)s");
@@ -345,40 +152,52 @@ bool doppia_run(doppia_conf *c, doppia_cancel_fn cancel, void *pd, char *err, si
             if (!esiste(orig) && doppia_esegui(argv, log, cancel, pd) != 0) { media_set_err(err, err_len, "download non riuscito (vedi %s)", log); goto fine; }
         } else {
             snprintf(orig, sizeof(orig), "%s", in);
+            if (doppia_durata(ff, orig, NULL, NULL) <= 0) { media_set_err(err, err_len, "ffmpeg non legge %s come video", orig); goto fine; }
         }
         double da = doppia_get_double(c, "da"), a = doppia_get_double(c, "a");
         char sda[32], sa[32];
         snprintf(sda, sizeof(sda), "%.3f", da);
         snprintf(sa, sizeof(sa), "%.3f", a);
         if (a > 0 && a <= da) { media_set_err(err, err_len, "intervallo vuoto: a deve superare da"); goto fine; }
-        /* Senza taglio basta copiare (YouTube da' gia' h264/aac: minuti di CPU risparmiati);
-         * con il taglio si ricodifica, per tagliare esatti e non al keyframe. Sempre su un
-         * file temporaneo rinominato alla fine: un sorgente troncato da un'interruzione
-         * sembrerebbe completo alla ripresa. */
+        /* Senza taglio si prova a copiare (YouTube e la maggior parte dei file danno
+         * h264/aac); se il contenitore mp4 non accetta i flussi (mkv con vorbis, avi con
+         * mpeg4...) si ricodifica. Con il taglio si ricodifica sempre, per tagliare
+         * esatti e non al keyframe. Sempre su un file temporaneo rinominato alla fine. */
         bool taglio = da > 0 || a > 0;
-        const char *copia[] = {ff, "-hide_banner", "-loglevel", "error", "-y", "-i", orig, "-c", "copy",
-                               "-movflags", "+faststart", "-f", "mp4", NULL, NULL};
+        const char *copia[] = {ff, "-hide_banner", "-loglevel", "error", "-y", "-i", orig, "-map", "0:v:0", "-map", "0:a:0?",
+                               "-c", "copy", "-movflags", "+faststart", "-f", "mp4", NULL, NULL};
         const char *ricod[] = {ff, "-hide_banner", "-loglevel", "error", "-y", "-ss", sda, a > 0 ? "-to" : "-nostdin",
-                               a > 0 ? sa : "-nostdin", "-i", orig, "-c:v", "libx264", "-preset", "medium", "-crf", "16",
-                               "-c:a", "aac", "-b:a", "192k", "-f", "mp4", NULL, NULL};
-        if (!(taglio ? doppia_ffmpeg(ricod, 22, src, log, cancel, pd, err, err_len)
-                     : doppia_ffmpeg(copia, 13, src, log, cancel, pd, err, err_len))) goto fine;
+                               a > 0 ? sa : "-nostdin", "-i", orig, "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264",
+                               "-preset", "medium", "-crf", "16", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+                               "-f", "mp4", NULL, NULL};
+        bool fatto = !taglio && doppia_ffmpeg(copia, 17, src, log, cancel, pd, err, err_len);
+        if (!fatto && !strcmp(err, "annullato")) goto fine;
+        if (!fatto) {
+            if (!taglio) fprintf(stderr, "  il contenitore mp4 non accetta i flussi di questo file: ricodifico\n");
+            if (!doppia_ffmpeg(ricod, 28, src, log, cancel, pd, err, err_len)) goto fine;
+        }
     }
     double durata = doppia_durata(ff, src, NULL, NULL);
     if (durata <= 0) { media_set_err(err, err_len, "non leggo la durata di %s", src); goto fine; }
+    if (!doppia_ha_audio(ff, src)) { media_set_err(err, err_len, "il video non ha una traccia audio: non c'e' niente da doppiare"); goto fine; }
 
-    /* 2-3 trascrivi, frasi */
+    /* 2 lingua, 3 trascrivi, 4 frasi */
+    if (!esiste(a16)) {
+        const char *a1[] = {ff, "-hide_banner", "-loglevel", "error", "-y", "-i", src, "-vn", "-ac", "1", "-ar", "16000", a16, NULL};
+        if (doppia_esegui(a1, log, cancel, pd) != 0) { media_set_err(err, err_len, "non estraggo l'audio (vedi %s)", log); goto fine; }
+    }
+    if (!doppia_fase_lingua(c, a16, log, cancel, pd, lingua, sizeof(lingua), err, err_len)) goto fine;
+    fprintf(stderr, "[2/10] lingua: %s%s\n", lingua, !strcmp(lingua, "it") ? " (gia' italiano: nessuna traduzione)" : "");
     if (!esiste(tsv)) {
         if (!esiste(csv)) {
-            fprintf(stderr, "[2/9] trascrivo (%.0f s di video)\n", durata);
-            const char *a1[] = {ff, "-hide_banner", "-loglevel", "error", "-y", "-i", src, "-vn", "-ac", "1", "-ar", "16000", a16, NULL};
+            fprintf(stderr, "[3/10] trascrivo (%.0f s di video)\n", durata);
             char of[1100];
             P(of, c, "parole");
             const char *g = doppia_get(c, "glossario");
             const char *a2[] = {doppia_get(c, "whisper_cli"), "-m", doppia_get(c, "whisper_modello"), "-f", a16,
-                                "-l", doppia_get(c, "lingua"), "-ml", "1", "-sow", "-ocsv", "-np", "-of", of,
+                                "-l", lingua, "-ml", "1", "-sow", "-ocsv", "-np", "-of", of,
                                 g[0] ? "--prompt" : NULL, g, NULL};
-            if (doppia_esegui(a1, log, cancel, pd) != 0 || doppia_esegui(a2, log, cancel, pd) != 0 || !esiste(csv)) {
+            if (doppia_esegui(a2, log, cancel, pd) != 0 || !esiste(csv)) {
                 media_set_err(err, err_len, "trascrizione non riuscita (vedi %s)", log);
                 goto fine;
             }
@@ -394,20 +213,23 @@ bool doppia_run(doppia_conf *c, doppia_cancel_fn cancel, void *pd, char *err, si
         int n = doppia_frasi_da_csv(testo, 3.0, 9.0, &f);
         free(testo);
         if (n <= 0 || !doppia_frasi_save(tsv, f, n)) { doppia_frasi_free(f, n > 0 ? n : 0); media_set_err(err, err_len, "nessuna frase dalla trascrizione"); goto fine; }
-        fprintf(stderr, "[3/9] %d frasi\n", n);
+        fprintf(stderr, "[4/10] %d frasi\n", n);
         doppia_frasi_free(f, n);
     }
 
-    /* 4 traduci */
+    /* 5 traduci (se la lingua non e' gia' l'italiano) */
     doppia_frase *f;
     int n = doppia_frasi_load(tsv, &f), manca = 0;
     for (int i = 0; i < n; i++) manca += !f[i].it;
-    if (manca) {
-        fprintf(stderr, "[4/9] traduco %d frasi\n", manca);
+    if (manca && !strcmp(lingua, "it")) {
+        for (int i = 0; i < n; i++) if (!f[i].it) f[i].it = media_xstrdup(f[i].en);   /* le parole restano le sue */
+        doppia_frasi_save(tsv, f, n);
+    } else if (manca) {
+        fprintf(stderr, "[5/10] traduco %d frasi\n", manca);
         char host[256];
-        int port = traduttore(c, host, sizeof(host));
-        if (!servizio_su(host, port, "/v1/models") &&
-            !accendi(c, doppia_get(c, "riga_traduzione"), host, port, "/v1/models", "il traduttore", log, cancel, pd, err, err_len)) {
+        int port = doppia_traduttore(c, host, sizeof(host));
+        if (!doppia_servizio_su(host, port, "/v1/models") &&
+            !doppia_accendi(c, doppia_get(c, "riga_traduzione"), host, port, "/v1/models", "il traduttore", log, cancel, pd, err, err_len)) {
             doppia_frasi_free(f, n);
             goto fine;
         }
@@ -415,65 +237,54 @@ bool doppia_run(doppia_conf *c, doppia_cancel_fn cancel, void *pd, char *err, si
     }
     doppia_frasi_free(f, n);
 
-    /* 5 voce: ComfyUI a riposo terrebbe la memoria che serve alla sintesi */
-    if (!esiste(voce)) {
-        fprintf(stderr, "[5/9] voce italiana (%s)\n", doppia_get(c, "voce_motore"));
-        int port = (int)doppia_get_long(c, "comfy_porta");
-        if (servizio_su("127.0.0.1", port, "/system_stats")) {
-            ds4_media_config mc = {.host = "127.0.0.1", .port = port};
-            ds4_media *m = ds4_media_create(&mc);
-            ds4_media_free_models(m, e, sizeof(e));
-            ds4_media_free(m);
-        }
-        char script[1100], vdir[1100], dur[32];
-        snprintf(script, sizeof(script), "%s/voce.py", g_aiuti(c));
-        P(vdir, c, "voce");
-        snprintf(dur, sizeof(dur), "%.3f", durata);
-        bool qwen = doppia_is(c, "voce_motore", "qwen");
-        const char *argv[] = {doppia_get(c, qwen ? "python_qwen" : "python_xtts"), script, doppia_get(c, "voce_motore"),
-                              tsv, doppia_get(c, "voce_campione"), doppia_get(c, "voce_testo"), vdir, voce, dur, ff, NULL};
-        if (doppia_esegui(argv, log, cancel, pd) != 0 || !esiste(voce)) { media_set_err(err, err_len, "sintesi della voce non riuscita (vedi %s)", log); goto fine; }
-    }
-
-    /* 6 posizione, 7 pezzi, 8 monta, 9 titolo */
+    /* 6 voce, 7 inquadrature, 8 pezzi, 9 monta, 10 titolo */
+    if (!doppia_fase_voce(c, lingua, durata, log, cancel, pd, err, err_len)) goto fine;
     bool scena = !doppia_is(c, "resa", "testa"), testa_fin = !doppia_is(c, "resa", "scena");
-    int cx = 0, cy = 0, r = 0;
-    if (scena) { fprintf(stderr, "[6/9] posizione nella scena\n"); if (!fase_posizione(c, log, cancel, pd, &cx, &cy, &r, err, err_len)) goto fine; }
-    fprintf(stderr, "[7/9] teste parlanti H3\n");
-    if (!fase_pezzi(c, durata, log, cancel, pd, err, err_len)) goto fine;
+    if (scena) {
+        fprintf(stderr, "[7/10] inquadrature\n");
+        if (!doppia_fase_posizione(c, durata, log, cancel, pd, &seg, &nseg, err, err_len)) goto fine;
+    }
+    fprintf(stderr, "[8/10] teste parlanti H3\n");
+    if (!doppia_fase_pezzi(c, durata, log, cancel, pd, err, err_len)) goto fine;
     char testa[1100], scena_p[1100], nome[128], out[1200];
     P(testa, c, "testa.mp4");
     P(scena_p, c, "scena.mp4");
     if (!esiste(testa)) {
-        fprintf(stderr, "[8/9] monto\n");
+        fprintf(stderr, "[9/10] monto\n");
         doppia_pezzo *pz;
         int np = doppia_piano_pezzi(durata, &pz);
         char **pezzi = media_xmalloc(sizeof(char *) * (size_t)np);
-        for (int i = 0; i < np; i++) { char q[1100]; snprintf(q, sizeof(q), "%s/pezzi/p%03d.mp4", c->dir, i); pezzi[i] = media_xstrdup(q); }
         int *fot = media_xmalloc(sizeof(int) * (size_t)np);
-        for (int i = 0; i < np; i++) fot[i] = pz[i].fotogrammi;
+        for (int i = 0; i < np; i++) {
+            char q[1100];
+            snprintf(q, sizeof(q), "%s/pezzi/p%03d.mp4", c->dir, i);
+            pezzi[i] = media_xstrdup(q);
+            fot[i] = pz[i].fotogrammi;
+        }
         bool mo = doppia_monta_testa(c, pezzi, fot, np, durata, voce, testa, log, cancel, pd, err, err_len);
-        free(fot);
         for (int i = 0; i < np; i++) free(pezzi[i]);
         free(pezzi);
+        free(fot);
         free(pz);
         if (!mo) goto fine;
     }
-    if (scena && !esiste(scena_p) && !doppia_monta_scena(c, src, testa, cx, cy, r, voce, scena_p, log, cancel, pd, err, err_len)) goto fine;
-    fprintf(stderr, "[9/9] titolo di testa\n");
+    if (scena && !esiste(scena_p) &&
+        !doppia_monta_scena(c, src, testa, seg, nseg, voce, scena_p, log, cancel, pd, err, err_len)) goto fine;
+    fprintf(stderr, "[10/10] titolo di testa\n");
     snprintf(nome, sizeof(nome), "%.100s", strrchr(c->dir, '/') ? strrchr(c->dir, '/') + 1 : c->dir);
     if (testa_fin) {
         snprintf(out, sizeof(out), "%s/%s_testa.mp4", c->dir, nome);
-        if (!titolo_se_serve(c, testa, out, log, cancel, pd, err, err_len)) goto fine;
+        if (!doppia_titolo_se_serve(c, testa, out, log, cancel, pd, err, err_len)) goto fine;
         printf("%s\n", out);
     }
     if (scena) {
         snprintf(out, sizeof(out), "%s/%s_scena.mp4", c->dir, nome);
-        if (!titolo_se_serve(c, scena_p, out, log, cancel, pd, err, err_len)) goto fine;
+        if (!doppia_titolo_se_serve(c, scena_p, out, log, cancel, pd, err, err_len)) goto fine;
         printf("%s\n", out);
     }
     ok = true;
 fine:
+    free(seg);
     media_http_set_cancel(NULL, NULL);
     return ok;
 }

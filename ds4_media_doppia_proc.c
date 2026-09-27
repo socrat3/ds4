@@ -189,54 +189,52 @@ bool doppia_monta_testa(const doppia_conf *c, char **pezzi, const int *fotogramm
 }
 
 bool doppia_monta_scena(const doppia_conf *c, const char *sorgente, const char *testa,
-                        int cx, int cy, int r, const char *voce, const char *out, const char *log,
-                        doppia_cancel_fn cancel, void *pd, char *err, size_t err_len) {
+                        const doppia_segmento *seg, int nseg, const char *voce, const char *out,
+                        const char *log, doppia_cancel_fn cancel, void *pd, char *err, size_t err_len) {
     int W = 0, H = 0;
     double dur = doppia_durata(doppia_get(c, "ffmpeg"), sorgente, &W, &H);
     if (dur <= 0 || W <= 0) { media_set_err(err, err_len, "non leggo durata e dimensioni di %s", sorgente); return false; }
-    char f[1024], ds[32], maschera[1300];
-    snprintf(maschera, sizeof(maschera), "%s.maschera.png", out);
-    if (r > 0) {
-        /* La maschera del cerchio (2 px di bordo sfumato: 255 dentro, 0 fuori) si calcola
-         * una volta in un PNG: geq valutato su ogni fotogramma di un video lungo era la
-         * parte piu' lenta del montaggio. */
+    int raggi[64], nr = 0;
+    char *f = doppia_filtro_scena(seg, nseg, W, H, doppia_get_double(c, "volume"), raggi, &nr);
+    if (nr > 60) { free(f); media_set_err(err, err_len, "troppe webcam tonde diverse nel video (%d)", nr); return false; }
+    /* Il filtro va in un file: con centinaia di tratti supererebbe il limite di
+     * lunghezza di un singolo argomento. */
+    char script[1300], ds[32], maschere[64][1300];
+    snprintf(script, sizeof(script), "%s.filtro.txt", out);
+    FILE *fp = fopen(script, "w");
+    if (!fp || fputs(f, fp) < 0) { if (fp) fclose(fp); free(f); media_set_err(err, err_len, "non scrivo %s", script); return false; }
+    fclose(fp);
+    free(f);
+    const char **argv = media_xmalloc(sizeof(char *) * (size_t)(40 + 6 * nr));
+    int k = 0;
+    const char *testa_argv[] = {doppia_get(c, "ffmpeg"), "-hide_banner", "-loglevel", "error", "-y",
+                                "-i", sorgente, "-i", testa, "-i", voce};
+    for (int i = 0; i < 11; i++) argv[k++] = testa_argv[i];
+    bool ok = true;
+    for (int m = 0; m < nr && ok; m++) {
+        /* La maschera di ogni cerchio (2 px di bordo sfumato: 255 dentro, 0 fuori) si
+         * calcola una volta in un PNG: geq su ogni fotogramma era la parte piu' lenta. */
+        int r = raggi[m];
         char mf[256], ms[64];
+        snprintf(maschere[m], sizeof(maschere[m]), "%s.maschera-%d.png", out, m);
         snprintf(ms, sizeof(ms), "color=c=black:s=%dx%d:d=1", 2 * r, 2 * r);
         snprintf(mf, sizeof(mf), "format=gray,geq=lum='255*clip((%d-hypot(X-%d+0.5,Y-%d+0.5))/2,0,1)'", r, r, r);
         const char *mv[] = {doppia_get(c, "ffmpeg"), "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
-                            "-i", ms, "-vf", mf, "-frames:v", "1", maschera, NULL};
-        if (doppia_esegui(mv, log, cancel, pd) != 0) {
-            media_set_err(err, err_len, "non preparo la maschera del cerchio (vedi il log)");
-            return false;
-        }
-        snprintf(f, sizeof(f),
-                 "[1:v]scale=%d:%d,format=yuva420p[t0];[3:v]format=gray,scale=%d:%d[m];[t0][m]alphamerge[t];"
-                 "[0:v][t]overlay=%d:%d:eof_action=repeat[v];"
-                 "[2:a]loudnorm=I=%.1f:TP=-1.5:LRA=11,aresample=48000,apad[a]",
-                 2 * r, 2 * r, 2 * r, 2 * r, cx - r, cy - r, doppia_get_double(c, "volume"));
-    } else {
-        snprintf(f, sizeof(f),
-                 "[1:v]scale=%d:%d:force_original_aspect_ratio=decrease:flags=lanczos,"
-                 "pad=%d:%d:(ow-iw)/2:(oh-ih)/2[t];[0:v][t]overlay=0:0:eof_action=repeat[v];"
-                 "[2:a]loudnorm=I=%.1f:TP=-1.5:LRA=11,aresample=48000,apad[a]",
-                 W, H, W, H, doppia_get_double(c, "volume"));
-    }
-    snprintf(ds, sizeof(ds), "%.3f", dur);
-    /* la maschera e' un quarto ingresso solo con il cerchio (-loop vale solo per le immagini) */
-    const char *argv[48] = {doppia_get(c, "ffmpeg"), "-hide_banner", "-loglevel", "error", "-y",
-                            "-i", sorgente, "-i", testa, "-i", voce};
-    int k = 11;
-    if (r > 0) {
-        const char *m4[] = {"-loop", "1", "-framerate", "24", "-i", maschera};
+                            "-i", ms, "-vf", mf, "-frames:v", "1", maschere[m], NULL};
+        if (doppia_esegui(mv, log, cancel, pd) != 0) { media_set_err(err, err_len, "non preparo la maschera del cerchio"); ok = false; }
+        const char *m4[] = {"-loop", "1", "-framerate", "24", "-i", maschere[m]};
         for (int i = 0; i < 6; i++) argv[k++] = m4[i];
     }
-    const char *resto[] = {"-filter_complex", f, "-map", "[v]", "-map", "[a]", "-t", ds, "-c:v", "libx264",
+    snprintf(ds, sizeof(ds), "%.3f", dur);
+    const char *resto[] = {"-filter_complex_script", script, "-map", "[v]", "-map", "[a]", "-t", ds, "-c:v", "libx264",
                            "-preset", "medium", "-crf", "18", "-c:a", "aac", "-b:a", "192k",
                            "-movflags", "+faststart", "-f", "mp4"};
     for (size_t i = 0; i < sizeof(resto) / sizeof(resto[0]); i++) argv[k++] = resto[i];
     argv[k] = NULL;
-    bool ok = doppia_ffmpeg(argv, k, out, log, cancel, pd, err, err_len);
-    unlink(maschera);
+    if (ok) ok = doppia_ffmpeg(argv, k, out, log, cancel, pd, err, err_len);
+    for (int m = 0; m < nr; m++) unlink(maschere[m]);
+    unlink(script);
+    free(argv);
     return ok;
 }
 

@@ -74,6 +74,42 @@ static void t_piano(void) {
     VERIFICA(doppia_piano_pezzi(0, &p) == 0, "durata zero: nessun pezzo");
 }
 
+static void t_posizione(void) {
+    char p[400];
+    snprintf(p, sizeof(p), "%s/posizione.txt", DIR_);
+    FILE *fp = fopen(p, "w");
+    fputs("# commento\n20.0 30.0 intero\n0 10.5 riquadro 1548 780 276 280\n10.5 20.0 vuoto\n"
+          "28 40 cerchio 1680 180 181\nriga sbagliata\n45 44 intero\n50 99 riquadro 1 2 0 5\n", fp);
+    fclose(fp);
+    doppia_segmento *s;
+    int n = doppia_posizione_load(p, 35.0, &s);
+    VERIFICA(n == 4, "mappa: 4 tratti validi (%d)", n);
+    if (n == 4) {
+        VERIFICA(s[0].tipo == SEG_RIQUADRO && s[0].x == 1548 && s[0].w == 276 && s[0].h == 280 && s[0].da == 0,
+                 "mappa: ordinata, riquadro letto");
+        VERIFICA(s[2].tipo == SEG_INTERO && s[3].tipo == SEG_CERCHIO && s[3].da == 30.0 && s[3].a == 35.0,
+                 "mappa: sovrapposizione tolta e fine portata alla durata (%.1f-%.1f)", s[3].da, s[3].a);
+    }
+    int raggi[8], nr = 0;
+    char *f = doppia_filtro_scena(s, n, 1920, 1080, -16, raggi, &nr);
+    VERIFICA(nr == 1 && raggi[0] == 181, "filtro: una maschera per il cerchio (%d)", nr);
+    VERIFICA(strstr(f, "[1:v]split=3") && strstr(f, "overlay=1548:780") && strstr(f, "overlay=1499:-1") &&
+             strstr(f, "overlay=0:0"), "filtro: tre sovrapposizioni al loro posto");
+    VERIFICA(strstr(f, "between(t,0.000,10.500)") && !strstr(f, "between(t,10.500,20.000)"), "filtro: il tratto vuoto resta originale");
+    VERIFICA(strstr(f, "'[v];") && strstr(f, "[3:v]format=gray") && strstr(f, "loudnorm=I=-16.0"), "filtro: uscita [v], maschera, volume");
+    free(f);
+    free(s);
+    fp = fopen(p, "w"); fputs("cerchio 1684 182 183\n", fp); fclose(fp);
+    n = doppia_posizione_load(p, 30.9, &s);
+    VERIFICA(n == 1 && s[0].tipo == SEG_CERCHIO && s[0].da == 0 && s[0].a == 30.9, "mappa: il formato vecchio vale per tutto il video");
+    free(s);
+    doppia_segmento v[1] = {{.da = 0, .a = 5, .tipo = SEG_VUOTO}};
+    f = doppia_filtro_scena(v, 1, 1920, 1080, -16, raggi, &nr);
+    VERIFICA(strstr(f, "[0:v]null[v]") && nr == 0, "filtro: solo tratti vuoti = video originale");
+    free(f);
+    VERIFICA(doppia_posizione_load("/nonesiste", 10, &s) == -1, "mappa: file mancante");
+}
+
 static void t_json(void) {
     char **v;
     int n = doppia_json_array("ecco: [\"uno\", \"d\\\"ue\", \"tr\\u00e8\"] fine", &v);
@@ -94,7 +130,10 @@ static void t_conf(void) {
     setenv("HOME", DIR_, 1);   /* niente ~/.ds4/doppia.conf dell'utente nei test */
     doppia_conf_init(&c);
     char e[256];
-    VERIFICA(doppia_is(&c, "voce_motore", "qwen") && doppia_get_long(&c, "risoluzione") == 576, "predefiniti");
+    VERIFICA(doppia_is(&c, "voce_motore", "qwen") && doppia_get_long(&c, "risoluzione") == 576 &&
+             doppia_is(&c, "lingua", "auto") && doppia_is(&c, "voce_modalita", "auto"), "predefiniti");
+    VERIFICA(!doppia_set(&c, "voce_modalita", "clonata", e, sizeof(e)) && doppia_set(&c, "voce_modalita", "conversione", e, sizeof(e)),
+             "modalita' della voce validata");
     VERIFICA(!doppia_set(&c, "resa", "tutte", e, sizeof(e)) && strstr(e, "entrambe"), "scelta fuori elenco: %s", e);
     VERIFICA(!doppia_set(&c, "passi", "20x", e, sizeof(e)), "intero sporco rifiutato");
     VERIFICA(!doppia_set(&c, "foto", "/nonesiste.png", e, sizeof(e)), "file che non esiste rifiutato");
@@ -315,6 +354,7 @@ int main(void) {
     t_frasi();
     t_piano();
     t_json();
+    t_posizione();
     t_conf();
     t_terza();
     t_traduci();
