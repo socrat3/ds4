@@ -43685,7 +43685,9 @@ static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_ve
         bpe_tokenize_text_glm4(vocab, text, out);
         return;
     }
-    if (ds4_model_is_qwen4()) {
+    /* The dense 27B declares tokenizer.ggml.pre = qwen35 as well: the DeepSeek
+     * rule below groups digits by three, qwen35 splits them one by one. */
+    if (ds4_model_is_qwen4() || ds4_model_is_qwen35()) {
         bpe_tokenize_text_qwen35(vocab, text, out);
         return;
     }
