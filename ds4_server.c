@@ -19752,7 +19752,7 @@ static void test_qwen35_history_keeps_think_block(void) {
     u2.content = xstrdup("seconda domanda");
     chat_msgs_push(&msgs, u2);
 
-    char *reso = render_qwen35_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    char *reso = render_qwen_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
     TEST_ASSERT(reso != NULL);
     TEST_ASSERT(strstr(reso,
         "<|im_start|>assistant\n<think>\nci penso\n</think>\n\nprima risposta<|im_end|>") != NULL);
@@ -19766,7 +19766,7 @@ static void test_qwen35_history_keeps_think_block(void) {
      * template con `reasoning_content` assente. */
     free(msgs.v[1].reasoning);
     msgs.v[1].reasoning = NULL;
-    reso = render_qwen35_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_NONE);
+    reso = render_qwen_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_NONE);
     TEST_ASSERT(reso != NULL);
     TEST_ASSERT(strstr(reso,
         "<|im_start|>assistant\n<think>\n\n</think>\n\nprima risposta<|im_end|>") != NULL);
@@ -19846,7 +19846,7 @@ static void test_qwen35_prefill_con_chiusura_in_testa(void) {
     a.content = xstrdup("</think>\n\nla risposta");
     chat_msgs_push(&msgs, a);
 
-    char *reso = render_qwen35_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    char *reso = render_qwen_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
     TEST_ASSERT(reso != NULL);
     TEST_ASSERT(strstr(reso, "<|im_start|>assistant\n<think>\n</think>\n\nla risposta") != NULL);
     {   /* un'apertura sola, una chiusura sola */
@@ -19871,7 +19871,7 @@ static void test_qwen35_ultimo_assistant_e_un_prefill(void) {
     a.reasoning = xstrdup("  Ragioniamo in italiano.  ");
     chat_msgs_push(&msgs, a);
 
-    char *reso = render_qwen35_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    char *reso = render_qwen_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
     TEST_ASSERT(reso != NULL);
     /* Il pensiero resta APERTO e il testo finisce li'. */
     TEST_ASSERT(strstr(reso, "<|im_start|>assistant\n<think>\nRagioniamo in italiano.") != NULL);
@@ -19887,7 +19887,7 @@ static void test_qwen35_ultimo_assistant_e_un_prefill(void) {
     /* Con del contenuto il pensiero si chiude e si continua la RISPOSTA. */
     free(msgs.v[1].content);
     msgs.v[1].content = xstrdup("La risposta comincia");
-    reso = render_qwen35_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    reso = render_qwen_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
     TEST_ASSERT(reso != NULL);
     TEST_ASSERT(strstr(reso, "<think>\nRagioniamo in italiano.\n</think>\n\nLa risposta comincia") != NULL);
     TEST_ASSERT(strstr(reso, "La risposta comincia<|im_end|>") == NULL);
@@ -19900,7 +19900,7 @@ static void test_qwen35_ultimo_assistant_e_un_prefill(void) {
     msgs.v[1].reasoning = NULL;
     free(msgs.v[1].content);
     msgs.v[1].content = xstrdup("<think>\nSto gia' pensando");
-    reso = render_qwen35_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    reso = render_qwen_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
     TEST_ASSERT(reso != NULL);
     {
         const char *primo = strstr(reso, "<think>");
@@ -19916,7 +19916,7 @@ static void test_qwen35_ultimo_assistant_e_un_prefill(void) {
      * cioe' invitava a pensare dove il client aveva chiesto di non farlo. */
     free(msgs.v[1].content);
     msgs.v[1].content = xstrdup("La risposta comincia");
-    reso = render_qwen35_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_NONE);
+    reso = render_qwen_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_NONE);
     TEST_ASSERT(reso != NULL);
     TEST_ASSERT(strstr(reso, "<think>\n\n</think>\n\nLa risposta comincia") != NULL);
     TEST_ASSERT(strstr(reso, "La risposta comincia<|im_end|>") == NULL);
@@ -19927,7 +19927,7 @@ static void test_qwen35_ultimo_assistant_e_un_prefill(void) {
     msgs.v[1].reasoning = xstrdup("Ragiono lo stesso");
     free(msgs.v[1].content);
     msgs.v[1].content = xstrdup("");
-    reso = render_qwen35_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_NONE);
+    reso = render_qwen_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_NONE);
     TEST_ASSERT(reso != NULL);
     TEST_ASSERT(strstr(reso, "<think>\nRagiono lo stesso") != NULL);
     TEST_ASSERT(strstr(reso, "</think>") == NULL);
@@ -19942,7 +19942,7 @@ static void test_qwen35_ultimo_assistant_e_un_prefill(void) {
     u2.role = xstrdup("user");
     u2.content = xstrdup("seconda domanda");
     chat_msgs_push(&msgs, u2);
-    reso = render_qwen35_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    reso = render_qwen_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
     TEST_ASSERT(reso != NULL);
     TEST_ASSERT(strstr(reso, "La risposta comincia<|im_end|>") != NULL);
     TEST_ASSERT(strstr(reso, "<|im_start|>user\nseconda domanda<|im_end|>") != NULL);
