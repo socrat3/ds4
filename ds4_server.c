@@ -4682,6 +4682,8 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     if (!request_validate_prefill(&msgs, r->think_mode, r->model_syntax, err, errlen)) {
         chat_msgs_free(&msgs);
+        free(system);
+        free(tool_schemas);
         request_free(r);
         return false;
     }
@@ -5717,6 +5719,10 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     responses_prepare_live_continuation(s, r, &msgs);
     if (!request_validate_prefill(&msgs, r->think_mode, r->model_syntax, err, errlen)) {
         chat_msgs_free(&msgs);
+        buf_free(&combined_tool_schemas);
+        buf_free(&loaded_tool_schemas);
+        free(instructions);
+        free(tool_schemas);
         request_free(r);
         return false;
     }
