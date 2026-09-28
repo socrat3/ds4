@@ -550,6 +550,10 @@ typedef enum {
     DS4_VARIANT_FLASH41 = 4,
     DS4_VARIANT_QWEN4_EXP = 5,
     DS4_VARIANT_QWEN4_MINI = 6,
+    /* Was 4 before the 28/09 merge, a value upstream then gave to FLASH41.
+     * This number is the KV-file model_id (ds4_engine_model_id): a qwen35 KV
+     * file written with 4 would now read as FLASH41.  None exists, since the
+     * dense server runs without --kv-disk-dir; do not reuse 4 for it. */
     DS4_VARIANT_QWEN35_27B = 7,
 } ds4_variant;
 
@@ -44147,11 +44151,11 @@ void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens) {
 }
 
 void ds4_chat_append_think_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode mode) {
-    if (ds4_model_is_qwen4() || ds4_model_is_qwen35()) {
-        /* ChatML carries the effort instruction in a system turn, exactly as
-         * the single-prompt path renders it.  Without it the chat template is
-         * not the one the model was trained on, and a thinking model reopens
-         * <think> inside its own reasoning. */
+    if (ds4_model_is_qwen35()) {
+        /* The dense 27B reopens <think> inside its own reasoning when the
+         * REPL omits the effort instruction (measured on qwen35 only, so the
+         * Flash Next keeps upstream behaviour).  It is a turn of its own, as
+         * before the merge, not merged into the user's system text. */
         qwen4_chat_system(&e->vocab, NULL, mode, tokens);
         return;
     }

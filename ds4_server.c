@@ -3661,7 +3661,10 @@ static void append_qwen_generation_prompt(buf *out, bool think) {
  * `</think>` se c'e' il solo ragionamento, nessun `<|im_end|>`, e nessun
  * turno dopo.  I casi contraddittori (pensiero spento con `reasoning`, o
  * `reasoning` insieme a un tag nel content) li rifiuta prima
- * `request_validate_prefill`. */
+ * `request_validate_prefill`.  Vale per tutta la sintassi Qwen, quindi anche
+ * per il Flash Next: misurato sul 27B, ma la regola e' del protocollo, non del
+ * modello, e senza di essa il turno finale restava chiuso e senza prompt di
+ * generazione. */
 static void append_qwen_assistant_prefill(buf *out, const chat_msg *m, bool think) {
     const char *rc = m->reasoning ? m->reasoning : "";
     const char *ct = m->content ? m->content : "";
