@@ -44060,12 +44060,6 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
         {"<｜end▁of▁sentence｜>",   vocab->eos_id},
         {"[gMASK]",                vocab->bos_id},
         {"<sop>",                  vocab->sop_id},
-        /* ChatML, which is what Qwen speaks.  Without these two the rendered
-         * prompt reached the tokenizer as ordinary text and came out as a
-         * different token stream than the one the multi-turn encoder builds:
-         * both valid sequences, neither the same. */
-        {"<|im_start|>",           vocab->im_start_id},
-        {"<|im_end|>",             vocab->im_end_id},
         {"<|system|>",             vocab->system_id},
         {"<｜System｜>",            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ? vocab->system_id : -1},
         {"<｜User｜>",              vocab->user_id},
