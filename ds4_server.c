@@ -827,6 +827,11 @@ typedef struct {
     int cache_read_tokens;
     int cache_write_tokens;
     ds4_think_mode think_mode;
+    /* Opt-in ("think_loop_guard": true): reasoning that repeats one block
+     * verbatim is closed with a forced </think>, and the response says so. */
+    bool think_loop_guard;
+    int think_loop_period;     /* Tokens in the repeated block; 0 = no loop found. */
+    int think_loop_cut_tokens; /* Reasoning tokens generated before the forced close. */
     bool has_tools;
     bool prompt_preserves_reasoning;
     /* For /v1/responses: emit reasoning_summary_* events / fields only when the
@@ -4235,6 +4240,11 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 goto bad;
             }
             got_thinking = true;
+        } else if (!strcmp(key, "think_loop_guard")) {
+            if (!json_bool(&p, &r->think_loop_guard)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "stop")) {
             if (!parse_stop(&p, &r->stops)) {
                 free(key);
@@ -7019,6 +7029,21 @@ static bool sse_error_event(int fd, const request *r, const char *msg) {
     return ok;
 }
 
+/* DS4 extension, written next to "choices" on the object that carries
+ * finish_reason, and only when the request enabled the guard: an answer that
+ * follows cut reasoning must stay distinguishable from an ordinary one. */
+static void append_reasoning_guard_json(buf *b, const request *r) {
+    if (!r->think_loop_guard) return;
+    if (r->think_loop_period > 0) {
+        buf_printf(b,
+                   ",\"reasoning_guard\":{\"interrupted\":true,\"reason\":\"loop\","
+                   "\"reasoning_tokens\":%d,\"loop_period_tokens\":%d}",
+                   r->think_loop_cut_tokens, r->think_loop_period);
+    } else {
+        buf_puts(b, ",\"reasoning_guard\":{\"interrupted\":false}");
+    }
+}
+
 static bool sse_chunk(int fd, const request *r, const char *id, const char *text, const char *finish) {
     buf b = {0};
     long now = (long)time(NULL);
@@ -7035,7 +7060,9 @@ static bool sse_chunk(int fd, const request *r, const char *id, const char *text
         }
         buf_puts(&b, ",\"finish_reason\":");
         if (finish) json_escape(&b, finish); else buf_puts(&b, "null");
-        buf_puts(&b, "}]}\n\n");
+        buf_puts(&b, "}]");
+        if (finish) append_reasoning_guard_json(&b, r);
+        buf_puts(&b, "}\n\n");
     } else {
         buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"text_completion\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
@@ -7134,7 +7161,9 @@ static bool sse_chat_finish(int fd, const request *r, const char *id, const char
     json_escape(&b, r->model);
     buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":");
     json_escape(&b, finish);
-    buf_puts(&b, "}]}\n\n");
+    buf_puts(&b, "}]");
+    append_reasoning_guard_json(&b, r);
+    buf_puts(&b, "}\n\n");
 
     bool ok = send_all(fd, b.ptr, b.len) &&
               sse_done(fd, r, id, prompt_tokens, completion_tokens);
@@ -8150,7 +8179,9 @@ static bool openai_sse_finish_live(int fd, server *s, const request *r, const ch
     json_escape(&b, r->model);
     buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":");
     json_escape(&b, finish);
-    buf_puts(&b, "}]}\n\n");
+    buf_puts(&b, "}]");
+    append_reasoning_guard_json(&b, r);
+    buf_puts(&b, "}\n\n");
 
     bool ok = send_all(fd, b.ptr, b.len) &&
               sse_done(fd, r, id, prompt_tokens, completion_tokens);
@@ -9029,6 +9060,7 @@ static bool final_response(int fd, bool enable_cors,
         buf_puts(&b, "}],\"usage\":");
     }
     append_openai_usage_json(&b, r, prompt_tokens, completion_tokens);
+    append_reasoning_guard_json(&b, r);
     buf_puts(&b, "}\n");
     bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -12205,6 +12237,58 @@ static thinking_state thinking_state_from_prompt(const request *r) {
     return st;
 }
 
+/* Reasoning loop detector.
+ *
+ * Deterministic decoding can lock reasoning into an exact cycle that never
+ * emits </think>. For every period p the detector keeps run[p], the number of
+ * consecutive tokens equal to the token p positions back, and reports the
+ * smallest p whose run covers a full period: the same block twice in a row,
+ * token for token, with nothing in between. Tracking every period costs one
+ * pass over the reasoning per token, and cannot be misled by phrases that recur
+ * inside the block. Long reasoning that does not repeat verbatim never
+ * matches, whatever its length; a loop that changes even one token per cycle
+ * is not detected.
+ *
+ * Two copies are enough: in the saved production loops the run never stopped
+ * growing once two copies existed, while no reasoning that closed by itself
+ * had a run above one token. The floor keeps short legitimate repetition
+ * (table rows, a matrix of zeros) from matching. */
+#define THINK_LOOP_MIN_RUN 1024
+
+typedef struct {
+    int *v;
+    int *run;
+    int len;
+    int cap;
+} think_loop_state;
+
+/* Returns the period once the reasoning tail is a verbatim loop, else 0. */
+static int think_loop_feed(think_loop_state *st, int token) {
+    if (st->len == st->cap) {
+        st->cap = st->cap ? st->cap * 2 : 4096;
+        st->v = xrealloc(st->v, (size_t)st->cap * sizeof(st->v[0]));
+        st->run = xrealloc(st->run, (size_t)st->cap * sizeof(st->run[0]));
+    }
+    const int last = st->len++;
+    st->v[last] = token;
+    st->run[last] = 0;
+    int period = 0;
+    for (int p = 1; p <= last; p++) {
+        if (st->v[last - p] != token) {
+            st->run[p] = 0;
+        } else if (++st->run[p] >= p && st->run[p] >= THINK_LOOP_MIN_RUN && !period) {
+            period = p;
+        }
+    }
+    return period;
+}
+
+static void think_loop_free(think_loop_state *st) {
+    free(st->v);
+    free(st->run);
+    memset(st, 0, sizeof(*st));
+}
+
 /* A completed tool block inside unclosed reasoning can be recovered without
  * predicting what the model will emit after an injected close marker. Keep a
  * short overlap until the opening appears, then wait for its matching end. */
@@ -13923,6 +14007,10 @@ decode_again:
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
     dsml_tracker.model_syntax = j->req.model_syntax;
+    think_loop_state think_loop = {0};
+    ds4_tokens think_force = {0};
+    int think_force_pos = 0;
+    int think_tokens = 0;
 
     server_generation_enter(s);
     while (!g_stop_requested && !job_cancelled(j) && completion < max_tokens &&
@@ -13954,7 +14042,11 @@ decode_again:
             temperature = 0.0f;
         }
         const int eos_token = ds4_token_eos(s->engine);
-        int token = j->req.ignore_eos ?
+        /* A cut reasoning loop is closed by feeding </think> in place of the
+         * sampled token; the answer that follows is sampled as usual. */
+        const bool forced = think_force_pos < think_force.len;
+        int token = forced ? think_force.v[think_force_pos++] :
+            j->req.ignore_eos ?
             ds4_session_argmax_ignoring_eos(slot->session,
                                             j->req.think_mode) :
             ds4_session_sample(slot->session, temperature, top_k,
@@ -13976,7 +14068,7 @@ decode_again:
         int toks[17];
         int ntok = 0;
         const int block_start = ds4_session_pos(slot->session);
-        if (!s->batched_mode &&
+        if (!forced && !s->batched_mode &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
@@ -13997,7 +14089,7 @@ decode_again:
                 finish = "error";
                 break;
             }
-        } else if (s->batched_mode && s->qwen4_batch_mtp &&
+        } else if (!forced && s->batched_mode && s->qwen4_batch_mtp &&
                    max_tokens - completion >= 2 && !j->req.ignore_eos &&
                    (!ds4_engine_mtp_exact_sampling(s->engine) || temperature == 0.0f) &&
                    getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
@@ -14049,6 +14141,33 @@ decode_again:
             const bool was_thinking = thinking.inside;
             if (!dsml_decode_state_is_tool(dsml_tracker.decode))
                 thinking_state_feed(&thinking, piece, piece_len);
+            if (j->req.think_loop_guard && was_thinking && thinking.inside && !forced) {
+                think_tokens++;
+                if (think_force_pos < think_force.len) {
+                    /* Draft tokens accepted after the loop was found. */
+                    j->req.think_loop_cut_tokens = think_tokens;
+                } else if (!j->req.think_loop_period &&
+                           (j->req.think_loop_period = think_loop_feed(&think_loop, token)) > 0) {
+                    j->req.think_loop_cut_tokens = think_tokens;
+                    /* Qwen's template separates reasoning and answer with
+                     * newlines around the close marker. */
+                    ds4_tokenize_rendered_chat(
+                        s->engine,
+                        j->req.model_syntax == SERVER_MODEL_SYNTAX_QWEN ?
+                            "\n</think>\n\n" : "</think>",
+                        &think_force);
+                    server_log(DS4_LOG_WARNING,
+                               "ds4-server: chat ctx=%s%s%s reasoning loop cut after %d reasoning tokens (period %d), forcing </think>",
+                               ctx_span,
+                               req_flags[0] ? " " : "",
+                               req_flags,
+                               think_tokens,
+                               j->req.think_loop_period);
+                    trace_event(s, trace_id,
+                                "reasoning loop cut after %d reasoning tokens (period %d)",
+                                think_tokens, j->req.think_loop_period);
+                }
+            }
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
                 if (thinking.inside) {
                     dsml_decode_tracker_init(&dsml_tracker);
@@ -14256,6 +14375,8 @@ decode_again:
         if (stop_decode) break;
     }
     server_generation_leave(s);
+    think_loop_free(&think_loop);
+    ds4_tokens_free(&think_force);
 
     if (job_cancelled(j)) {
         request_live_state_clear(s, slot);
@@ -15109,7 +15230,8 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
             "\"stop\","
             "\"seed\","
             "\"stream\","
-            "\"reasoning_effort\"]}",
+            "\"reasoning_effort\","
+            "\"think_loop_guard\"]}",
         ctx,
         ctx,
         max_completion);
@@ -17573,6 +17695,159 @@ static void test_openai_stream_usage_reports_cache_details(void) {
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
+}
+
+/* Feeds n tokens produced by gen(i). Returns the 1-based count at which the
+ * detector fired, or 0, and stores the reported period. */
+static int think_loop_fire_at(int n, int (*gen)(int), int *period) {
+    think_loop_state st = {0};
+    int at = 0;
+    *period = 0;
+    for (int i = 0; i < n && !at; i++) {
+        *period = think_loop_feed(&st, gen(i));
+        if (*period) at = i + 1;
+    }
+    think_loop_free(&st);
+    return at;
+}
+
+static int think_loop_gen_unique(int i) { return 100000 + i; }
+/* 4300 unique tokens, then a 2200-token block forever. */
+static int think_loop_gen_cycle(int i) {
+    return i < 4300 ? 100000 + i : (i - 4300) % 2200;
+}
+/* The same 600-token block twice, then new text: below the floor. */
+static int think_loop_gen_short_pair(int i) {
+    if (i < 4300) return 100000 + i;
+    if (i < 4300 + 2 * 600) return (i - 4300) % 600;
+    return 200000 + i;
+}
+/* A cycle where one token changes on every pass, e.g. a counter. */
+static int think_loop_gen_counter(int i) {
+    if (i < 4300) return 100000 + i;
+    int off = (i - 4300) % 2200;
+    return off == 1100 ? 500000 + (i - 4300) / 2200 : off;
+}
+/* A 300-token quote that keeps coming back after different 50-token comments. */
+static int think_loop_gen_requote(int i) {
+    int block = i / 350, off = i % 350;
+    return off < 300 ? off : 300000 + block * 50 + off;
+}
+/* A 20x20 matrix of zeros: 20 identical rows of 41 tokens, then new text. */
+static int think_loop_gen_zero_matrix(int i) {
+    if (i < 100 || i >= 100 + 20 * 41) return 100000 + i;
+    int col = (i - 100) % 41;
+    return col == 40 ? 3 : col % 2 ? 2 : 1;
+}
+static int think_loop_gen_short(int i) { return i < 100 ? 100000 + i : (i - 100) % 7; }
+/* A 2192-token cycle built from 137 phrases of exactly 16 tokens drawn from
+ * only 5 phrase types: every 16-token window also recurs inside the cycle. */
+static int think_loop_gen_formulaic(int i) {
+    if (i < 4300) return 100000 + i;
+    int off = (i - 4300) % 2192;
+    unsigned phrase = (unsigned)(off / 16);
+    return (int)((phrase * 2654435761u >> 7) % 5u) * 16 + off % 16;
+}
+
+static void test_think_loop_detector(void) {
+    int period = 0;
+    TEST_ASSERT(think_loop_fire_at(40000, think_loop_gen_unique, &period) == 0);
+
+    /* Fires at the end of the second identical copy, not before. */
+    TEST_ASSERT(think_loop_fire_at(40000, think_loop_gen_cycle, &period) == 4300 + 2 * 2200);
+    TEST_ASSERT(period == 2200);
+
+    TEST_ASSERT(think_loop_fire_at(40000, think_loop_gen_short_pair, &period) == 0);
+    TEST_ASSERT(think_loop_fire_at(40000, think_loop_gen_counter, &period) == 0);
+    TEST_ASSERT(think_loop_fire_at(40000, think_loop_gen_requote, &period) == 0);
+    TEST_ASSERT(think_loop_fire_at(40000, think_loop_gen_zero_matrix, &period) == 0);
+
+    /* Short periods wait for THINK_LOOP_MIN_RUN repeated tokens. */
+    TEST_ASSERT(think_loop_fire_at(40000, think_loop_gen_short, &period) ==
+                100 + 7 + THINK_LOOP_MIN_RUN);
+    TEST_ASSERT(period == 7);
+
+    int at = think_loop_fire_at(40000, think_loop_gen_formulaic, &period);
+    TEST_ASSERT(at > 0 && at <= 4300 + 2 * 2192);
+    TEST_ASSERT(period > 0 && 2192 % period == 0);
+}
+
+/* Runs the three writers that answer chat requests and returns what they sent. */
+static char *think_loop_guard_responses(request *r) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return xstrdup("");
+    const char *raw = "<think>why</think>ok";
+    openai_stream st;
+    openai_stream_start(r, &st);
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, r, "live", &st, raw, strlen(raw),
+                                       NULL, "stop", 10, 2));
+    TEST_ASSERT(sse_chunk(sv[0], r, "delta", "hi", NULL));
+    TEST_ASSERT(final_response(sv[0], false, r, "full", "ok", "why", NULL, "stop", 10, 2));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    openai_stream_free(&st);
+    close(sv[0]);
+    close(sv[1]);
+    return out;
+}
+
+static void test_think_loop_guard_report(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+
+    /* Without the request field nothing is added anywhere. */
+    char *out = think_loop_guard_responses(&r);
+    TEST_ASSERT(strstr(out, "\"id\":\"live\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"id\":\"full\"") != NULL);
+    TEST_ASSERT(strstr(out, "reasoning_guard") == NULL);
+    free(out);
+
+    /* Guard on, no loop: the report says so on the finish chunk and on the
+     * completion object, and never on a content delta. */
+    r.think_loop_guard = true;
+    out = think_loop_guard_responses(&r);
+    const char *quiet = "\"reasoning_guard\":{\"interrupted\":false}}";
+    const char *live = strstr(out, "\"finish_reason\":\"stop\"}],\"reasoning_guard\":{\"interrupted\":false}}");
+    const char *delta = strstr(out, "\"id\":\"delta\"");
+    const char *full = strstr(out, "\"id\":\"full\"");
+    TEST_ASSERT(live && delta && full && live < delta);
+    TEST_ASSERT(strstr(delta, "reasoning_guard") > full);
+    TEST_ASSERT(strstr(full, "\"cache_write_tokens\":0}},\"reasoning_guard\":{\"interrupted\":false}}") != NULL);
+    TEST_ASSERT(strstr(strstr(out, quiet) + 1, quiet) != NULL);
+    free(out);
+
+    r.think_loop_period = 2200;
+    r.think_loop_cut_tokens = 8700;
+    out = think_loop_guard_responses(&r);
+    const char *cut = "\"reasoning_guard\":{\"interrupted\":true,\"reason\":\"loop\","
+                      "\"reasoning_tokens\":8700,\"loop_period_tokens\":2200}}";
+    live = strstr(out, cut);
+    TEST_ASSERT(live != NULL);
+    TEST_ASSERT(live && strstr(live + 1, cut) != NULL);
+    TEST_ASSERT(strstr(out, "\"interrupted\":false") == NULL);
+    free(out);
+
+    /* usage itself is untouched. */
+    buf b = {0};
+    append_openai_usage_json(&b, &r, 10, 2);
+    TEST_ASSERT(!strcmp(b.ptr,
+        "{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12,"
+        "\"prompt_tokens_details\":{\"cached_tokens\":0,\"cache_write_tokens\":0}}"));
+    buf_free(&b);
+    request_free(&r);
+
+    char err[160];
+    bool ok = parse_chat_request(
+        NULL, NULL,
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+        "\"think_loop_guard\":\"yes\"}",
+        128, 32768, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    TEST_ASSERT(!strcmp(err, "invalid JSON request"));
 }
 
 static void test_qwen_stream_split_reasoning_close(void) {
@@ -22943,6 +23218,8 @@ static void ds4_server_unit_tests_run(void) {
     test_reasoning_effort_mapping();
     test_model_alias_thinking_controls();
     test_api_thinking_controls_parse();
+    test_think_loop_detector();
+    test_think_loop_guard_report();
     test_render_think_max_prompt_prefix();
     test_render_non_thinking_prompt_closes_think();
     test_render_drops_old_reasoning_without_tools();

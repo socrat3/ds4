@@ -49,6 +49,22 @@ Max only with sufficient context; otherwise it falls back to normal thinking.
 `xhigh` maps to normal thinking, not Think Max. Use `think:false`, a disabled
 thinking object, or a non-thinking model alias for direct answers.
 
+Deterministic requests (`temperature: 0`) can lock reasoning into an exact
+cycle that never reaches the answer. `"think_loop_guard": true` on
+`/v1/chat/completions` (off by default; other endpoints ignore it) closes the
+reasoning once the same block has appeared twice in a row, token for token,
+with at least 1,024 repeated tokens, and lets the model answer. Reasoning that
+is long but not verbatim-repetitive is never cut. Not detected: a loop that
+changes even one token per cycle, and a loop whose second copy does not
+complete before `max_tokens`. A request that legitimately writes the same
+1,024-token block twice back to back would be cut too. A guarded response
+carries `reasoning_guard` next to `choices`, in the completion object or in
+the streaming chunk that has `finish_reason`: `{"interrupted":false}`, or
+`{"interrupted":true,"reason":"loop","reasoning_tokens":N,"loop_period_tokens":P}`.
+`interrupted` means the detector fired; `finish_reason` and `content` still
+say whether an answer followed.
+Without the request field the object is absent.
+
 ## Multiple sessions
 
 ```sh

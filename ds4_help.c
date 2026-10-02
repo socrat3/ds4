@@ -367,6 +367,7 @@ static void print_server_thinking(FILE *fp, const help_colors *c) {
     para(fp, c, "Think Max requires --ctx >= 393216; smaller contexts use high.");
     para(fp, c, "thinking={type:disabled}, think=false, or model=deepseek-chat selects non-thinking mode.");
     para(fp, c, "In thinking mode, client sampling knobs are ignored like the official API.");
+    para(fp, c, "think_loop_guard=true (/v1/chat/completions only, off by default) closes reasoning that repeats one block twice in a row verbatim, at least 1024 tokens, and reports it in reasoning_guard next to choices.");
     fputc('\n', fp);
 }
 
