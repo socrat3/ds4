@@ -352,6 +352,7 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--host HOST", "Bind address. Default: 127.0.0.1");
     opt(fp, c, "--port N", "Bind port. Default: 8000");
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
+    opt(fp, c, "--think-loop-guard", "Chat completions default to think_loop_guard=true; a request may still send false. See --help thinking.");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
     opt(fp, c, "--mixed-prefill-quantum N", "Prefill chunk while generations are active. Default: 128; GLM-5.3 minimum: 1024");
@@ -367,7 +368,7 @@ static void print_server_thinking(FILE *fp, const help_colors *c) {
     para(fp, c, "Think Max requires --ctx >= 393216; smaller contexts use high.");
     para(fp, c, "thinking={type:disabled}, think=false, or model=deepseek-chat selects non-thinking mode.");
     para(fp, c, "In thinking mode, client sampling knobs are ignored like the official API.");
-    para(fp, c, "think_loop_guard=true (/v1/chat/completions only, off by default) closes reasoning that repeats one block twice in a row verbatim, at least 1024 tokens, and reports it in reasoning_guard next to choices.");
+    para(fp, c, "think_loop_guard=true (/v1/chat/completions only; off by default unless the server runs with --think-loop-guard) closes reasoning that repeats one block twice in a row verbatim, at least 1024 tokens, and reports it in reasoning_guard next to choices.");
     fputc('\n', fp);
 }
 

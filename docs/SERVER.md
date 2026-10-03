@@ -51,7 +51,8 @@ thinking object, or a non-thinking model alias for direct answers.
 
 Deterministic requests (`temperature: 0`) can lock reasoning into an exact
 cycle that never reaches the answer. `"think_loop_guard": true` on
-`/v1/chat/completions` (off by default; other endpoints ignore it) closes the
+`/v1/chat/completions` (off by default; `--think-loop-guard` at startup makes it the
+default, and a request may still send `false`; other endpoints ignore it) closes the
 reasoning once the same block has appeared twice in a row, token for token,
 with at least 1,024 repeated tokens, and lets the model answer. Reasoning that
 is long but not verbatim-repetitive is never cut. Not detected: a loop that

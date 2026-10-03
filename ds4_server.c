@@ -4101,10 +4101,13 @@ static void anthropic_prepare_live_continuation(server *s, request *r,
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
  * prompt plus the small amount of protocol state needed to translate the reply. */
+static bool server_think_loop_guard_default(const server *s);
+
 static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_tokens,
                                int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
     r->model_syntax = server_model_syntax_for_engine(e);
+    r->think_loop_guard = server_think_loop_guard_default(s);
     const char *p = body;
     bool got_messages = false;
     bool tool_choice_none = false;
@@ -10180,6 +10183,7 @@ struct server {
     pthread_t *slot_threads;
     pthread_t decode_thread;
     int default_tokens;
+    bool think_loop_guard; /* --think-loop-guard: chat requests default to the guard. */
     kv_disk_cache kv;
     tool_memory tool_mem;
     server_image_cache image_cache; /* Protected by inference_mu. */
@@ -10208,6 +10212,10 @@ struct server {
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
 };
+
+static bool server_think_loop_guard_default(const server *s) {
+    return s && s->think_loop_guard;
+}
 
 static void server_inference_lock(server *s) {
     pthread_mutex_lock(&s->inference_mu);
@@ -15537,6 +15545,7 @@ typedef struct {
     int port;
     int ctx_size;
     int default_tokens;
+    bool think_loop_guard;
     const char *chdir_path;
     const char *trace_path;
     const char *kv_disk_dir;
@@ -15785,6 +15794,8 @@ static server_config parse_options(int argc, char **argv) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cors")) {
             c.enable_cors = true;
+        } else if (!strcmp(arg, "--think-loop-guard")) {
+            c.think_loop_guard = true;
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--batched-session")) {
@@ -16063,6 +16074,7 @@ int main(int argc, char **argv) {
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
     s.last_prefill_slot = slot_count - 1;
     s.default_tokens = cfg.default_tokens;
+    s.think_loop_guard = cfg.think_loop_guard;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
@@ -17848,6 +17860,7 @@ static void test_think_loop_guard_report(void) {
         128, 32768, &r, err, sizeof(err));
     TEST_ASSERT(!ok);
     TEST_ASSERT(!strcmp(err, "invalid JSON request"));
+
 }
 
 static void test_qwen_stream_split_reasoning_close(void) {
