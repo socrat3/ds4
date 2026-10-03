@@ -226,12 +226,18 @@ static void print_sampling(FILE *fp, const help_colors *c, bool full, ds4_help_t
     fputc('\n', fp);
 }
 
-static void print_steering(FILE *fp, const help_colors *c) {
+static void print_steering(FILE *fp, const help_colors *c, ds4_help_tool tool) {
     title(fp, c, "Directional Steering");
     opt(fp, c, "--dir-steering-file FILE", "Load one f32 direction vector per layer.");
     opt(fp, c, "--dir-steering-ffn F", "Apply steering after FFN outputs. Default with file: 1");
     opt(fp, c, "--dir-steering-attn F", "Apply steering after attention outputs. Default: 0");
     opt(fp, c, "--dir-steering-residual", "GLM 5.3: apply the FFN scale to the residual stream (Qwen, V4.1: always)");
+    /* The internal report is written by the CLI at the end of each answer; the agent and the
+     * server do not accept these options. */
+    if (tool != DS4_HELP_DS4) {
+        fputc('\n', fp);
+        return;
+    }
     opt(fp, c, "--probe-dirs DIR", "Internal report: concept directions (rifiuto/verita/sa .f32 + .stat)");
     opt(fp, c, "--probe-report FILE", "Append the internal report (question, answer, verdict) to FILE");
     opt(fp, c, "--probe-logit FILE", "Logit lens: per layer, top tokens favoured by the last token's state (Qwen)");
@@ -539,7 +545,7 @@ static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, cons
     if (streq(topic, "all")) {
         print_model_runtime(fp, c, tool, true);
         if (tool_has_topic(tool, "sampling")) print_sampling(fp, c, true, tool);
-        if (tool_has_topic(tool, "steering")) print_steering(fp, c);
+        if (tool_has_topic(tool, "steering")) print_steering(fp, c, tool);
         print_distributed(fp, c);
         if (tool == DS4_HELP_DS4) {
             print_cli_specific(fp, c, true);
@@ -561,7 +567,7 @@ static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, cons
 
     if (streq(topic, "runtime")) print_model_runtime(fp, c, tool, true);
     else if (streq(topic, "sampling")) print_sampling(fp, c, true, tool);
-    else if (streq(topic, "steering")) print_steering(fp, c);
+    else if (streq(topic, "steering")) print_steering(fp, c, tool);
     else if (streq(topic, "distributed")) print_distributed(fp, c);
     else if (tool == DS4_HELP_DS4 && streq(topic, "diagnostics")) print_cli_diagnostics(fp, c);
     else if (tool == DS4_HELP_DS4 && streq(topic, "commands")) print_cli_commands(fp, c);
