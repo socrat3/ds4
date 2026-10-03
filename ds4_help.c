@@ -232,8 +232,12 @@ static void print_steering(FILE *fp, const help_colors *c, ds4_help_tool tool) {
     opt(fp, c, "--dir-steering-ffn F", "Apply steering after FFN outputs. Default with file: 1");
     opt(fp, c, "--dir-steering-attn F", "Apply steering after attention outputs. Default: 0");
     opt(fp, c, "--dir-steering-residual", "GLM 5.3: apply the FFN scale to the residual stream (Qwen, V4.1: always)");
-    /* The internal report is written by the CLI at the end of each answer; the agent and the
-     * server do not accept these options. */
+    /* The internal report needs a front end that knows where an answer ends: the CLI and the
+     * agent have one, the server does not. */
+    if (tool == DS4_HELP_AGENT) {
+        opt(fp, c, "--probe-dirs DIR", "Internal report: concept directions (rifiuto/verita/sa .f32 + .stat). Needs --non-interactive");
+        opt(fp, c, "--probe-report FILE", "Append one report per generation round to FILE. Diagnostics: syncs the GPU every layer, slower");
+    }
     if (tool != DS4_HELP_DS4) {
         fputc('\n', fp);
         return;

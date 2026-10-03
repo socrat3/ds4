@@ -164,7 +164,23 @@ static double ds4_probe_score(const ds4_probe_concept *c, const double *proj_lay
 
 /* Finalize the previous position: turn its per-layer projections into one score per concept. */
 static void ds4_probe_report_flush_pos(void) {
-    if (g_report.cur_pos < 0 || g_report.n_score >= g_report.cap_score) return;
+    if (g_report.cur_pos < 0) return;
+    if (g_report.n_score >= g_report.cap_score) {
+        /* Agent rounds run past 512 positions: grow instead of dropping the rest of the answer.
+         * Scores are laid out per concept, so each concept's run is copied to the new stride. */
+        const int cap = g_report.cap_score * 2;
+        double *score = xmalloc((size_t)g_report.n_concept * cap * sizeof(double));
+        for (int c = 0; c < g_report.n_concept; c++)
+            memcpy(score + (size_t)c * cap, g_report.score + (size_t)c * g_report.cap_score,
+                   (size_t)g_report.n_score * sizeof(double));
+        int *pos = xmalloc((size_t)cap * sizeof(int));
+        memcpy(pos, g_report.score_pos, (size_t)g_report.n_score * sizeof(int));
+        free(g_report.score);
+        free(g_report.score_pos);
+        g_report.score = score;
+        g_report.score_pos = pos;
+        g_report.cap_score = cap;
+    }
     for (int c = 0; c < g_report.n_concept; c++) {
         const double *proj = g_report.proj + (size_t)c * g_report.n_layer;
         const bool *have = g_report.have + (size_t)c * g_report.n_layer;

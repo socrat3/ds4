@@ -729,6 +729,7 @@ static agent_config parse_options(int argc, char **argv) {
     };
 
     bool steering_scale_set = false;
+    bool probe_opt = false;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
@@ -956,6 +957,12 @@ static agent_config parse_options(int argc, char **argv) {
             steering_scale_set = true;
         } else if (!strcmp(arg, "--dir-steering-residual")) {
             c.engine.directional_steering_residual = true;
+        } else if (!strcmp(arg, "--probe-dirs")) {
+            setenv("DS4_PROBE_DIRS", need_arg(&i, argc, argv, arg), 1);
+            probe_opt = true;
+        } else if (!strcmp(arg, "--probe-report")) {
+            setenv("DS4_PROBE_REPORT", need_arg(&i, argc, argv, arg), 1);
+            probe_opt = true;
         } else {
             fprintf(stderr, "ds4-agent: unknown option: %s\n", arg);
             usage(stderr, NULL);
@@ -990,6 +997,11 @@ static agent_config parse_options(int argc, char **argv) {
     if (c.engine.distributed.role == DS4_DISTRIBUTED_WORKER ||
         c.engine.tp.role == DS4_TP_WORKER) {
         fprintf(stderr, "ds4-agent: --role worker is a serving mode; start workers with ./ds4\n");
+        exit(2);
+    }
+    /* The report prints its summary straight to stderr, which would cut through the TUI. */
+    if (probe_opt && !c.non_interactive) {
+        fprintf(stderr, "ds4-agent: --probe-dirs/--probe-report require --non-interactive\n");
         exit(2);
     }
     if (c.gen.raw_prompt && (!c.non_interactive || !c.gen.prompt)) {
@@ -10290,6 +10302,32 @@ static void worker_set_greedy_sampling(agent_worker *w, bool greedy) {
 /* Run one user turn until the assistant stops or returns a tool call.  Tool
  * results are appended to the transcript and the loop continues, which gives
  * the model native DSML tool iteration without a client/server protocol. */
+/* Internal report (--probe-dirs/--probe-report): one entry per completed generation round, with
+ * the user's request as the question and the round's generated text as the answer. Rounds cut
+ * by an interrupt or by compaction are not reported; their positions fall into the next round's
+ * prompt zone. */
+static void agent_probe_report_round(agent_worker *w, const char *user_text,
+                                     int prompt_tokens, int tool_round) {
+    if (!ds4_probe_report_active()) return;
+    static int turn;
+    static const char *last_user;
+    if (tool_round == 0 || user_text != last_user) turn++;
+    last_user = user_text;
+    int end = w->transcript.len;
+    if (end > prompt_tokens && w->transcript.v[end - 1] == ds4_token_eos(w->engine)) end--;
+    agent_buf answer = {0};
+    for (int i = prompt_tokens; i < end; i++) {
+        size_t len = 0;
+        char *piece = ds4_token_text(w->engine, w->transcript.v[i], &len);
+        agent_buf_append(&answer, piece, len);
+        free(piece);
+    }
+    char label[64];
+    snprintf(label, sizeof(label), "agente, turno %d, passo %d", turn, tool_round + 1);
+    ds4_probe_report(user_text ? user_text : "", answer.ptr ? answer.ptr : "", prompt_tokens, label);
+    free(answer.ptr);
+}
+
 static int worker_run_turn(agent_worker *w, const char *user_text) {
     agent_config *cfg = w->cfg;
     ds4_think_mode think_mode = effective_think_mode(cfg);
@@ -10427,6 +10465,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             agent_set_error(w, err);
             return 1;
         }
+        const int report_prompt_tokens = prompt_for_sync->len;
 
         int max_tokens = cfg->gen.n_predict - carried_generation;
         int room = ds4_session_ctx(w->session) - ds4_session_pos(w->session);
@@ -10711,6 +10750,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         }
 
         agent_worker_append_assistant_turn_end(w);
+        agent_probe_report_round(w, user_text, report_prompt_tokens, tool_round);
 
         if (!got_tool && !malformed_tool && !early_tool_error) {
             agent_dsml_parser_free(&dsml);
@@ -13568,6 +13608,9 @@ int main(int argc, char **argv) {
     } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
         return 1;
     }
+    /* Load the concept directions now that the model geometry is known: a bad --probe-dirs
+     * is reported before the first turn. No-op without --probe-dirs. */
+    ds4_probe_report_begin();
     if (ds4_think_mode_level(cfg.gen.think_mode) >= 0 && !ds4_engine_is_deepseek41(engine)) {
         fprintf(stderr, "ds4-agent: --think-level requires a DeepSeek V4.1 model\n");
         ds4_engine_close(engine);

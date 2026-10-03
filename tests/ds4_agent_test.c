@@ -1026,6 +1026,13 @@ int main(int argc, char **argv) {
     AGENT_TEST_ASSERT(cfg.engine.directional_steering_file &&
                       !strcmp(cfg.engine.directional_steering_file, "dir.f32"));
     AGENT_TEST_ASSERT(cfg.engine.directional_steering_ffn == 1.5f);
+    char *probe[] = {"ds4-agent", "--model", "glm.gguf", "--non-interactive", "-p", "x",
+                     "--probe-dirs", "/tmp/concetti", "--probe-report", "/tmp/resoconto.md"};
+    cfg = parse_options((int)(sizeof(probe) / sizeof(probe[0])), probe);
+    AGENT_TEST_ASSERT(getenv("DS4_PROBE_DIRS") && !strcmp(getenv("DS4_PROBE_DIRS"), "/tmp/concetti"));
+    AGENT_TEST_ASSERT(getenv("DS4_PROBE_REPORT") && !strcmp(getenv("DS4_PROBE_REPORT"), "/tmp/resoconto.md"));
+    unsetenv("DS4_PROBE_DIRS");
+    unsetenv("DS4_PROBE_REPORT");
     ds4_agent_unit_tests_run();
     test_v41_tool_syntax();
     test_qwen_tool_syntax();
