@@ -1017,6 +1017,15 @@ int main(int argc, char **argv) {
     agent_config cfg = parse_options((int)(sizeof(options) / sizeof(options[0])), options);
     AGENT_TEST_ASSERT(cfg.engine.vision_path && !strcmp(cfg.engine.vision_path, "mmproj.gguf"));
     AGENT_TEST_ASSERT(cfg.engine.model_path && !strcmp(cfg.engine.model_path, "qwen.gguf"));
+    AGENT_TEST_ASSERT(!cfg.engine.directional_steering_residual);
+    /* The steering options the shared help lists must parse here as in ds4 and ds4-server. */
+    char *steer[] = {"ds4-agent", "--model", "glm.gguf", "--dir-steering-file", "dir.f32",
+                     "--dir-steering-ffn", "1.5", "--dir-steering-residual"};
+    cfg = parse_options((int)(sizeof(steer) / sizeof(steer[0])), steer);
+    AGENT_TEST_ASSERT(cfg.engine.directional_steering_residual);
+    AGENT_TEST_ASSERT(cfg.engine.directional_steering_file &&
+                      !strcmp(cfg.engine.directional_steering_file, "dir.f32"));
+    AGENT_TEST_ASSERT(cfg.engine.directional_steering_ffn == 1.5f);
     ds4_agent_unit_tests_run();
     test_v41_tool_syntax();
     test_qwen_tool_syntax();
