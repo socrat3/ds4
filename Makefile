@@ -721,12 +721,13 @@ MEDIA_HDRS = ds4_media.h ds4_media_int.h ds4_media_http.h ds4_media_ws.h ds4_med
 
 tests/test_media: tests/test_media.c $(MEDIA_SRCS) $(MEDIA_HDRS)
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_media.c $(MEDIA_SRCS) -lpthread -lm
-test-media: tests/test_media tests/test_media_f01 tests/test_media_adv tests/test_media_adv_io tests/test_media_doppia ds4-media
+test-media: tests/test_media tests/test_media_f01 tests/test_media_adv tests/test_media_adv_io tests/test_media_doppia tests/test_media_storia ds4-media
 	./tests/test_media
 	./tests/test_media_f01
 	./tests/test_media_adv
 	./tests/test_media_adv_io
 	./tests/test_media_doppia
+	./tests/test_media_storia
 
 tests/test_media_adv: tests/test_media_adv.c tests/media_adv_util.h tests/media_adv_fake.h $(MEDIA_SRCS) $(MEDIA_HDRS)
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_media_adv.c $(MEDIA_SRCS) -lpthread -lm
@@ -745,14 +746,20 @@ tests/test_media_doppia: tests/test_media_doppia.c tests/media_fake.h $(MEDIA_SR
 test-media-doppia: tests/test_media_doppia
 	./tests/test_media_doppia
 
+tests/test_media_storia: tests/test_media_storia.c tests/media_fake.h $(MEDIA_SRCS) $(DOPPIA_SRCS) $(MEDIA_HDRS) ds4_media_storia.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_media_storia.c $(MEDIA_SRCS) $(DOPPIA_SRCS) -lpthread -lm
+.PHONY: test-media-storia
+test-media-storia: tests/test_media_storia
+	./tests/test_media_storia
+
 tests/test_media_f01: tests/test_media_f01.c tests/media_fake.h $(MEDIA_SRCS) $(DOPPIA_SRCS) $(MEDIA_HDRS)
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_media_f01.c $(MEDIA_SRCS) $(DOPPIA_SRCS) -lpthread -lm
 
 # ds4-media: eseguibile autonomo (serve + img), senza GPU. Bersaglio fisso per Open WebUI.
 # ds4-media doppia: doppiaggio con volto e voce dell'utente (aiuti Python in media/doppia).
-DOPPIA_SRCS = ds4_media_doppia.c ds4_media_doppia_fasi.c ds4_media_doppia_conf.c ds4_media_doppia_proc.c ds4_media_doppia_testo.c ds4_media_trad.c
+DOPPIA_SRCS = ds4_media_doppia.c ds4_media_doppia_fasi.c ds4_media_doppia_conf.c ds4_media_doppia_proc.c ds4_media_doppia_testo.c ds4_media_trad.c ds4_media_storia.c
 
-ds4-media: ds4_media_cli.c ds4_media_help.c ds4_media_help.h $(MEDIA_SRCS) $(DOPPIA_SRCS) $(MEDIA_HDRS) ds4_media_doppia.h
+ds4-media: ds4_media_cli.c ds4_media_help.c ds4_media_help.h $(MEDIA_SRCS) $(DOPPIA_SRCS) $(MEDIA_HDRS) ds4_media_doppia.h ds4_media_storia.h
 	$(CC) $(CFLAGS) -I. -o $@ ds4_media_cli.c ds4_media_help.c $(MEDIA_SRCS) $(DOPPIA_SRCS) -lpthread -lm
 
 .PHONY: test-engram

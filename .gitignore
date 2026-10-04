@@ -93,6 +93,7 @@ tests/test_media_f01
 tests/test_media_adv
 tests/test_media_adv_io
 tests/test_media_doppia
+tests/test_media_storia
 /media-prove/
 /media-webui/
 /media-serve.log

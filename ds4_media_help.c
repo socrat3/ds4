@@ -22,6 +22,7 @@ static void generale(FILE *o) {
 "Comandi\n"
 "  img      genera un'immagine da una descrizione, o ne modifica una (--rif)\n"
 "  video    anima un'immagine: video con audio dal primo fotogramma (H3)\n"
+"  storia   da una sceneggiatura a scene: fotogrammi, clip H3 e video unico\n"
 "  doppia   doppia un video in italiano con il tuo volto e la tua voce\n"
 "  serve    server compatibile con l'API Immagini di OpenAI (per Open WebUI)\n"
 "  clean    cancella le immagini, i video e i log generati\n"
@@ -275,16 +276,50 @@ static void semplice(FILE *o, const char *cmd) {
               "(POST /free), per restituirla a un modello di chat. Opzioni: --comfy-port, --host.\n", o);
 }
 
+static void storia_aiuto(FILE *o) {
+    fputs(
+"ds4-media storia - da una sceneggiatura a un video (Qwen-Image + MiniMax H3)\n"
+"\n"
+"uso: ds4-media storia SCENEGGIATURA [opzioni]\n"
+"\n"
+"Per ogni scena genera il primo fotogramma con Qwen-Image, lo anima con H3 (video\n"
+"con audio) e alla fine unisce le clip in storia.mp4. Se si interrompe, lo stesso\n"
+"comando riprende: le scene gia' fatte non si rifanno.\n"
+"\n"
+"Sceneggiatura ('#' commenta, scene numerate da 1, al massimo 20)\n"
+"  [scena 1]\n"
+"  secondi = 8\n"
+"  fotogramma = il tempio dorico al tramonto, cielo arancione, foto realistica\n"
+"  movimento = la camera avanza lenta tra le colonne, vento e cicale\n"
+"\n"
+"Opzioni\n"
+"  --dir D          cartella del lavoro: scena-NN.png, scena-NN.mp4, storia.mp4\n"
+"                   (predefinita: quella della sceneggiatura)\n"
+"  --size WxH       misura di fotogrammi e clip                      (864x480)\n"
+"  --passi N        passi di campionamento (predefiniti di img e video)\n"
+"  --seed S         seme; la scena N usa S+N; -1 = casuale            (-1)\n"
+"  --da K           riparte dalla scena K (le precedenti devono esserci)\n"
+"  --ffmpeg P       ffmpeg da usare (predefinito: voce ffmpeg di doppia.conf)\n"
+"  --comfy-port, --host, --bf16, --tieni-comfy, --no-gate   come gli altri comandi\n"
+"\n"
+"Memoria e tempi\n"
+"  Tra fotogramma e clip libera da se' i modelli di ComfyUI. H3 vuole quasi tutta\n"
+"  la GPU e dura minuti: 3 scene da 8 s sono circa 25-35 minuti.\n"
+"\n"
+"Uscita: il percorso di storia.mp4 su stdout. Codici: 0, 1 errore, 2 uso, 130 Ctrl+C\n", o);
+}
+
 int ds4_media_help(FILE *o, const char *cmd) {
     if (!cmd || !cmd[0] || !strcmp(cmd, "help")) generale(o);
     else if (!strcmp(cmd, "img")) img(o);
     else if (!strcmp(cmd, "video")) video(o);
+    else if (!strcmp(cmd, "storia")) storia_aiuto(o);
     else if (!strcmp(cmd, "doppia")) doppia(o);
     else if (!strcmp(cmd, "serve")) serve(o);
     else if (!strcmp(cmd, "clean")) clean(o);
     else if (!strcmp(cmd, "health") || !strcmp(cmd, "free")) semplice(o, cmd);
     else {
-        fprintf(stderr, "ds4-media: nessun aiuto per \"%s\"; comandi: img video doppia serve clean health free\n", cmd);
+        fprintf(stderr, "ds4-media: nessun aiuto per \"%s\"; comandi: img video storia doppia serve clean health free\n", cmd);
         return 2;
     }
     return 0;

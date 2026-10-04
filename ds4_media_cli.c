@@ -11,6 +11,7 @@
  * la descrizione e' tutto cio' che non e' opzione (o che segue "--"), in qualsiasi
  * posizione. Cosi' `img "gatto" --bf16` funziona e `img --rif foto.png` senza
  * descrizione e' un errore, invece di usare il percorso come descrizione. */
+#include "ds4_media_storia.h"
 #include "ds4_media.h"
 #include "ds4_media_doppia.h"
 #include "ds4_media_help.h"
@@ -473,7 +474,7 @@ static bool vuole_aiuto(int argc, char **argv) {
     return false;
 }
 
-static const char *COMANDI[] = {"serve", "img", "video", "doppia", "clean", "health", "free", NULL};
+static const char *COMANDI[] = {"serve", "img", "video", "storia", "doppia", "clean", "health", "free", NULL};
 
 int main(int argc, char **argv) {
     if (argc < 2) { ds4_media_help(stderr, NULL); return 2; }
@@ -484,6 +485,7 @@ int main(int argc, char **argv) {
     for (int i = 0; COMANDI[i]; i++) noto |= !strcmp(c, COMANDI[i]);
     if (!noto) { fprintf(stderr, "ds4-media: comando sconosciuto '%s' (ds4-media help)\n", c); return 2; }
     if (vuole_aiuto(argc, argv)) return ds4_media_help(stdout, c);
+    if (!strcmp(c, "storia")) return ds4_media_storia_cli(argc - 1, argv + 1);   /* ha il suo parser */
     static cli_args a;
     if (!cli_parse(argc - 1, argv + 1, &a)) { fprintf(stderr, "(ds4-media help %s)\n", c); return 2; }
     bool words_ok = !strcmp(c, "img") || !strcmp(c, "video") || !strcmp(c, "doppia");
