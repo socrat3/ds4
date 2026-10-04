@@ -300,6 +300,7 @@ static void storia_aiuto(FILE *o) {
 "  --seed S         seme; la scena N usa S+N; -1 = casuale            (-1)\n"
 "  --da K           riparte dalla scena K (le precedenti devono esserci)\n"
 "  --ffmpeg P       ffmpeg da usare (predefinito: voce ffmpeg di doppia.conf)\n"
+"  --controlla      legge solo la sceneggiatura: errori o numero di scene\n"
 "  --comfy-port, --host, --bf16, --tieni-comfy, --no-gate   come gli altri comandi\n"
 "\n"
 "Memoria e tempi\n"

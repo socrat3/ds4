@@ -218,7 +218,7 @@ static bool eseguibile(const char *p) {
 int ds4_media_storia_cli(int argc, char **argv) {
     const char *file = NULL, *dir = NULL, *size = NULL, *ffmpeg = NULL, *host = "127.0.0.1";
     long port = 8188, steps = 0, seed = -1, da = 1;
-    bool bf16 = false, tieni = false, no_gate = false;
+    bool bf16 = false, tieni = false, no_gate = false, controlla = false;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         const char *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -237,6 +237,7 @@ int ds4_media_storia_cli(int argc, char **argv) {
         else if (!strcmp(a, "--bf16")) bf16 = true;
         else if (!strcmp(a, "--tieni-comfy")) tieni = true;
         else if (!strcmp(a, "--no-gate")) no_gate = true;
+        else if (!strcmp(a, "--controlla")) controlla = true;
         else if (a[0] == '-' && a[1]) { fprintf(stderr, "ds4-media: opzione sconosciuta %s (ds4-media help storia)\n", a); return 2; }
         else if (file) { fprintf(stderr, "ds4-media: una sola sceneggiatura (%s, %s)\n", file, a); return 2; }
         else file = a;
@@ -249,6 +250,13 @@ int ds4_media_storia_cli(int argc, char **argv) {
     if (!storia_leggi(file, &s, err, sizeof(err))) { fprintf(stderr, "ds4-media: %s\n", err); return 2; }
     int w = 0, h = 0;
     if (size && !ds4_media_parse_size(size, &w, &h)) { fprintf(stderr, "ds4-media: size non valida: %s\n", size); storia_libera(&s); return 2; }
+    if (controlla) {
+        double tot = 0;
+        for (int k = 0; k < s.n; k++) tot += s.v[k].secondi;
+        printf("sceneggiatura valida: %d scene, %.1f s di video\n", s.n, tot);
+        storia_libera(&s);
+        return 0;
+    }
     /* ffmpeg prima di tutto: scoprirlo assente dopo mezz'ora di GPU sarebbe uno spreco. */
     doppia_conf conf;
     doppia_conf_init(&conf);
