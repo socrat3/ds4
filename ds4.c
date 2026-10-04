@@ -18466,7 +18466,7 @@ void ds4_probe_report(const char *question, const char *answer, int prompt_token
 }
 /* Carica le direzioni-concetto prima della generazione, usando la geometria del modello, cosi' il
  * resoconto e' attivo gia' alla prima risposta (senza dipendere dalla prima cattura del prefill). */
-void ds4_probe_report_begin(void) { ds4_probe_report_init(DS4_N_LAYER, DS4_N_EMBD); }
+void ds4_probe_report_begin(void) { ds4_probe_report_init(directional_steering_layer_count(), DS4_N_EMBD); }
 
 static void metal_graph_debug_dump_f16_tensor(
         const char       *name,

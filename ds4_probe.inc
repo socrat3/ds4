@@ -268,7 +268,9 @@ static FILE *ds4_probe_file(void) {
  * both the DS4_PROBE_OUT capture and the internal report; reads the tensor once for both. */
 static void ds4_probe_rows(ds4_gpu_tensor *t, uint32_t il, uint32_t pos0, uint32_t rows,
                            uint32_t hc, uint32_t width) {
-    ds4_probe_report_init(DS4_N_LAYER, width);   /* idempotente */
+    /* Trunk layers only, as the concept files are built: the NextN/MTP layer is not part of them
+     * (GLM 5.3: 46 layers, 45 in the files; Qwen 3.8: 49 and 48; V4.1 has none). */
+    ds4_probe_report_init(directional_steering_layer_count(), width);   /* idempotente */
     FILE *fp = ds4_probe_file();
     if ((!fp && !g_report.active) || !t || rows == 0 || hc == 0 || width == 0) return;
     const bool was_active = ds4_gpu_commands_active() != 0;
