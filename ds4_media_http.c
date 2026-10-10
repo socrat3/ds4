@@ -111,7 +111,7 @@ int media_tcp_connect(const char *host, int port, char *err, size_t err_len) {
     }
     freeaddrinfo(res);
     if (fd < 0)
-        media_set_err(err, err_len, "ComfyUI non risponde su %s:%d (%s): accendi ComfyUI (spark-switch avvia 18)",
+        media_set_err(err, err_len, "ComfyUI non risponde su %s:%d (%s): accendi ComfyUI (in spark-switch, riga \"MiniMax H3 video ComfyUI\")",
                       host, port, strerror(last_errno));
     return fd;
 }
