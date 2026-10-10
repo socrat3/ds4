@@ -714,6 +714,8 @@ static agent_config parse_options(int argc, char **argv) {
         .engine = {
             .model_path = "ds4flash.gguf",
             .backend = default_backend(),
+            .glm_mtp = true,
+            .glm_mtp_auto = true,
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
         },
@@ -827,6 +829,7 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.vision_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.glm_mtp = true;
+            c.engine.glm_mtp_auto = false;
         } else if (!strcmp(arg, "--mtp-model")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
@@ -835,6 +838,7 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.mtp_margin = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
         } else if (!strcmp(arg, "--mtp-timing")) {
             c.engine.glm_mtp = true;
+            c.engine.glm_mtp_auto = false;
             c.engine.glm_mtp_timing = true;
         } else if (!strcmp(arg, "--dspark")) {
             c.engine.dspark = true;

@@ -71858,6 +71858,19 @@ static int ds4_engine_open_internal(ds4_engine **out,
         return 1;
     }
     config_validate_model(&e->model);
+    if (e->glm_mtp && opt->glm_mtp_auto) {
+        /* --mtp is on by default: fall back to off, with no error, for any
+         * model family that cannot use it (no embedded MTP/nextn head, or a
+         * family that excludes it outright such as V4.1). An explicit
+         * --mtp still gets a hard error below instead of a silent skip. */
+        const bool glm_mtp_model_capable =
+            (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA || ds4_model_is_qwen4()) &&
+            DS4_N_NEXTN_PREDICT != 0;
+        if (!glm_mtp_model_capable) {
+            e->glm_mtp = false;
+            e->glm_mtp_timing = false;
+        }
+    }
     if (ds4_model_is_qwen4() && !opt->inspect_only) {
         const bool backend_ok =
 #ifdef DS4_HAS_QWEN4_GPU
@@ -71885,7 +71898,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #endif
                  false) &&
             opt->distributed.role == DS4_DISTRIBUTED_NONE &&
-            !load_slice && !opt->dspark && !opt->glm_mtp &&
+            !load_slice && !opt->dspark && !e->glm_mtp &&
             !opt->first_token_test && !opt->metal_graph_test &&
             (!opt->mtp_path || !opt->mtp_path[0]) &&
             e->power_percent == 100 && opt->context_size <= 1048576;
@@ -72257,7 +72270,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         e->vision_image_token = vocab_lookup(&e->vocab, "<|image_pad|>");
         e->vision_end_token = vocab_lookup(&e->vocab, "<|vision_end|>");
     }
-    if (opt->glm_mtp &&
+    if (opt->glm_mtp && !opt->glm_mtp_auto &&
         ((DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA && !ds4_model_is_qwen4()) ||
          DS4_N_NEXTN_PREDICT == 0)) {
         fprintf(stderr,
