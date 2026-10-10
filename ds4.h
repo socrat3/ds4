@@ -153,7 +153,6 @@ typedef struct {
     bool warm_weights;
     bool quality;
     bool glm_mtp;
-    bool glm_mtp_auto;
     bool glm_mtp_timing;
     bool dspark;
     bool dspark_strict;
