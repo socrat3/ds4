@@ -73608,6 +73608,7 @@ static int ds4_engine_vision_encode_image(
     uint32_t content_width = 0, content_height = 0;
     uint32_t grid_width = 0, grid_height = 0;
     uint32_t layout = 0;
+    uint32_t row_width = 0;
     int ok = 0;
     if (e->vision_kind == DS4_VISION_DEEPSEEK4) {
         ds4_deepseek4_image_patches patches = {0};
@@ -73616,7 +73617,8 @@ static int ds4_engine_vision_encode_image(
             ds4_image_preprocess_deepseek4(&patches, image, error, error_cap);
         if (!preprocessed) return 0;
         token_count = patches.llm_grid_height * patches.llm_grid_width;
-        embedding = malloc((size_t)token_count * DS4_N_EMBD * sizeof(float));
+        row_width = DS4_N_EMBD;
+        embedding = malloc((size_t)token_count * row_width * sizeof(float));
         if (embedding) {
 #ifndef DS4_NO_GPU
             ok = ds4_gpu_deepseek4_vision_encode(
@@ -73642,6 +73644,7 @@ static int ds4_engine_vision_encode_image(
         }
         ok = 1;
         token_count = patches.image_token_count;
+        row_width = e->qwen4_vision_weights.n_out;
         content_width = patches.content_width;
         content_height = patches.content_height;
         grid_width = patches.grid_width / 2u;
@@ -73653,7 +73656,8 @@ static int ds4_engine_vision_encode_image(
         if (!ds4_image_preprocess_glm53(&patches, image, 16u, 8000u,
                                         error, error_cap)) return 0;
         token_count = patches.image_token_count;
-        embedding = malloc((size_t)token_count * 4096u * sizeof(float));
+        row_width = 4096u;
+        embedding = malloc((size_t)token_count * row_width * sizeof(float));
         if (embedding) {
 #ifndef DS4_NO_GPU
             ok = ds4_gpu_glm53_vision_encode(
@@ -73678,6 +73682,16 @@ static int ds4_engine_vision_encode_image(
             snprintf(error, error_cap, "%s vision inference failed",
                      e->vision_kind == DS4_VISION_DEEPSEEK4 ? "DeepSeek V4" :
                      e->vision_kind == DS4_VISION_QWEN4 ? "Qwen3.8" : "GLM-5.3");
+        return 0;
+    }
+    /* A non-finite row would only surface later as a failed prefill of the
+     * whole prompt: refuse the image here, where the cause is still visible. */
+    const size_t values = (size_t)token_count * row_width;
+    for (size_t i = 0; i < values; i++) {
+        if (isfinite(embedding[i])) continue;
+        free(embedding);
+        if (error && error_cap)
+            snprintf(error, error_cap, "vision encoder produced a non-finite embedding");
         return 0;
     }
     out->data = embedding;
