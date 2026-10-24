@@ -27,8 +27,27 @@ void storia_libera(storia *s) {
     for (int i = 0; i < STORIA_MAX_SCENE; i++) {
         free(s->v[i].fotogramma);
         free(s->v[i].movimento);
+        free(s->v[i].audio);
+        for (int r = 0; r < STORIA_MAX_RIF; r++) free(s->v[i].riferimento[r]);
     }
     memset(s, 0, sizeof(*s));
+}
+
+static bool c_esiste(const char *p) {
+    struct stat st;
+    return stat(p, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0;
+}
+
+/* Un percorso della sceneggiatura: relativo alla cartella del file (malloc'd). */
+static char *risolvi(const char *sceneggiatura, const char *valore) {
+    if (valore[0] == '/') return media_xstrdup(valore);
+    const char *sl = strrchr(sceneggiatura, '/');
+    size_t dl = sl ? (size_t)(sl - sceneggiatura) : 0;
+    char *p = malloc(dl + strlen(valore) + 3);
+    if (!p) { perror("malloc"); exit(1); }
+    if (dl) snprintf(p, dl + strlen(valore) + 3, "%.*s/%s", (int)dl, sceneggiatura, valore);
+    else snprintf(p, dl + strlen(valore) + 3, "%s", valore);
+    return p;
 }
 
 /* Una scena e' completa se ha secondi validi e i due testi. */
@@ -85,8 +104,17 @@ bool storia_leggi(const char *path, storia *s, char *err, size_t err_len) {
             free(c->fotogramma); c->fotogramma = media_xstrdup(valore);
         } else if (!strcmp(chiave, "movimento")) {
             free(c->movimento); c->movimento = media_xstrdup(valore);
+        } else if (!strcmp(chiave, "riferimento")) {
+            if (c->n_rif == STORIA_MAX_RIF) { media_set_err(err, err_len, "scena %d: al massimo %d riferimenti", cur, STORIA_MAX_RIF); ok = false; break; }
+            char *p = risolvi(path, valore);
+            if (!valore[0] || !c_esiste(p)) { media_set_err(err, err_len, "scena %d: riferimento non trovato: %s", cur, p); free(p); ok = false; break; }
+            c->riferimento[c->n_rif++] = p;
+        } else if (!strcmp(chiave, "audio")) {
+            char *p = risolvi(path, valore);
+            if (!valore[0] || !c_esiste(p)) { media_set_err(err, err_len, "scena %d: audio non trovato: %s", cur, p); free(p); ok = false; break; }
+            free(c->audio); c->audio = p;
         } else {
-            media_set_err(err, err_len, "scena %d: chiave sconosciuta %s (secondi, fotogramma, movimento)", cur, chiave);
+            media_set_err(err, err_len, "scena %d: chiave sconosciuta %s (secondi, fotogramma, movimento, riferimento, audio)", cur, chiave);
             ok = false; break;
         }
     }
@@ -95,11 +123,6 @@ bool storia_leggi(const char *path, storia *s, char *err, size_t err_len) {
     if (ok && !scena_completa(&s->v[s->n - 1], s->n, err, err_len)) ok = false;
     if (!ok) storia_libera(s);
     return ok;
-}
-
-static bool c_esiste(const char *p) {
-    struct stat st;
-    return stat(p, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0;
 }
 
 /* Lascia memoria al prossimo lavoro: Qwen-Image e H3 stanno nella stessa ComfyUI. */
@@ -150,19 +173,32 @@ int storia_esegui(ds4_media *m, const storia *s, const storia_opzioni *o,
         if (c_esiste(mp4)) { fprintf(stderr, "[%d/%d] gia' fatta: %s\n", k, s->n, mp4); continue; }
         ds4_media_result r = {0};
         if (!c_esiste(png)) {
-            fprintf(stderr, "[%d/%d] fotogramma (Qwen-Image): \"%.70s\"\n", k, s->n, c->fotogramma);
+            fprintf(stderr, "[%d/%d] fotogramma (Qwen-Image%s): \"%.70s\"\n", k, s->n,
+                    c->n_rif ? ", con riferimenti" : "", c->fotogramma);
             ds4_media_image_req ir = {.prompt = c->fotogramma, .width = w, .height = h, .steps = o->steps,
-                                      .seed = o->seed < 0 ? -1 : o->seed + k, .weights = ds4_media_default_weights(m)};
+                                      .seed = o->seed < 0 ? -1 : o->seed + k, .weights = ds4_media_default_weights(m),
+                                      .refs = (const char *const *)c->riferimento, .n_refs = c->n_rif};
             libera_se_serve(m, ds4_media_image_need_gib(ir.weights, w, h, 1));
             bool ok = ds4_media_image(m, &ir, &r, err, err_len) && sposta(&r, png, err, err_len);
             ds4_media_result_free(&r);
             if (!ok) return cancellato(o) ? 130 : 1;
         }
-        fprintf(stderr, "[%d/%d] clip di %.1f s (MiniMax H3, dura minuti): \"%.70s\"\n", k, s->n, c->secondi, c->movimento);
-        ds4_media_video_req vr = {.prompt = c->movimento, .ref = png, .seconds = c->secondi, .width = w, .height = h,
-                                  .steps = o->steps, .seed = o->seed < 0 ? -1 : o->seed + k};
+        fprintf(stderr, "[%d/%d] clip di %.1f s (MiniMax H3%s, dura minuti): \"%.70s\"\n", k, s->n, c->secondi,
+                c->audio ? " con guida audio" : "", c->movimento);
         libera_se_serve(m, DS4_MEDIA_VIDEO_NEED_GIB);
-        bool ok = ds4_media_video(m, &vr, &r, err, err_len) && sposta(&r, mp4, err, err_len);
+        bool ok;
+        if (c->audio) {
+            /* Con l'audio la clip e' la testa parlante: il wav guida il labiale dal fotogramma 0. */
+            ds4_media_talk_req tr = {.prompt = c->movimento, .face = png, .audio = c->audio, .width = w, .height = h,
+                                     .frames = ds4_media_h3_frames(c->secondi), .steps = o->steps,
+                                     .seed = o->seed < 0 ? -1 : o->seed + k};
+            ok = ds4_media_talk(m, &tr, &r, err, err_len);
+        } else {
+            ds4_media_video_req vr = {.prompt = c->movimento, .ref = png, .seconds = c->secondi, .width = w, .height = h,
+                                      .steps = o->steps, .seed = o->seed < 0 ? -1 : o->seed + k};
+            ok = ds4_media_video(m, &vr, &r, err, err_len);
+        }
+        ok = ok && sposta(&r, mp4, err, err_len);
         ds4_media_result_free(&r);
         if (!ok) return cancellato(o) ? 130 : 1;
     }
@@ -252,8 +288,12 @@ int ds4_media_storia_cli(int argc, char **argv) {
     if (size && !ds4_media_parse_size(size, &w, &h)) { fprintf(stderr, "ds4-media: size non valida: %s\n", size); storia_libera(&s); return 2; }
     if (controlla) {
         double tot = 0;
-        for (int k = 0; k < s.n; k++) tot += s.v[k].secondi;
-        printf("sceneggiatura valida: %d scene, %.1f s di video\n", s.n, tot);
+        int rif = 0, con_audio = 0;
+        for (int k = 0; k < s.n; k++) { tot += s.v[k].secondi; rif += s.v[k].n_rif; con_audio += s.v[k].audio != NULL; }
+        printf("sceneggiatura valida: %d scene, %.1f s di video", s.n, tot);
+        if (rif) printf(", %d riferimenti", rif);
+        if (con_audio) printf(", %d scene con audio", con_audio);
+        printf("\n");
         storia_libera(&s);
         return 0;
     }

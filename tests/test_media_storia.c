@@ -1,6 +1,7 @@
 /* Test di ds4-media storia senza GPU: lettura della sceneggiatura (errori con scena e
- * chiave), scene contro il finto ComfyUI di media_fake.h, ripresa, --da, unione con un
- * finto ffmpeg (senza ricodifica, poi ricodifica se la prima rifiuta), annullamento.
+ * chiave, riferimento e audio con i file controllati), scene contro il finto ComfyUI di
+ * media_fake.h, ripresa, --da, unione con un finto ffmpeg (senza ricodifica, poi
+ * ricodifica se la prima rifiuta), annullamento, scene con riferimenti e con audio.
  *
  *   make test-media-storia */
 #include "../ds4_media_storia.h"
@@ -72,6 +73,82 @@ static void t_leggi(void) {
     VERIFICA(!prova("[scena uno]\n", &s, e, sizeof(e)) && strstr(e, "intestazione"), "intestazione storta [%s]", e);
     VERIFICA(!prova("[scena 1]\nsecondi=8\nfotogramma=a\n[scena 2]\n", &s, e, sizeof(e)) && strstr(e, "scena 1: manca movimento"),
              "scena incompleta chiusa dalla successiva [%s]", e);
+
+    /* riferimento e audio: percorsi relativi alla sceneggiatura, i file devono esistere */
+    char rp[400], ap[400];
+    snprintf(rp, sizeof(rp), "%s/r.png", DIR_);
+    snprintf(ap, sizeof(ap), "%s/a.wav", DIR_);
+    scrivi(rp, "png");
+    scrivi(ap, "RIFFxxxxWAVE");
+    ok = prova("[scena 1]\nsecondi=8\nfotogramma=a\nmovimento=b\nriferimento = r.png\nriferimento=r.png\naudio = a.wav\n", &s, e, sizeof(e));
+    VERIFICA(ok && s.n == 1 && s.v[0].n_rif == 2 && s.v[0].audio, "riferimenti e audio letti: %s", e);
+    if (ok) {
+        VERIFICA(!strcmp(s.v[0].riferimento[0], rp) && !strcmp(s.v[0].audio, ap), "percorsi relativi alla cartella della sceneggiatura [%s]", s.v[0].riferimento[0]);
+        storia_libera(&s);
+    }
+    char assoluto[600];
+    snprintf(assoluto, sizeof(assoluto), "[scena 1]\nsecondi=8\nfotogramma=a\nmovimento=b\nriferimento=%s\n", rp);
+    ok = prova(assoluto, &s, e, sizeof(e));
+    VERIFICA(ok && !strcmp(s.v[0].riferimento[0], rp), "percorso assoluto lasciato com'e'");
+    if (ok) storia_libera(&s);
+    VERIFICA(!prova("[scena 1]\nsecondi=8\nfotogramma=a\nmovimento=b\nriferimento=manca.png\n", &s, e, sizeof(e)) && strstr(e, "riferimento non trovato: ") && strstr(e, "/manca.png"),
+             "riferimento assente [%s]", e);
+    VERIFICA(!prova("[scena 1]\nsecondi=8\nfotogramma=a\nmovimento=b\naudio=manca.wav\n", &s, e, sizeof(e)) && strstr(e, "scena 1: audio non trovato"),
+             "audio assente [%s]", e);
+    char troppi[1200] = "[scena 1]\nsecondi=8\nfotogramma=a\nmovimento=b\n";
+    for (int i = 0; i < 11; i++) strcat(troppi, "riferimento=r.png\n");
+    VERIFICA(!prova(troppi, &s, e, sizeof(e)) && strstr(e, "al massimo 10 riferimenti"), "undici riferimenti [%s]", e);
+}
+
+/* Il finto ffmpeg: registra gli argomenti in argsf, scrive il file d'uscita; con
+ * STORIA_RIFIUTA_COPIA fallisce su "-c copy". */
+static void finto_ffmpeg(const char *ff, const char *argsf) {
+    char script[1200];
+    snprintf(script, sizeof(script),
+             "#!/bin/sh\necho \"$@\" >> '%s'\n"
+             "case \"$*\" in *'-c copy'*) [ -n \"$STORIA_RIFIUTA_COPIA\" ] && exit 1;; esac\n"
+             "for a; do last=$a; done\necho video > \"$last\"\n", argsf);
+    scrivi(ff, script);
+    chmod(ff, 0755);
+}
+
+/* Scena con riferimenti: il fotogramma li carica; scena con audio: la clip e' la testa
+ * parlante (guida audio, fotogrammi dai secondi sulla griglia 17k+5). */
+static void t_esegui_rif_audio(void) {
+    static fake_comfy F;
+    fk_start(&F);
+    fk_reset(&F);
+    F.view_w = 864; F.view_h = 480;
+    char lav[400], ff[400], argsf[400], sc[400], rp[400], ap[400];
+    snprintf(lav, sizeof(lav), "%s/lavoro2", DIR_);
+    mkdir(lav, 0775);
+    snprintf(argsf, sizeof(argsf), "%s/ffmpeg2.args", DIR_);
+    snprintf(ff, sizeof(ff), "%s/ffmpeg2", DIR_);
+    finto_ffmpeg(ff, argsf);
+    snprintf(rp, sizeof(rp), "%s/ritratto.png", lav);
+    snprintf(ap, sizeof(ap), "%s/battuta.wav", lav);
+    unsigned char png[64];
+    fk_png(png, 64, 64);
+    FILE *fp = fopen(rp, "wb"); fwrite(png, 1, 64, fp); fclose(fp);
+    scrivi(ap, "RIFFxxxxWAVE");
+    snprintf(sc, sizeof(sc), "%s/s.txt", lav);
+    scrivi(sc, "[scena 1]\nsecondi=8\nfotogramma=marta al tempio\nmovimento=avanza\nriferimento=ritratto.png\n"
+               "[scena 2]\nsecondi=2\nfotogramma=marta parla\nmovimento=dice la battuta\naudio=battuta.wav\n");
+    storia s;
+    char e[512] = {0}, out[600];
+    VERIFICA(storia_leggi(sc, &s, e, sizeof(e)), "sceneggiatura con riferimento e audio: %s", e);
+    ds4_media_config mc = {.host = "127.0.0.1", .port = F.port, .media_dir = lav, .no_gate = true};
+    ds4_media *m = ds4_media_create(&mc);
+    storia_opzioni o = {.dir = lav, .seed = 10, .ffmpeg = ff};
+    int rc = storia_esegui(m, &s, &o, out, sizeof(out), e, sizeof(e));
+    VERIFICA(rc == 0 && esiste(lav, "storia.mp4"), "due scene e unione: %d %s", rc, e);
+    VERIFICA(F.prompts == 4, "quattro lavori (%d)", F.prompts);
+    /* caricati: il riferimento del fotogramma 1, il fotogramma 1 per la clip, la foto e l'audio della clip 2 */
+    VERIFICA(F.uploads == 4, "riferimento, fotogramma, foto e audio caricati (%d)", F.uploads);
+    VERIFICA(strstr(F.graph, "MiniMaxH3AddGuide") && strstr(F.graph, "LoadAudio") && strstr(F.graph, "\"length\": 56"),
+             "ultima clip con guida audio e 56 fotogrammi (2 s)");
+    ds4_media_free(m);
+    storia_libera(&s);
 }
 
 static int g_annulla_dopo = -1, g_chiamate;
@@ -87,14 +164,7 @@ static void t_esegui(void) {
     mkdir(lav, 0775);
     snprintf(argsf, sizeof(argsf), "%s/ffmpeg.args", DIR_);
     snprintf(ff, sizeof(ff), "%s/ffmpeg", DIR_);
-    /* Finto ffmpeg: registra gli argomenti; con STORIA_RIFIUTA_COPIA fallisce su "-c copy". */
-    char script[1200];
-    snprintf(script, sizeof(script),
-             "#!/bin/sh\necho \"$@\" >> '%s'\n"
-             "case \"$*\" in *'-c copy'*) [ -n \"$STORIA_RIFIUTA_COPIA\" ] && exit 1;; esac\n"
-             "for a; do last=$a; done\necho video > \"$last\"\n", argsf);
-    scrivi(ff, script);
-    chmod(ff, 0755);
+    finto_ffmpeg(ff, argsf);
     snprintf(sc, sizeof(sc), "%s/s.txt", DIR_);
     scrivi(sc, "[scena 1]\nsecondi=8\nfotogramma=tempio\nmovimento=avanza\n"
                "[scena 2]\nsecondi=8\nfotogramma=colonne\nmovimento=gira\n"
@@ -179,6 +249,7 @@ int main(void) {
     mkdir(DIR_, 0775);
     t_leggi();
     t_esegui();
+    t_esegui_rif_audio();
     char cmd[300];
     snprintf(cmd, sizeof(cmd), "rm -rf '%s'", DIR_);
     if (system(cmd) != 0) printf("cartella di prova non rimossa: %s\n", DIR_);

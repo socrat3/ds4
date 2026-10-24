@@ -9,11 +9,15 @@
 #include <stddef.h>
 
 #define STORIA_MAX_SCENE 20
+#define STORIA_MAX_RIF 10
 
 typedef struct {
     double secondi;            /* 0.1..15 */
     char *fotogramma;          /* descrizione del primo fotogramma (Qwen-Image) */
     char *movimento;           /* cosa succede e cosa si sente (H3) */
+    char *riferimento[STORIA_MAX_RIF];   /* immagini di riferimento del fotogramma (come img --rif) */
+    int n_rif;
+    char *audio;               /* wav che guida il labiale della clip (H3 con guida audio), o NULL */
 } storia_scena;
 
 typedef struct {
@@ -26,7 +30,11 @@ typedef struct {
  *   secondi = 8
  *   fotogramma = ...
  *   movimento = ...
- * '#' commenta. Le scene vanno numerate di seguito da 1; gli errori nominano scena e chiave. */
+ *   riferimento = ritratto.png     (facoltativo, ripetibile fino a 10)
+ *   audio = battuta.wav            (facoltativo, uno per scena)
+ * '#' commenta. Le scene vanno numerate di seguito da 1; gli errori nominano scena e chiave.
+ * I percorsi relativi di riferimento e audio partono dalla cartella della sceneggiatura e i
+ * file devono esistere gia' alla lettura (cosi' --controlla li trova prima della GPU). */
 bool storia_leggi(const char *path, storia *s, char *err, size_t err_len);
 void storia_libera(storia *s);
 

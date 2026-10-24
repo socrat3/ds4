@@ -33,7 +33,7 @@ static char *media_json_inner(const char *s) {
 }
 
 /* Fotogrammi dal tempo, sulla griglia 17k+5 di H3 (124~5s, 362~15s). */
-static int media_h3_length(double seconds) {
+int ds4_media_h3_frames(double seconds) {
     if (!(seconds > 0)) seconds = 5.0;
     if (seconds > 60) seconds = 60;
     long base = (long)(seconds * 24.0 + 0.5);
@@ -58,7 +58,7 @@ static bool media_video_job(ds4_media *m, const ds4_media_video_req *req, media_
     }
     if (req->steps < 0 || req->steps > 60) { media_set_err(err, err_len, "passi da 1 a 60"); return false; }
     int steps = req->steps > 0 ? req->steps : 20;
-    int length = media_h3_length(req->seconds);
+    int length = ds4_media_h3_frames(req->seconds);
     long seed = req->seed >= 0 ? req->seed : (long)(time(NULL) ^ ((long)getpid() << 8)) & 0x7fffffff;
 
     /* H3 occupa la GPU per intero (~110 GiB in uso): a macchina scarica la memoria per

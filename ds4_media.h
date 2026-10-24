@@ -132,6 +132,10 @@ typedef struct {
 
 #define DS4_MEDIA_TALK_MAX_FRAMES 362
 
+/* Fotogrammi di H3 per una durata in secondi: griglia 17k+5 a 24 fps (124 ~ 5 s,
+ * 362 ~ 15 s), arrotondata al piu' vicino, entro 5..362. Secondi non validi = 5 s. */
+int ds4_media_h3_frames(double seconds);
+
 bool ds4_media_talk(ds4_media *m, const ds4_media_talk_req *req,
                     ds4_media_result *out, char *err, size_t err_len);
 
