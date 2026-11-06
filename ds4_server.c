@@ -18525,6 +18525,12 @@ static void test_reasoning_effort_mapping(void) {
     TEST_ASSERT(think_mode_from_enabled(false, DS4_THINK_LOW) == DS4_THINK_NONE);
     TEST_ASSERT(!strcmp(ds4_glm_reasoning_effort_text(DS4_THINK_LOW), "Reasoning Effort: High"));
     TEST_ASSERT(!strcmp(ds4_glm_reasoning_effort_text(DS4_THINK_MEDIUM), "Reasoning Effort: High"));
+    TEST_ASSERT(!strncmp(ds4_deepseek41_reasoning_effort_text(DS4_THINK_LOW), "Reasoning Effort: 25 ", 21));
+    TEST_ASSERT(!strncmp(ds4_deepseek41_reasoning_effort_text(DS4_THINK_MEDIUM), "Reasoning Effort: 50 ", 21));
+    TEST_ASSERT(!strncmp(ds4_deepseek41_reasoning_effort_text(DS4_THINK_HIGH), "Reasoning Effort: 75 ", 21));
+    TEST_ASSERT(!strncmp(ds4_deepseek41_reasoning_effort_text(DS4_THINK_MAX), "Reasoning Effort: 100 ", 22));
+    TEST_ASSERT(!strncmp(ds4_deepseek41_reasoning_effort_text((ds4_think_mode)(DS4_THINK_LEVEL_BASE + 25)), "Reasoning Effort: 25 ", 21));
+    TEST_ASSERT(ds4_deepseek41_reasoning_effort_text(DS4_THINK_NONE) == NULL);
     TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX, 32768) == DS4_THINK_HIGH);
     TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX,
                                            (int)ds4_think_max_min_context()) == DS4_THINK_MAX);

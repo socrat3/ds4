@@ -45848,6 +45848,11 @@ const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode) {
 
 const char *ds4_deepseek41_reasoning_effort_text(ds4_think_mode mode) {
     int level = ds4_think_mode_level(mode);
+    /* Named low/medium have no V4.1 template line of their own: map them onto
+     * the numeric scale so "low" actually shortens the reasoning instead of
+     * falling back to the unhinted default. */
+    if (mode == DS4_THINK_LOW) level = 25;
+    if (mode == DS4_THINK_MEDIUM) level = 50;
     if (mode == DS4_THINK_HIGH) level = 75;
     if (mode == DS4_THINK_MAX) level = 100;
     if (level <= 0) return NULL;
