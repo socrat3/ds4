@@ -12283,6 +12283,14 @@ static thinking_state thinking_state_from_prompt(const request *r) {
  * had a run above one token. The floor keeps short legitimate repetition
  * (table rows, a matrix of zeros) from matching. */
 #define THINK_LOOP_MIN_RUN 1024
+/* Short cycles (a phrase of a few tokens said over and over) are cut sooner:
+ * eight copies in a row and at least THINK_LOOP_SHORT_RUN repeated tokens.
+ * Clients such as omp abort the stream after ~1000 repeated characters and
+ * retry the same prompt, which falls into the same cycle; closing the
+ * reasoning here first lets the model answer instead. */
+#define THINK_LOOP_SHORT_PERIOD 32
+#define THINK_LOOP_SHORT_COPIES 8
+#define THINK_LOOP_SHORT_RUN 128
 
 typedef struct {
     int *v;
@@ -12305,7 +12313,11 @@ static int think_loop_feed(think_loop_state *st, int token) {
     for (int p = 1; p <= last; p++) {
         if (st->v[last - p] != token) {
             st->run[p] = 0;
-        } else if (++st->run[p] >= p && st->run[p] >= THINK_LOOP_MIN_RUN && !period) {
+        } else if (++st->run[p] >= p && !period &&
+                   (st->run[p] >= THINK_LOOP_MIN_RUN ||
+                    (p <= THINK_LOOP_SHORT_PERIOD &&
+                     st->run[p] >= (THINK_LOOP_SHORT_COPIES - 1) * p &&
+                     st->run[p] >= THINK_LOOP_SHORT_RUN))) {
             period = p;
         }
     }
@@ -17794,6 +17806,12 @@ static int think_loop_gen_zero_matrix(int i) {
     return col == 40 ? 3 : col % 2 ? 2 : 1;
 }
 static int think_loop_gen_short(int i) { return i < 100 ? 100000 + i : (i - 100) % 7; }
+static int think_loop_gen_phrase12(int i) { return i < 100 ? 100000 + i : (i - 100) % 12; }
+static int think_loop_gen_phrase40(int i) { return i < 100 ? 100000 + i : (i - 100) % 40; }
+static int think_loop_gen_seven(int i) {
+    if (i < 100 || i >= 100 + 7 * 20) return 100000 + i;
+    return (i - 100) % 20;
+}
 /* A 2192-token cycle built from 137 phrases of exactly 16 tokens drawn from
  * only 5 phrase types: every 16-token window also recurs inside the cycle. */
 static int think_loop_gen_formulaic(int i) {
@@ -17816,10 +17834,20 @@ static void test_think_loop_detector(void) {
     TEST_ASSERT(think_loop_fire_at(40000, think_loop_gen_requote, &period) == 0);
     TEST_ASSERT(think_loop_fire_at(40000, think_loop_gen_zero_matrix, &period) == 0);
 
-    /* Short periods wait for THINK_LOOP_MIN_RUN repeated tokens. */
+    /* Short periods wait for THINK_LOOP_SHORT_RUN repeated tokens. */
     TEST_ASSERT(think_loop_fire_at(40000, think_loop_gen_short, &period) ==
-                100 + 7 + THINK_LOOP_MIN_RUN);
+                100 + 7 + THINK_LOOP_SHORT_RUN);
     TEST_ASSERT(period == 7);
+    /* A 12-token phrase (omp's "48-character cycle"): eight copies, then cut. */
+    TEST_ASSERT(think_loop_fire_at(40000, think_loop_gen_phrase12, &period) ==
+                100 + 12 + 7 * 12 + (THINK_LOOP_SHORT_RUN - 7 * 12));
+    TEST_ASSERT(period == 12);
+    /* A 40-token period is not short: it still needs THINK_LOOP_MIN_RUN. */
+    TEST_ASSERT(think_loop_fire_at(40000, think_loop_gen_phrase40, &period) ==
+                100 + 40 + THINK_LOOP_MIN_RUN);
+    TEST_ASSERT(period == 40);
+    /* Seven copies of a short phrase, then new text: no cut. */
+    TEST_ASSERT(think_loop_fire_at(40000, think_loop_gen_seven, &period) == 0);
 
     int at = think_loop_fire_at(40000, think_loop_gen_formulaic, &period);
     TEST_ASSERT(at > 0 && at <= 4300 + 2 * 2192);
